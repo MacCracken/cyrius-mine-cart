@@ -70,10 +70,13 @@ fn rr_tri(b, tex): i64 {
     var hix = x0; if (x1 > hix) { hix = x1; }  if (x2 > hix) { hix = x2; }
     var loy = y0; if (y1 < loy) { loy = y1; }  if (y2 < loy) { loy = y2; }
     var hiy = y0; if (y1 > hiy) { hiy = y1; }  if (y2 > hiy) { hiy = y2; }
-    if (lox < 0) { lox = 0; }
-    if (loy < 0) { loy = 0; }
-    if (hix > MC_W - 1) { hix = MC_W - 1; }
-    if (hiy > MC_H - 1) { hiy = MC_H - 1; }
+    # ⚠ ABSOLUTE COORDS: the visible rect is [MC_DX, MC_DX+MC_W) x [MC_DY, MC_DY+MC_H), and the
+    # store index rebases back to rect-local. Clamping to [0,MC_W) here would silently crop the
+    # frame whenever the game draws at an offset.
+    if (lox < MC_DX) { lox = MC_DX; }
+    if (loy < MC_DY) { loy = MC_DY; }
+    if (hix > MC_DX + MC_W - 1) { hix = MC_DX + MC_W - 1; }
+    if (hiy > MC_DY + MC_H - 1) { hiy = MC_DY + MC_H - 1; }
 
     var hit = 0;
     var py = loy;
@@ -102,7 +105,7 @@ fn rr_tri(b, tex): i64 {
                     var tx = (uu >>> 16) & (MC_TEX - 1);
                     var ty = (vv >>> 16) & (MC_TEX - 1);
                     var c = load32(tex + (ty * MC_TEX + tx) * 4) & 0xFFFFFFFF;
-                    store32(&rr_fb + (py * MC_W + px) * 4, c);
+                    store32(&rr_fb + ((py - MC_DY) * MC_W + (px - MC_DX)) * 4, c);
                     rr_drawn = rr_drawn + 1;
                     hit = 1;
                 }

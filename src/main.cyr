@@ -219,6 +219,43 @@ fn mc_check(): i64 {
         bad = bad + 1;
     }
 
+    # ---- ⭐⭐ THE COORDINATE-FRAME GATE — op 0x0F VERTICES ARE FRAMEBUFFER-ABSOLUTE ----------
+    # ⛔⛔ THIS EXISTS BECAUSE THE OPPOSITE ASSUMPTION NEARLY WENT TO IRON. gpu_tper_prep_build folds
+    # dstxy into every plane CONSTANT, so the shader evaluates each edge at the SCREEN sample point
+    # 2*(dx+lx)+1. Emitting rect-local vertices with a non-zero dstxy pans the picture up-left by
+    # (dx,dy) — modelled at (80,96) that is 251,227 of 256,000 pixels wrong, and --verify would have
+    # failed near-totally against a PERFECTLY CORRECT kernel.
+    # ⚠ #92 carries TWO conventions: op 0x0A is rect-LOCAL, 0x0E/0x0F are ABSOLUTE. Nothing in the
+    # tree pinned that — gputri passes dstxy=0 on both — so this gate is the only thing that does.
+    # The assertion: moving dstxy must move EVERY vertex by exactly the same amount.
+    var fdx = MC_DX;
+    var fdy = MC_DY;
+    MC_DX = 0; MC_DY = 0;
+    mc_cart_to(60);
+    mc_build(mc_cart_x, mc_cart_z);
+    var n0 = mc_n_a;
+    var probe0x = mc_i32(&mc_vtx_a + 0) >>> 16;
+    var probe0y = mc_i32(&mc_vtx_a + 4) >>> 16;
+    var lastx = mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16;
+    MC_DX = 80; MC_DY = 96;
+    mc_cart_to(60);
+    mc_build(mc_cart_x, mc_cart_z);
+    var shifted = 0;
+    if (mc_n_a == n0) {
+        if ((mc_i32(&mc_vtx_a + 0) >>> 16) - probe0x == 80) {
+            if ((mc_i32(&mc_vtx_a + 4) >>> 16) - probe0y == 96) {
+                if ((mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16) - lastx == 80) { shifted = 1; }
+            }
+        }
+    }
+    MC_DX = fdx; MC_DY = fdy;
+    ps("  vertices are FRAMEBUFFER-ABSOLUTE: moving dstxy by (80,96) moves every vertex with it: ");
+    if (shifted == 1) { ps("PASS"); nl(); }
+    if (shifted != 1) {
+        ps("FAIL -- rect-local geometry with a non-zero dstxy pans the whole picture"); nl();
+        bad = bad + 1;
+    }
+
     # ---- ⭐⭐ THE MUTATION. A gate that cannot fail has not passed. -------------------------
     # Set one fraction bit in one coordinate of one already-accepted record — the exact defect
     # that would cost a flash — and require the re-parse to catch it.

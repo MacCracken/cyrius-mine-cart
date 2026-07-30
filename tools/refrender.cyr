@@ -35,6 +35,19 @@ fn main(): i64 {
         frame = v;
     }
 
+    # optional dx dy — ⭐ THE INVARIANCE TEST. Vertices are framebuffer-absolute and refcore
+    # rebases to rect-local, so the rendered IMAGE must be byte-identical for every dstxy. If it is
+    # not, the game and the kernel disagree about the coordinate frame — which is exactly the defect
+    # that nearly went to iron.
+    if (argc() > 3) {
+        var sx = argv(2); var sy = argv(3);
+        var vx = 0; var kx = 0;
+        while (load8(sx + kx) != 0) { vx = vx * 10 + (load8(sx + kx) - 48); kx = kx + 1; }
+        var vy = 0; var ky = 0;
+        while (load8(sy + ky) != 0) { vy = vy * 10 + (load8(sy + ky) - 48); ky = ky + 1; }
+        MC_DX = vx; MC_DY = vy;
+    }
+
     mc_sin_init();
     mc_tex_init();
     rr_clear();
@@ -44,7 +57,8 @@ fn main(): i64 {
     mc_cart_to(frame);
     mc_build(mc_cart_x, mc_cart_z);
 
-    ps("refrender: frame "); pn(frame); ps("  cart_x "); pn(mc_cart_x);
+    ps("refrender: frame "); pn(frame); ps("  dstxy ("); pn(MC_DX); ps(","); pn(MC_DY);
+    ps(")  cart_x "); pn(mc_cart_x);
     ps("  cart_z "); pn(mc_cart_z); nl();
     ps("  ONE record, "); pn(mc_n_a); ps(" triangles (floor, ceiling, both walls)"); nl();
 

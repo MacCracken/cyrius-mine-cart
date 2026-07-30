@@ -169,8 +169,17 @@ fn mc_track_x(wz): i64 {
 # the camera and no near-plane clipping is needed. That is a geometry choice made specifically to
 # avoid a clipper, because a clipper is where the fraction bits and the degenerate triangles come
 # from, and both of those are whole-batch rejections.
-fn mc_px(rx, rz): i64 { return MC_CX + (rx * MC_FOCAL) / rz; }
-fn mc_py(ry, rz): i64 { return MC_CY + (ry * MC_FOCAL) / rz; }
+# ⛔⛔ VERTICES ARE FRAMEBUFFER-ABSOLUTE, NOT RECT-LOCAL — AND THIS COST A BURN-BLOCKER CATCH.
+# gpu_tper_prep_build folds dstxy into every plane CONSTANT (`c += 2*dx*a + 2*dy*b`), so the shader
+# — which works draw-local — evaluates each edge at the SCREEN sample point 2*(dx+lx)+1. Emitting
+# rect-local coordinates while passing a non-zero dstxy therefore renders the window
+# [dx, dx+w) x [dy, dy+h) OF THE SCENE into the rect, panning the picture up-left by (dx,dy).
+# Modelled at dstxy (80,96): 251,227 of 256,000 px wrong. At (0,0): 0.
+# ⚠ #92 CARRIES TWO CONVENTIONS AND THAT IS WHY THIS WAS EASY TO GET WRONG: op 0x0A is rect-LOCAL
+# (its prep never sees dx/dy), while 0x0E and 0x0F are ABSOLUTE. The absolute side had never been
+# exercised — gputri passes dstxy=0 on both — so nothing in the tree pinned the convention.
+fn mc_px(rx, rz): i64 { return MC_DX + MC_CX + (rx * MC_FOCAL) / rz; }
+fn mc_py(ry, rz): i64 { return MC_DY + MC_CY + (ry * MC_FOCAL) / rz; }
 fn mc_wof(rz): i64    { return MC_WSC * rz; }
 
 # ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------
