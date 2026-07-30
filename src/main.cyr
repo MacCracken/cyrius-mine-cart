@@ -1,0 +1,456 @@
+# cyrius-mine-cart — a ride through a curving mine tunnel, rasterised by the GPU.
+#
+# ⭐ WHAT THIS PROGRAM IS FOR. The AGNOS kernel grew perspective-correct textured triangle
+# rasterisation on real AMD silicon (#92 op 0x0F) across a long ladder of rungs, every one of
+# which closed on a proof binary rather than on something a person could look at. This is the
+# first application to actually draw with it: a real texture, a real camera, a real frame, on
+# screen. Nothing here is a test harness. `--check` exists so the burn is not wasted, but the
+# default mode is the game.
+#
+# Modes:
+#   (default)   ride the tunnel and present it FULLSCREEN
+#   --check     the host gate: emit frames and re-validate every record the kernel would see.
+#               Runs anywhere, needs no GPU, and is the thing that stops a black-screen burn.
+#   --frames N  bound the ride (0 = until the track runs out of patience)
+#   --trace     report every dropped triangle, for diagnosis
+#
+# ⛔ WHY THERE IS NO WINDOWED MODE, precisely — the loose answer ("no desktop yet") is FALSE and
+# would rot: aethersafha runs on agnos, grants windows, and already composites client surfaces on
+# the GPU. Software clients get windows because they rasterise into their own buffer, and setu asks
+# the kernel for that buffer as a #86 carveout slot, so the client→compositor transport is already
+# GPU-visible memory. The transport is not the problem.
+#
+# The problem is that **no GPU op that writes colour lets the caller name where the colour goes.**
+# gpu_tri_persp derives its destination from two kernel module globals (gpu_bb_a_mc / gpu_bb_b_mc,
+# agnos kernel/core/gpu.cyr:1543-1545) and the record ABI has no field to override it —
+# gpo_field_mask(0x0F) is 0x00FF, dwords 0-7 only, and the validator's reserved sweep rejects
+# anything else. So a GPU draw lands in the SAME shared back buffer the compositor stages into
+# between its deferred #39 and its #84 flip, and #92 carries no process identity to arbitrate.
+# ⇒ A GPU-rendering client today can own the whole frame or corrupt someone else's. Fullscreen is
+# the correct target, not a compromise.
+#
+# ⭐ The fix is already shipped for DEPTH: gpu_tri_depth writes Z to a ring-3-named handle
+# (gpu_rt_handle_mc) while writing colour to the back buffer, in the same dispatch. Colour needs
+# the same treatment; see agnos gpu.md's follow-on row.
+
+include "lib/io.cyr"
+include "src/say.cyr"
+include "src/geom.cyr"
+include "src/tex.cyr"
+include "src/refcore.cyr"
+include "src/check.cyr"
+include "src/gpu.cyr"
+
+# ---- the host gate ---------------------------------------------------------------------------
+# ⛔ THE ORDER HERE IS DELIBERATE AND IS THE LESSON OF THE RUNGS THIS GAME CONSUMES. The first
+# thing asserted is not "the records are correct" — it is that the gate CAN FAIL (the mutation at
+# the end) and that the frame is not EMPTY (the coverage sweep). Two blank buffers agree on
+# everything, and a validator that cannot reject has proven nothing about the frames it passed.
+fn mc_check(): i64 {
+    var bad = 0;
+    ps("mine-cart: host gate -- will the kernel accept what this game emits?"); nl(); nl();
+
+    # ---- buffers, MEASURED rather than assumed ----------------------------------------------
+    ps("  buffers: vertex lists ");
+    if (mc_bufs_ok() == 1) { ps("ok"); }
+    if (mc_bufs_ok() == 0) { ps("UNDER-SIZED"); bad = bad + 1; }
+    ps(", textures ");
+    if (mc_tex_ok() == 1) { ps("ok"); }
+    if (mc_tex_ok() == 0) { ps("UNDER-SIZED"); bad = bad + 1; }
+    ps(", frame buffer ");
+    if (mc_fb_ok() == 1) { ps("ok"); nl(); }
+    if (mc_fb_ok() == 0) { ps("UNDER-SIZED"); nl(); bad = bad + 1; }
+
+    mc_sin_init();
+    mc_tex_init();
+
+    # ---- TWO PASSES, and the split is the point -----------------------------------------------
+    # ⛔⛔ THE FIRST VERSION OF THIS GATE RAN ONE PASS OVER ARTIFICIAL CAMERA POSITIONS — the cart
+    # jammed against a tunnel wall at |x| = 60 of a 64 half-width — and then asserted a coverage
+    # floor over it. It failed at 41%, and the failure was the GATE's, not the game's: pressed
+    # against a wall, the geometry that would fill the screen lies nearer than the near plane and is
+    # not drawn, so the frame really is mostly background. The ride never produces that position;
+    # the cart tracks the rail with a lag and stays near the centre line.
+    # ⇒ A gate must probe states the system can ACTUALLY reach. So:
+    #     pass 1  the REAL ride path, driven by mc_cart_step itself — coverage asserted here
+    #     pass 2  deliberate extremes — ABI legality asserted here, and no coverage claim
+    #   ABI rules must hold everywhere, including at positions the player will never see. What the
+    #   screen looks like is only a meaningful question along the path the game actually flies.
+    var frames = 0;
+    var tris   = 0;
+    var mincov = 999999;
+    var maxlap = 0;
+    var mintri = 999999;
+    var maxtri = 0;
+    # ⛔ ACCUMULATE. mc_build RESETS the drop counters every frame, so reading them after the loop
+    # reports only the LAST frame — which said "0 dropped" while 26 triangles had gone missing
+    # across the run. A per-frame counter read once is a per-frame answer.
+    var dr_flat  = 0;
+    var dr_huge  = 0;
+    var dr_coord = 0;
+    var dr_band  = 0;
+
+    mc_cart_x = 0;
+    mc_cart_z = 0;
+    mc_speed  = 3;
+    var f = 0;
+    while (f < 240) {
+        mc_cart_step();
+        var n = mc_build(mc_cart_x, mc_cart_z);
+        tris = tris + n;
+        if (n < mintri) { mintri = n; }
+        if (n > maxtri) { maxtri = n; }
+        dr_flat  = dr_flat  + mc_drop_flat;
+        dr_huge  = dr_huge  + mc_drop_huge;
+        dr_coord = dr_coord + mc_drop_coord;
+        dr_band  = dr_band  + mc_drop_band;
+        frames = frames + 1;
+        mc_ck_list(&mc_vtx_a, mc_n_a);
+        mc_ck_list(&mc_vtx_b, mc_n_b);
+        if ((f % 24) == 0) {
+            # UNION of both lists, background EXCLUDED — see mc_ck_cover's note
+            var cov = mc_ck_cover(&mc_vtx_a, MC_BG_TRIS, mc_n_a, &mc_vtx_a, 0, 0);
+            if (cov < mincov) { mincov = cov; }
+            if (mc_n_b != 0) { maxlap = maxlap + 1; }
+        }
+        f = f + 1;
+    }
+
+    # ---- ⭐ pass 1b: THE SAME RIDE PATH, AT THE REAL ON-SCREEN OFFSET -------------------------
+    # ⛔ |D| IS EVALUATED AT THE DRAW RECT'S CORNERS, AND THE RECT NO LONGER STARTS AT (0,0). The
+    # frame is now drawn straight to its place in the back buffer, so qx1/qy1 move outward with
+    # dstxy and |D| grows with them. Measuring only at the origin would understate the one bound
+    # this gate exists to enforce. 80/96 is an 800x600 console; 960/520 is 2560x1440, the largest
+    # this game can meet — and D grows with the offset, so passing there bounds every console between.
+    var saved_dx = MC_DX;
+    var saved_dy = MC_DY;
+    var oi = 0;
+    while (oi < 2) {
+        MC_DX = 80;  MC_DY = 96;
+        if (oi == 1) { MC_DX = 960; MC_DY = 520; }
+        mc_cart_reset();
+        var q = 0;
+        while (q < 60) {
+            mc_cart_step();
+            mc_build(mc_cart_x, mc_cart_z);
+            dr_flat  = dr_flat  + mc_drop_flat;
+            dr_huge  = dr_huge  + mc_drop_huge;
+            dr_coord = dr_coord + mc_drop_coord;
+            dr_band  = dr_band  + mc_drop_band;
+            frames = frames + 1;
+            mc_ck_list(&mc_vtx_a, mc_n_a);
+            q = q + 1;
+        }
+        oi = oi + 1;
+    }
+    MC_DX = saved_dx;
+    MC_DY = saved_dy;
+
+    # pass 2 — the extremes. ABI only.
+    var g = 0;
+    while (g < 60) {
+        var cz = g * 97;
+        var cx = 0;
+        if ((g % 4) == 1) { cx = MC_TW - 2; }
+        if ((g % 4) == 2) { cx = 2 - MC_TW; }
+        if ((g % 4) == 3) { cx = mc_track_x(cz) + MC_TW - 2; }
+        var n2 = mc_build(cx, cz);
+        tris = tris + n2;
+        dr_flat  = dr_flat  + mc_drop_flat;
+        dr_huge  = dr_huge  + mc_drop_huge;
+        dr_coord = dr_coord + mc_drop_coord;
+        dr_band  = dr_band  + mc_drop_band;
+        frames = frames + 1;
+        mc_ck_list(&mc_vtx_a, mc_n_a);
+        mc_ck_list(&mc_vtx_b, mc_n_b);
+        g = g + 1;
+    }
+
+    ps("  "); pn(frames); ps(" frames built ("); pn(240); ps(" on the ride path, 120 at real screen offsets, ");
+    pn(60); ps(" at extremes), "); pn(tris); ps(" triangles"); nl();
+    ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_BG_TRIS + 8 * 8);
+    ps(" possible"); nl();
+
+    # ---- drops, and the distinction that decides whether one is a hole -----------------------
+    ps("  dropped: coord "); pn(dr_coord); ps("  w-band "); pn(dr_band);
+    ps("  oversize "); pn(dr_huge); ps(" -- these LOSE PIXELS: ");
+    if (dr_coord + dr_band + dr_huge == 0) { ps("none"); nl(); }
+    if (dr_coord + dr_band + dr_huge != 0) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("  dropped: degenerate "); pn(dr_flat);
+    ps(" -- cross is EXACTLY 0 (see geom.cyr), so these cover no pixel and are not holes"); nl();
+
+    # ---- the rule the geometry was designed around ------------------------------------------
+    ps("  peak |D| "); pn(mc_peak_d); ps(" of "); pn(MC_D_MAX);
+    ps(" permitted -- margin "); pn(MC_D_MAX / mc_peak_d); ps("x: ");
+    if (mc_peak_d <= MC_D_MAX) { ps("PASS"); nl(); }
+    if (mc_peak_d > MC_D_MAX) { ps("FAIL -- the batch would be refused GPO_E_DRANGE"); nl(); bad = bad + 1; }
+
+    ps("  peak |N| "); pn(mc_peak_n); ps(" (a register PAIR in the shader; the bound is 2^62): ");
+    if (mc_peak_n <= 4611686018427387904) { ps("PASS"); nl(); }
+    if (mc_peak_n > 4611686018427387904) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    # ---- the re-parse verdict ---------------------------------------------------------------
+    ps("  re-parsed every packed record by the kernel's rules: ");
+    if (mc_ck_fail == 0) { ps("PASS -- 0 violations"); nl(); }
+    if (mc_ck_fail != 0) {
+        ps("FAIL -- "); pn(mc_ck_fail); ps(" violations, first was GPO_E_"); pn(mc_ck_why); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐ NOT AN ABI RULE: is there a picture at all? --------------------------------------
+    var total = (MC_W / MC_CK_STEP) * (MC_H / MC_CK_STEP);
+    ps("  coverage: worst RIDE frame fills "); pn(mincov); ps(" of "); pn(total);
+    ps(" samples, background EXCLUDED"); nl();
+    ps("    -- LEGAL AND EMPTY is the failure a burn cannot tell from a refused batch: ");
+    if (mincov > total / 2) { ps("PASS"); nl(); }
+    if (mincov <= total / 2) { ps("FAIL -- the tunnel does not fill the screen"); nl(); bad = bad + 1; }
+
+    # ---- ⭐⭐ THE FRAME MUST BE EXACTLY ONE RECORD ------------------------------------------
+    # ⛔ THIS GATE EXISTS BECAUSE 0.1.0 SHIPPED TWO AND IT COST AN IRON FRAME. op 0x0F REPLACES its
+    # whole rect — tri_persp.s writes bg to every lane no triangle covered, then stores
+    # unconditionally — so a second record over the same rect paints opaque black over everything
+    # the first drew. The first burn showed the walls and nothing else. Records do not layer, and
+    # nothing in the ABI says so; the only defence is to assert it here.
+    ps("  the frame is ONE op 0x0F record ("); pn(maxlap);
+    ps(" frames emitted a second list): ");
+    if (maxlap == 0) { ps("PASS -- op 0x0F REPLACES its rect, so records cannot be layered"); nl(); }
+    if (maxlap != 0) {
+        ps("FAIL -- a second record would black out the first"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐⭐ THE MUTATION. A gate that cannot fail has not passed. -------------------------
+    # Set one fraction bit in one coordinate of one already-accepted record — the exact defect
+    # that would cost a flash — and require the re-parse to catch it.
+    var saved_fail = mc_ck_fail;
+    var saved_why  = mc_ck_why;
+    mc_ck_fail = 0;
+    var probe = load32(&mc_vtx_a + 0) & 0xFFFFFFFF;
+    store32(&mc_vtx_a + 0, probe + 1);            # one sub-pixel bit
+    mc_ck_rec(&mc_vtx_a);
+    store32(&mc_vtx_a + 0, probe);
+    ps("  MUTATION: one fraction bit set in one coordinate is caught: ");
+    if (mc_ck_fail == 1) {
+        if (mc_ck_why == 30) { ps("PASS -- reported GPO_E_SUBPIXEL"); nl(); }
+        if (mc_ck_why != 30) { ps("FAIL -- caught, but called it "); pn(mc_ck_why); nl(); bad = bad + 1; }
+    }
+    if (mc_ck_fail != 1) {
+        ps("FAIL -- THE GATE CANNOT FAIL, so its passes mean nothing"); nl();
+        bad = bad + 1;
+    }
+    mc_ck_fail = saved_fail;
+    mc_ck_why  = saved_why;
+
+    nl();
+    if (bad == 0) {
+        ps("mine-cart: PASS -- every record this game emits satisfies every rule #92 op 0x0F"); nl();
+        ps("           enforces, the frame is not empty, and the gate is able to fail."); nl();
+        return 95;
+    }
+    ps("mine-cart: FAIL -- "); pn(bad); ps(" propert(ies) broken; do NOT burn this."); nl();
+    return 90;
+}
+
+# ---- the ride --------------------------------------------------------------------------------
+fn mc_ride(limit): i64 {
+    mc_sin_init();
+    mc_tex_init();
+
+    if (mc_fbinfo() != 1) {
+        ps("mine-cart: no framebuffer -- this mode needs agnos"); nl();
+        return 3;
+    }
+    if (mc_gpu_init() != 1) {
+        # ⭐ NAME THE FAILURE. A bare code here read "-1" on the first real-kernel run and could not
+        # be told apart from a dozen other things. The #86 slots come from the GPU CARVEOUT, so an
+        # alloc failure is the ordinary answer on a box with no GPU (QEMU) — not a bug in the game.
+        ps("mine-cart: GPU setup failed -- ");
+        if (mc_gpu_err > 0 - 6) {
+            ps("no carveout shm slot (#86). Expected where there is no GPU;");
+            nl();
+            ps("           on iron this means the carveout is absent or exhausted.");
+        }
+        if (mc_gpu_err < 0 - 5) { ps("texture upload refused (#72)"); }
+        nl();
+        return 4;
+    }
+    ps("mine-cart: "); pn(MC_W); ps("x"); pn(MC_H);
+    ps(" perspective-correct textured triangles on the GPU, into a "); pn(mc_fbw);
+    ps("x"); pn(mc_fbh); ps(" framebuffer"); nl();
+
+    var drawn = 0;
+    var presented = 0;
+    var f = 0;
+    while (1 == 1) {
+        if (limit > 0) { if (f >= limit) { f = limit; break; } }
+        mc_cart_step();
+        mc_build(mc_cart_x, mc_cart_z);
+        if (mc_gpu_frame() != 1) {
+            ps("mine-cart: frame refused at "); pn(f); ps(" -- #92 returned "); pn(mc_gpu_err);
+            nl();
+            ps("           reason "); pn((0 - mc_gpu_err) & 0xFF);
+            ps(" in record "); pn(((0 - mc_gpu_err) >>> 8) & 0xFF); nl();
+            mc_gpu_free();
+            return 5;
+        }
+        # ⛔ CHECK THE PRESENT. #84 returns 0 when the double-buffer is not armed, and an ignored 0
+        # means 900 frames of "success" over a screen that never changed — the silent-nothing class
+        # this whole cut keeps running into. Reported ONCE, not per frame.
+        if (mc_gpu_present() != 1) {
+            if (presented == 0) {
+                ps("mine-cart: #84 present returned 0 -- the double buffer is NOT armed, so nothing");
+                nl();
+                ps("           reaches the panel. The draw may still be fine; the FLIP is not."); nl();
+            }
+            presented = 0 - 1;
+        }
+        if (presented >= 0) { presented = presented + 1; }
+        drawn = drawn + 1;
+        f = f + 1;
+    }
+
+    mc_gpu_free();
+    ps("mine-cart: "); pn(presented); ps(" frames PRESENTED, "); pn(drawn); ps(" drawn, ");
+    pn(mc_cart_z);
+    ps(" world units of track, dropped "); pn(mc_drop_flat + mc_drop_huge + mc_drop_coord + mc_drop_band);
+    ps(" triangles, peak |D| "); pn(mc_peak_d); nl();
+    if (drawn == 0) { return 6; }
+    return 95;
+}
+
+# ---- ⭐⭐ --verify: THE ON-IRON BYTE COMPARE, and the thing that was missing ------------------
+# Renders ONE frame twice — once through #92 op 0x0F on the GPU, once through refcore on the CPU —
+# and compares every pixel. This is what gputri does for the kernel's own rungs, and what mine-cart
+# shipped without: its first iron frame drew the WALLS where the floor and ceiling belonged (a
+# kernel prep-arena race between the frame's two op 0x0F records) and every host assertion passed,
+# because every record was ABI-perfect. Only an image comparison can see a defect like that.
+fn mc_verify(frame): i64 {
+    mc_sin_init();
+    mc_tex_init();
+
+    if (mc_fbinfo() != 1) { ps("mine-cart: no framebuffer -- needs agnos"); nl(); return 3; }
+    if (mc_gpu_init() != 1) { ps("mine-cart: GPU setup failed"); nl(); return 4; }
+
+    mc_cart_to(frame);
+    mc_build(mc_cart_x, mc_cart_z);
+    ps("mine-cart: VERIFY frame "); pn(frame); ps(" -- GPU vs CPU reference, "); pn(mc_n_a);
+    ps(" triangles in ONE op 0x0F record at ("); pn(MC_DX); ps(","); pn(MC_DY); ps(")"); nl();
+
+    # ⛔ POISON FIRST. A #86 slot is a fixed window per index and hands back the previous run's
+    # pixels, so an untouched buffer can read as a pass.
+    var i = 0;
+    while (i < MC_W * MC_H) { store32(&mc_fb + i * 4, 0xA5A5A5A5); i = i + 1; }
+
+    if (mc_gpu_frame() != 1) {
+        ps("mine-cart: frame refused -- #92 returned "); pn(mc_gpu_err);
+        ps(", reason "); pn((0 - mc_gpu_err) & 0xFF);
+        ps(" in record "); pn(((0 - mc_gpu_err) >>> 8) & 0xFF); nl();
+        mc_gpu_free();
+        return 5;
+    }
+    if (mc_gpu_readback() != 1) {
+        ps("mine-cart: readback failed ("); pn(mc_gpu_err); ps(")"); nl();
+        mc_gpu_free();
+        return 6;
+    }
+    mc_gpu_free();
+
+    var untouched = 0;
+    i = 0;
+    while (i < MC_W * MC_H) {
+        if ((load32(&mc_fb + i * 4) & 0xFFFFFFFF) == 0xA5A5A5A5) { untouched = untouched + 1; }
+        i = i + 1;
+    }
+    if (untouched == MC_W * MC_H) {
+        ps("mine-cart: the GPU wrote NOTHING"); nl();
+        return 88;
+    }
+
+    # the reference, same frame, same record order, same textures
+    # ⛔ rr_record, not rr_list: it fills the rect with bg first, exactly as the op does. A
+    # reference that writes only covered pixels is MORE FORGIVING THAN THE HARDWARE and would
+    # report a huge diff against a correct GPU.
+    rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+    var pxa = rr_drawn;
+
+    var diff = 0;
+    var first = 0 - 1;
+    i = 0;
+    while (i < MC_W * MC_H) {
+        if ((load32(&mc_fb + i * 4) & 0xFFFFFFFF) != (load32(&rr_fb + i * 4) & 0xFFFFFFFF)) {
+            if (first < 0) { first = i; }
+            diff = diff + 1;
+        }
+        i = i + 1;
+    }
+
+    ps("  reference drew "); pn(pxa); ps(" px from "); pn(mc_n_a); ps(" triangles"); nl();
+    ps("  GPU buffer untouched at "); pn(untouched); ps(" of "); pn(MC_W * MC_H); ps(" px"); nl();
+    ps("  DIFFER: "); pn(diff); ps(" of "); pn(MC_W * MC_H); ps(" px");
+    if (first >= 0) {
+        ps("  first at ("); pn(first % MC_W); ps(","); pn(first / MC_W); ps(")");
+    }
+    nl();
+    if (diff == 0) {
+        ps("mine-cart: PASS -- byte-identical to the CPU reference at every pixel."); nl();
+        return 95;
+    }
+    ps("mine-cart: FAIL -- the GPU drew a different picture than op 0x0F specifies."); nl();
+    return 86;
+}
+
+fn mc_streq(a, b): i64 {
+    if (mc_slen(a) != mc_slen(b)) { return 0; }
+    var i = 0;
+    while (i < mc_slen(a)) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
+}
+
+fn main(): i64 {
+    # ⚠ argc()/argv() read ZERO until this runs — it is not implicit. It has an agnos path as well
+    # as a Linux one (lib/args_agnos.cyr), so the same call serves both targets.
+    args_init();
+
+    var check  = 0;
+    var verify = 0;
+    var frames = 900;
+    var i = 1;
+    while (i < argc()) {
+        var a = argv(i);
+        if (mc_streq(a, "--check") == 1) { check = 1; }
+        if (mc_streq(a, "--trace") == 1) { mc_trace = 1; }
+        if (mc_streq(a, "--verify") == 1) { verify = 1; }
+        if (mc_streq(a, "--frames") == 1) {
+            i = i + 1;
+            if (i < argc()) {
+                var s = argv(i);
+                var v = 0;
+                var k = 0;
+                while (k < mc_slen(s)) { v = v * 10 + (load8(s + k) - 48); k = k + 1; }
+                frames = v;
+            }
+        }
+        if (mc_streq(a, "--help") == 1) {
+            ps("mine-cart [--check] [--frames N]"); nl();
+            ps("  --check    host gate: re-validate every emitted record, needs no GPU"); nl();
+            ps("  --frames N bound the ride (0 = unbounded)"); nl();
+            return 0;
+        }
+        i = i + 1;
+    }
+    # ⭐ SAY WHICH MODE, AND HOW MANY ARGS WERE SEEN. args_init() reads /proc/self/cmdline on Linux
+    # and takes a different path on agnos, and if it ever returns nothing then argc() is 0 and every
+    # flag silently vanishes — `--check` would quietly become a ride, which on a burn log is
+    # indistinguishable from the gate having been skipped. One line removes that ambiguity.
+    ps("mine-cart: argc "); pn(argc()); ps(" -- mode ");
+    if (check == 1) { ps("CHECK (host gate, no GPU needed)"); nl(); return mc_check(); }
+    if (verify == 1) { ps("VERIFY (GPU vs CPU reference)"); nl(); return mc_verify(120); }
+    ps("RIDE ("); pn(frames); ps(" frames)"); nl();
+    return mc_ride(frames);
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

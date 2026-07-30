@@ -1,0 +1,167 @@
+# gpu.cyr — the #92 op 0x0F draw path, and the readback that turns it into pixels a window can show.
+#
+# The frame, end to end, every syscall of it already proven on archaemenid by the kernel's own
+# rung-18 instrument:
+#
+#   #86 shm_alloc      once — two vertex slots, two texture slots, one readback slot
+#   #72 shm_write      upload the vertex lists this frame (textures go up once, at init)
+#   #92 gpu_shader_op  TWO records: floor+ceiling+background, then walls. ONE dispatch.
+#   #90 gpu_readback   copy the drawn rect OUT of the blit back buffer into the readback slot
+#   #73 shm_read       carry it into the game's own buffer
+#   #39 blit / setu    present
+#
+# ⛔ op 0x0F DRAWS INTO THE KERNEL'S BLIT BACK BUFFER (gpu_bb_a_mc / gpu_bb_b_mc), not into a
+# buffer this program owns and not into a render-target handle. That is why #90 exists and why the
+# readback is not optional: without it the game would be drawing into a surface it cannot see, and
+# under a compositor it shares that surface. Fullscreen is therefore the clean path for now, and
+# the windowed path reads back immediately after the dispatch so the copy sits inside the same
+# uninterrupted syscall sequence as the draw.
+#
+# ⚠ EVERY ONE OF #86/#90/#92 COLLIDES WITH A REAL LINUX SYSCALL — #90 is chmod, #92 is chown, both
+# metadata WRITES. That is not a portability nuisance, it is a hazard: off agnos these would
+# succeed and touch the filesystem. Hence the whole-function #ifdef, never an inline branch.
+
+var mc_fb[128000];         # 1,024,000 B = 640*400*4. Checked at runtime by mc_fb_ok().
+var mc_slot_va = 0;
+var mc_slot_vb = 0;
+var mc_slot_ta = 0;
+var mc_slot_tb = 0;
+var mc_slot_fb = 0;
+var mc_gpu_up  = 0;
+var mc_gpu_err = 0;        # last -((idx<<8)|reason) from #92, unpacked below
+
+fn mc_fb_bytes(): i64 { return MC_W * MC_H * 4; }
+
+# ⛔ MEASURE, DO NOT ASSUME. The allocation unit of a module-global `var X[N]` has been measured to
+# differ between files in this language, and an 8x under-sized frame buffer is a silent overrun
+# into whatever follows it. The kernel's own instrument lost a burn to exactly this: the overflow
+# landed on its triangle COUNT, and the symptom read as "the GPU did nothing".
+fn mc_fb_ok(): i64 {
+    var span = &mc_slot_va - &mc_fb;
+    if (span < mc_fb_bytes()) { return 0; }
+    return 1;
+}
+
+# ---- the console geometry, so the draw rect cannot fall outside it ---------------------------
+# A draw rect wider than the framebuffer is GPO_E_BOUNDS, which rejects THE WHOLE BATCH — the
+# frame comes back as whatever the slot held before. Ask, do not assume 640x400 fits.
+var mc_fbw = 0;
+var mc_fbh = 0;
+
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_fbinfo(): i64 {
+    var info[24];
+    var i = 0;
+    while (i < 24) { store8(&info + i, 0); i = i + 1; }
+    if (syscall(38, &info, 24) != 0) { return 0; }
+    mc_fbw = load32(&info + 0) & 0xFFFFFFFF;
+    mc_fbh = load32(&info + 4) & 0xFFFFFFFF;
+    if (mc_fbw < MC_W) { return 0; }
+    if (mc_fbh < MC_H) { return 0; }
+    # ⚠ CENTRE, THEN ROUND DOWN TO THE TILE. dx and dy must be multiples of GPU_TILE (8) or the
+    # record is refused GPO_E_ALIGN — and on an 800x600 console the exact centre is (80,100), where
+    # 100 is NOT a multiple of 8. Masking gives (80,96): four pixels above centre, and legal.
+    MC_DX = ((mc_fbw - MC_W) / 2) & 0xFFFFFFF8;
+    MC_DY = ((mc_fbh - MC_H) / 2) & 0xFFFFFFF8;
+    return 1;
+}
+#else
+fn mc_fbinfo(): i64 { return 0; }
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_gpu_init(): i64 {
+    var vbytes = MC_TRI_MAX * 64;
+    var tbytes = MC_TEX * MC_TEX * 4;
+
+    # ⛔ ONE vertex slot and ONE texture slot — the frame is a SINGLE op 0x0F record now, because
+    # the op replaces its whole rect and records therefore cannot be layered.
+    mc_slot_va = syscall(86, vbytes);
+    if (mc_slot_va < 1) { mc_gpu_err = 0 - 1; return 0; }
+    mc_slot_ta = syscall(86, tbytes);
+    if (mc_slot_ta < 1) { mc_gpu_err = 0 - 3; return 0; }
+    mc_slot_fb = syscall(86, mc_fb_bytes());
+    if (mc_slot_fb < 1) { mc_gpu_err = 0 - 5; return 0; }
+
+    # the texture is immutable — upload once, not per frame
+    if (syscall(72, mc_slot_ta, &mc_tex_a, tbytes) != 0) { mc_gpu_err = 0 - 6; return 0; }
+
+    mc_gpu_up = 1;
+    return 1;
+}
+#else
+fn mc_gpu_init(): i64 { return 0; }
+#endif
+
+# ---- one frame: upload, dispatch, read back ---------------------------------------------------
+# Returns 1 on success. On refusal mc_gpu_err carries #92's -((idx<<8)|reason) verbatim, so a
+# failure names WHICH record and WHICH rule — the difference between a five-minute fix and a burn.
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_gpu_frame(): i64 {
+    if (mc_gpu_up != 1) { return 0; }
+    if (syscall(72, mc_slot_va, &mc_vtx_a, mc_n_a * 64) != 0) { mc_gpu_err = 0 - 8; return 0; }
+
+    # ⛔ CLEAR THE WHOLE BACK BUFFER FIRST. The draw rect is 640x400 inside an 800x600 buffer, and
+    # the surround is never written by op 0x0F. Without this it holds whatever the PREVIOUS use of
+    # this buffer left — and since #84 flips between two buffers, that is frame N-2, which flickers.
+    syscall(85, 0, 0, 0);
+
+    var d[64];
+    var i = 0;
+    while (i < 64) { store8(&d + i, 0); i = i + 1; }
+    store32(&d +  0, 15);                              # GPU_OP_TRI_PERSP
+    store32(&d +  8, mc_slot_ta);
+    store32(&d + 12, mc_slot_va);
+    store32(&d + 16, (MC_H * 65536) + MC_W);
+    store32(&d + 20, (MC_DY * 65536) + MC_DX);         # ⭐ straight to its place on screen
+    store32(&d + 24, mc_n_a);
+    store32(&d + 28, (MC_TEX * 65536) + MC_TEX);
+
+    var rc = syscall(92, &d, 64);
+    if (rc != 0) { mc_gpu_err = rc; return 0; }
+    return 1;
+}
+
+# present the finished back buffer — the explicit half of the blit/present split
+fn mc_gpu_present(): i64 { return syscall(84); }
+
+# ⭐ Only --verify needs the pixels back. The RIDE does not: it draws straight to the final position
+# and flips. The old path (draw at 0,0 -> #90 -> #73 -> #39 at 80,100) blitted into the SAME back
+# buffer it had drawn into, because #39 targets gpu_bb_a/b exactly as op 0x0F does — so the
+# un-offset original stayed visible as an L-shaped band. That was the first frame's "duplicated
+# area", and this seam is where it came from.
+fn mc_gpu_readback(): i64 {
+    if (syscall(90, mc_slot_fb, (MC_H * 65536) + MC_W, (MC_DY * 65536) + MC_DX) != 0) {
+        mc_gpu_err = 0 - 10; return 0;
+    }
+    if (syscall(73, mc_slot_fb, &mc_fb, mc_fb_bytes()) != 0) { mc_gpu_err = 0 - 11; return 0; }
+    return 1;
+}
+#else
+fn mc_gpu_frame(): i64 { return 0; }
+fn mc_gpu_present(): i64 { return 0; }
+fn mc_gpu_readback(): i64 { return 0; }
+#endif
+
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_gpu_free(): i64 {
+    if (mc_slot_va > 0) { syscall(74, mc_slot_va); }
+    if (mc_slot_ta > 0) { syscall(74, mc_slot_ta); }
+    if (mc_slot_fb > 0) { syscall(74, mc_slot_fb); }
+    mc_gpu_up = 0;
+    return 0;
+}
+#else
+fn mc_gpu_free(): i64 { return 0; }
+#endif
+
+# ---- fullscreen presentation: the graphical-takeover path doom already uses -------------------
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_blit_fullscreen(): i64 {
+    var ox = (mc_fbw - MC_W) / 2;
+    var oy = (mc_fbh - MC_H) / 2;
+    return syscall(39, &mc_fb, MC_W, MC_H, (oy * 65536) + ox);
+}
+#else
+fn mc_blit_fullscreen(): i64 { return 0; }
+#endif

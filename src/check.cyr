@@ -1,0 +1,218 @@
+# check.cyr — the host gate. Runs on Linux, where there is no #92 and no GPU, and answers the one
+# question a burn cannot answer cheaply: WILL THE KERNEL ACCEPT WHAT THIS GAME EMITS?
+#
+# ⛔⛔ WHY THIS EXISTS AT ALL. `syscall(92, recs, n*64)` validates EVERY record before dispatching
+# ANY of them — a rejected batch draws nothing whatsoever. So the difference between a correct
+# game and one with a single fraction bit set in one vertex is not a slightly wrong picture, it is
+# a black screen, and on this hardware a black screen costs a flash, a reboot, and an adjudication
+# that cannot distinguish "record refused" from "no GPU" from "shader wrote nothing". Every rule
+# the kernel enforces is re-derived here from the PACKED BYTES, over a scripted run of the actual
+# game, before any of that is spent.
+#
+# ⭐ THE RE-PARSE IS THE POINT, and it is the lesson the kernel's own rungs paid for twice. Checking
+# the emitter's INPUTS proves only that the inputs were sane; rung 17 shipped a kernarg swap where
+# every witness was correct and both orderings were byte-identical, and rung 15 shipped a
+# half-texel offset past four green gates because every implementation shared the convention. So
+# this gate re-reads the 64-byte records exactly as the kernel will — sign-extending the same way,
+# masking the same way, at the same four draw-rect corners — and never looks at the values that
+# were passed in.
+
+fn mc_i32(p): i64 {
+    var v = load32(p) & 0xFFFFFFFF;
+    if (v >= 2147483648) { v = v - 4294967296; }
+    return v;
+}
+
+var mc_ck_fail = 0;         # rule violations found in the packed records
+var mc_ck_why  = 0;         # first violation's code, for the report
+
+fn mc_ck_note(code): i64 {
+    if (mc_ck_fail == 0) { mc_ck_why = code; }
+    mc_ck_fail = mc_ck_fail + 1;
+    return 0;
+}
+
+# ---- re-validate ONE packed record, from its bytes, by the kernel's rules ---------------------
+# codes mirror the kernel's GPO_E_* so a host failure names the same thing a burn would
+fn mc_ck_rec(b): i64 {
+    if ((load32(b + 60) & 0xFFFFFFFF) != 0) { return mc_ck_note(21); }   # reserved dword
+
+    var f = 0;
+    while (f < 3) {
+        var cx = mc_i32(b + f * 20 + 0);
+        var cy = mc_i32(b + f * 20 + 4);
+        if (cx > MC_COORD_MAX) { return mc_ck_note(20); }
+        if (cy > MC_COORD_MAX) { return mc_ck_note(20); }
+        if (cx < 0 - MC_COORD_MAX) { return mc_ck_note(20); }
+        if (cy < 0 - MC_COORD_MAX) { return mc_ck_note(20); }
+        if ((cx & 0xFFFF) != 0) { return mc_ck_note(30); }               # GPO_E_SUBPIXEL
+        if ((cy & 0xFFFF) != 0) { return mc_ck_note(30); }
+        f = f + 1;
+    }
+
+    var w0 = load32(b +  8) & 0xFFFFFFFF;
+    var w1 = load32(b + 28) & 0xFFFFFFFF;
+    var w2 = load32(b + 48) & 0xFFFFFFFF;
+    if (w0 < MC_W_MIN) { return mc_ck_note(33); }
+    if (w1 < MC_W_MIN) { return mc_ck_note(33); }
+    if (w2 < MC_W_MIN) { return mc_ck_note(33); }
+    if (w0 > MC_W_MAX) { return mc_ck_note(33); }
+    if (w1 > MC_W_MAX) { return mc_ck_note(33); }
+    if (w2 > MC_W_MAX) { return mc_ck_note(33); }
+
+    var dax = 2 * (mc_i32(b +  0) >>> 16);  var day = 2 * (mc_i32(b +  4) >>> 16);
+    var dbx = 2 * (mc_i32(b + 20) >>> 16);  var dby = 2 * (mc_i32(b + 24) >>> 16);
+    var dcx = 2 * (mc_i32(b + 40) >>> 16);  var dcy = 2 * (mc_i32(b + 44) >>> 16);
+
+    var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
+    if (cross < 0) { cross = 0 - cross; }
+    var a2 = cross << 16;
+    if (a2 < MC_AREA_MIN) { return mc_ck_note(22); }                     # GPO_E_AREA
+    if (a2 > MC_AREA_MAX) { return mc_ck_note(22); }
+
+    var W0 = 65536 / w0;
+    var W1 = 65536 / w1;
+    var W2 = 65536 / w2;
+    var u0 = load32(b + 12) & 0xFFFFFFFF;  var v0 = load32(b + 16) & 0xFFFFFFFF;
+    var u1 = load32(b + 32) & 0xFFFFFFFF;  var v1 = load32(b + 36) & 0xFFFFFFFF;
+    var u2 = load32(b + 52) & 0xFFFFFFFF;  var v2 = load32(b + 56) & 0xFFFFFFFF;
+
+    var qx0 = 1;  var qx1 = 2 * (MC_W - 1) + 1;
+    var qy0 = 1;  var qy1 = 2 * (MC_H - 1) + 1;
+    var k = 0;
+    while (k < 4) {
+        var qx = qx0; var qy = qy0;
+        if (k == 1) { qx = qx1; qy = qy0; }
+        if (k == 2) { qx = qx0; qy = qy1; }
+        if (k == 3) { qx = qx1; qy = qy1; }
+        var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
+        var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
+        var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
+        var D = e0 * W0 + e1 * W1 + e2 * W2;
+        if (D < 0) { D = 0 - D; }
+        if (D > MC_D_MAX) { return mc_ck_note(34); }                     # GPO_E_DRANGE
+        var Nu = e0 * (W0 * u0) + e1 * (W1 * u1) + e2 * (W2 * u2);
+        var Nv = e0 * (W0 * v0) + e1 * (W1 * v1) + e2 * (W2 * v2);
+        if (Nu < 0) { Nu = 0 - Nu; }
+        if (Nv < 0) { Nv = 0 - Nv; }
+        if (Nu > 4611686018427387904) { return mc_ck_note(34); }
+        if (Nv > 4611686018427387904) { return mc_ck_note(34); }
+        k = k + 1;
+    }
+    return 0;
+}
+
+fn mc_ck_list(list, n): i64 {
+    var i = 0;
+    while (i < n) { mc_ck_rec(list + i * 64); i = i + 1; }
+    return 0;
+}
+
+# ---- coarse coverage: does the tunnel actually FILL the screen? -------------------------------
+# ⭐ THE ONE CHECK THAT IS NOT AN ABI RULE, and the reason it is here: a frame can satisfy every
+# rule the kernel enforces and still project to nothing at all. "Legal" and "visible" are different
+# claims, and a burn that comes back black would otherwise be indistinguishable from a refused
+# batch. Sampled every 4th pixel in each axis, using the same doubled-integer edge functions and
+# pixel-centre convention the shader uses, so a covered sample here is a covered pixel there.
+var MC_CK_STEP = 4;
+
+fn mc_ck_hit(b, qx, qy): i64 {
+    var dax = 2 * (mc_i32(b +  0) >>> 16);  var day = 2 * (mc_i32(b +  4) >>> 16);
+    var dbx = 2 * (mc_i32(b + 20) >>> 16);  var dby = 2 * (mc_i32(b + 24) >>> 16);
+    var dcx = 2 * (mc_i32(b + 40) >>> 16);  var dcy = 2 * (mc_i32(b + 44) >>> 16);
+    var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
+    var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
+    var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
+    var neg = 0;
+    var pos = 0;
+    if (e0 < 0) { neg = neg + 1; }
+    if (e1 < 0) { neg = neg + 1; }
+    if (e2 < 0) { neg = neg + 1; }
+    if (e0 > 0) { pos = pos + 1; }
+    if (e1 > 0) { pos = pos + 1; }
+    if (e2 > 0) { pos = pos + 1; }
+    if (neg == 0) { return 1; }
+    if (pos == 0) { return 1; }
+    return 0;
+}
+
+# ⛔⛔ THE TWO DEFECTS THIS SIGNATURE EXISTS TO FIX, both found by reading the gate's own output
+# rather than by it failing — which is the whole reason a gate reports numbers and not just a verdict.
+#
+#   1. SUMMING TWO LISTS DOUBLE-COUNTS. The floor and the walls overlap in screen space, so
+#      cover(A) + cover(B) reported 19440 of 16000 possible samples. A count larger than its own
+#      denominator passes any threshold, so the check could not have failed.
+#   2. ⭐ THE BACKGROUND QUAD COVERS THE WHOLE SCREEN BY CONSTRUCTION. It is the first primitive in
+#      list A and it exists precisely to write every pixel of the rect. Counting it means "does the
+#      frame fill the screen" is answered YES by a frame in which every tunnel triangle collapsed to
+#      nothing — the exact empty-frame case this check was added to detect. `sa` skips it.
+#
+# So: a UNION over both lists, with the background excluded, which is the only version of this
+# measurement that can distinguish a tunnel from a blank fill.
+fn mc_ck_cover(la, sa, na, lb, sb, nb): i64 {
+    var hit = 0;
+    var py = 0;
+    while (py < MC_H) {
+        var px = 0;
+        while (px < MC_W) {
+            var qx = 2 * px + 1;
+            var qy = 2 * py + 1;
+            var inside = 0;
+            var i = sa;
+            while (i < na) {
+                if (mc_ck_hit(la + i * 64, qx, qy) == 1) { inside = 1; i = na; }
+                i = i + 1;
+            }
+            if (inside == 0) {
+                var j = sb;
+                while (j < nb) {
+                    if (mc_ck_hit(lb + j * 64, qx, qy) == 1) { inside = 1; j = nb; }
+                    j = j + 1;
+                }
+            }
+            if (inside == 1) { hit = hit + 1; }
+            px = px + MC_CK_STEP;
+        }
+        py = py + MC_CK_STEP;
+    }
+    return hit;
+}
+
+# ---- ⭐ DOES RECORD ORDER MATTER? -------------------------------------------------------------
+# The frame is ONE #92 dispatch carrying TWO op 0x0F records, and records execute in order: every
+# wall is drawn after every floor and ceiling, regardless of depth. Painter's order is the depth
+# test here (op 0x0F REPLACES rather than compositing), so that split is only sound if the two
+# lists do not fight over pixels — a far wall drawn after a near floor would punch through it.
+#
+# The geometric argument is that a tunnel is a closed box seen from inside, so its faces TILE the
+# screen and meet at silhouette edges rather than overlapping. That argument is exactly the kind
+# this project has been burned by: plausible, shared by every implementation, and never measured.
+# So measure it. A large overlap means the two-record split is wrong and the frame needs either one
+# record or a real depth buffer (op 0x0E).
+fn mc_ck_overlap(la, sa, na, lb, sb, nb): i64 {
+    var both = 0;
+    var py = 0;
+    while (py < MC_H) {
+        var px = 0;
+        while (px < MC_W) {
+            var qx = 2 * px + 1;
+            var qy = 2 * py + 1;
+            var inA = 0;
+            var i = sa;
+            while (i < na) {
+                if (mc_ck_hit(la + i * 64, qx, qy) == 1) { inA = 1; i = na; }
+                i = i + 1;
+            }
+            if (inA == 1) {
+                var j = sb;
+                while (j < nb) {
+                    if (mc_ck_hit(lb + j * 64, qx, qy) == 1) { both = both + 1; j = nb; }
+                    j = j + 1;
+                }
+            }
+            px = px + MC_CK_STEP;
+        }
+        py = py + MC_CK_STEP;
+    }
+    return both;
+}

@@ -1,0 +1,408 @@
+# geom.cyr — the track, the camera, and the GPU record emitter.
+#
+# ⭐ THIS FILE IS THE GAME'S HALF OF THE #92 op 0x0F ABI. Everything the kernel's
+# gpo_validate_triperspec refuses is refused HERE first, because a single bad record does not
+# draw a bad triangle — it makes `syscall(92, ...)` reject THE WHOLE BATCH, and the frame comes
+# back as whatever was in the slot before. A black screen on iron is the most expensive way to
+# discover a coordinate with a fraction bit set.
+#
+# The rules, all of them, and where each number comes from (agnos kernel/core/syscall.cyr):
+#   · coordinates are 16.16 with the fraction EXACTLY zero        GPO_E_SUBPIXEL
+#   · |coordinate| <= 2^28 (i.e. +-4096 px)                       GPO_E_COORD
+#   · per-vertex w in [256, 4096]                                 GPO_E_WRANGE
+#   · frame area in [2^16, 2^42] — no degenerate triangles        GPO_E_AREA
+#   · texture dims are POWERS OF TWO, unconditionally             GPO_E_TEXDIM
+#   · <= 256 triangles per record                                 GPO_E_TRILIST
+#   · the per-triangle reserved dword is zero                     GPO_E_TRILIST
+#   · |D| <= 2^31-1 at the four DRAW RECT corners                 GPO_E_DRANGE
+#
+# ⛔⛔ THE D RULE IS THE ONE THAT BITES, and it is why this file's constants are what they are.
+# D = e0*W0 + e1*W1 + e2*W2 where W_i = 2^16 / w_i, and the edge functions e are evaluated at the
+# corners of the DRAW RECT — not of the triangle. So a small triangle in the middle of the screen
+# still gets its denominator measured a thousand pixels away, and the bound scales with the rect.
+# A near plane at w = 512 rather than the ABI floor of 256 halves every W and buys the margin.
+# mc_band_check() below computes the kernel's D exactly; check.cyr proves it stays in band across
+# a whole scripted run.
+
+# ---- the screen. Both axes MUST be multiples of GPU_TILE (8) or the record is GPO_E_ALIGN. ----
+var MC_W  = 640;
+var MC_H  = 400;
+var MC_CX = 320;
+var MC_CY = 200;
+
+# ---- the camera frustum ----------------------------------------------------------------------
+# w = MC_WSC * rz, so the near plane sits at w = 256 and the far plane at w = 4096.
+#
+# ⭐⭐ 16:1 IS NOT A PREFERENCE, IT IS THE CEILING THE ABI IMPOSES, and the geometry is built to use
+# all of it. w must lie in [256, 4096] and w is proportional to depth, so z_far/z_near can never
+# exceed 4096/256 = 16 no matter what scale is chosen — picking a bigger MC_WSC to pull the near
+# plane closer pulls the far plane in by the same factor. An earlier 8:1 setting (near plane at
+# z = 64) left half the available depth on the table, and the visible cost was specific: everything
+# nearer than the near plane is not drawn, which is exactly the geometry that should sweep out to
+# the sides and fill the screen when the cart passes close to a wall. Doubling the range fixed it.
+var MC_FOCAL = 320;
+var MC_ZN    = 32;         # near plane, world units.  w = 256, the ABI floor exactly
+var MC_ZF    = 512;        # far plane.                w = 4096, the ABI ceiling exactly
+var MC_WSC   = 8;
+var MC_SEG   = 60;         # one tunnel segment; (512-32)/60 = 8 segments exactly
+
+# ---- the tunnel cross-section, world units ----------------------------------------------------
+# At the near plane a wall lands at MC_TW*MC_FOCAL/MC_ZN = 640 px from centre — off the screen
+# edge, which is what being INSIDE a tunnel looks like as opposed to looking at a box from outside.
+var MC_TW      = 64;       # half-width
+var MC_FLOOR_Y = 56;       # +y is down
+var MC_CEIL_Y  = 56;       # emitted as -y
+
+# ---- the texture. Power of two on BOTH axes, unconditionally. ---------------------------------
+var MC_TEX      = 128;
+var MC_TEXFULL  = 8388608;    # 128 << 16 — one full wrap of the texture, in 16.16 texels
+
+# ---- caps ------------------------------------------------------------------------------------
+var MC_TRI_MAX  = 128;        # per record; the kernel's GPU_TPER_LIST_MAX is 256
+var MC_W_MIN    = 256;
+var MC_W_MAX    = 4096;
+var MC_COORD_MAX = 268435456; # 2^28
+var MC_D_MAX    = 2147483647; # 2^31-1
+var MC_AREA_MIN = 65536;
+var MC_AREA_MAX = 4398046511104;
+
+# the background quad, always the FIRST two triangles of list A. Named because check.cyr must skip
+# it to measure anything: it covers the whole rect by design, so counting it makes an empty-tunnel
+# frame look full.
+# ⛔ NO BACKGROUND QUAD ANY MORE. op 0x0F fills its whole rect with bg before any triangle lands,
+# so a full-screen quad to "clear" was always redundant — and with ONE record it is pure waste.
+var MC_BG_TRIS  = 0;
+
+# ---- the draw-rect ORIGIN on screen -----------------------------------------------------------
+# ⭐ The frame is now drawn STRAIGHT to its final position in the back buffer and presented with
+# #84 — no #90 readback, no #73 copy, no #39 blit. The old round-trip wrote the frame into the back
+# buffer at (0,0), read it out, then blitted it back at (80,100) OF THE SAME BUFFER (#39 targets
+# gpu_bb_a/b exactly as op 0x0F does), leaving the un-offset original visible as an L-shaped band
+# down the top and left. That was the "duplicated area" in the first iron frame.
+# ⚠ BOTH MUST BE MULTIPLES OF 8 or the record is GPO_E_ALIGN — (800-400)/2 = 100 is NOT, which is
+# why these are masked down rather than centred exactly.
+var MC_DX = 0;
+var MC_DY = 0;
+
+# ---- the two vertex lists. 64 B per triangle, exactly GPU_TPER_VTX_BYTES. ---------------------
+# ⚠ SIZED IN u64 SLOTS, and the game verifies that at runtime in mc_bufs_ok(). A module-global
+# `var X[N]` is N*8 bytes here, but that has been measured to differ by file in this language and
+# an 8x under-sized vertex buffer is exactly the overflow that cost the kernel's own instrument a
+# burn — it corrupted the triangle COUNT, which reads as "the GPU did nothing".
+var mc_vtx_a[1024];        # 8192 B = 128 triangles — floor, ceiling and the background
+var mc_vtx_b[1024];        # 8192 B = 128 triangles — the walls
+var mc_n_a = 0;
+var mc_n_b = 0;
+
+# ---- rejection counters. A dropped triangle is a hole in the tunnel, so these must stay 0. ----
+var mc_drop_flat  = 0;   # exactly-degenerate: cross == 0, so it covers no pixel at all
+var mc_drop_huge  = 0;   # past the area ceiling — a REAL hole
+var mc_drop_coord = 0;
+var mc_drop_band  = 0;
+var mc_peak_d     = 0;
+var mc_peak_n     = 0;
+var mc_trace      = 0;   # 1 = report every dropped triangle, for diagnosis
+
+fn mc_bufs_ok(): i64 {
+    # the allocation unit is not portable across files in this language, so MEASURE it rather
+    # than trust it: two adjacent lists must be at least MC_TRI_MAX*64 apart.
+    var span = &mc_vtx_b - &mc_vtx_a;
+    if (span < MC_TRI_MAX * 64) { return 0; }
+    return 1;
+}
+
+# ---- a quarter sine table, 1.12 fixed point (4096 = 1.0) --------------------------------------
+var mc_sintab[17];
+
+fn mc_sin_init(): i64 {
+    store64(&mc_sintab +  0 * 8, 0);
+    store64(&mc_sintab +  1 * 8, 401);
+    store64(&mc_sintab +  2 * 8, 799);
+    store64(&mc_sintab +  3 * 8, 1189);
+    store64(&mc_sintab +  4 * 8, 1567);
+    store64(&mc_sintab +  5 * 8, 1931);
+    store64(&mc_sintab +  6 * 8, 2276);
+    store64(&mc_sintab +  7 * 8, 2598);
+    store64(&mc_sintab +  8 * 8, 2896);
+    store64(&mc_sintab +  9 * 8, 3166);
+    store64(&mc_sintab + 10 * 8, 3406);
+    store64(&mc_sintab + 11 * 8, 3612);
+    store64(&mc_sintab + 12 * 8, 3784);
+    store64(&mc_sintab + 13 * 8, 3920);
+    store64(&mc_sintab + 14 * 8, 4017);
+    store64(&mc_sintab + 15 * 8, 4076);
+    store64(&mc_sintab + 16 * 8, 4096);
+    return 0;
+}
+
+# sine at a phase measured in 64ths of a full turn, by quadrant mirroring
+fn mc_sin(p): i64 {
+    p = p & 63;
+    if (p < 17) { return load64(&mc_sintab + p * 8); }
+    if (p < 32) { return load64(&mc_sintab + (32 - p) * 8); }
+    if (p < 49) { return 0 - load64(&mc_sintab + (p - 32) * 8); }
+    return 0 - load64(&mc_sintab + (64 - p) * 8);
+}
+
+# sine at a phase in 1024ths of a turn, linearly interpolated between table entries.
+# ⚠ Without the interpolation the track kinks once every 32 world units, and the segments are 56
+# long, so every seam would visibly hinge.
+fn mc_sin_i(ph): i64 {
+    var idx  = (ph >>> 4) & 63;
+    var frac = ph & 15;
+    var a = mc_sin(idx);
+    var b = mc_sin(idx + 1);
+    return a + ((b - a) * frac) / 16;
+}
+
+# ---- the track: where the tunnel's centre line sits at a given world z ------------------------
+var MC_CURVE_AMP = 40;      # world units of lateral sway; MC_TW is 64, so the tunnel really moves
+var MC_CURVE_PER = 3072;    # world units per full turn
+
+fn mc_track_x(wz): i64 {
+    var ph = (wz * 1024) / MC_CURVE_PER;
+    return (MC_CURVE_AMP * mc_sin_i(ph)) >>> 12;
+}
+
+# ---- projection ------------------------------------------------------------------------------
+# rz is ALWAYS >= MC_ZN: the segment grid is anchored to the near plane so nothing is ever behind
+# the camera and no near-plane clipping is needed. That is a geometry choice made specifically to
+# avoid a clipper, because a clipper is where the fraction bits and the degenerate triangles come
+# from, and both of those are whole-batch rejections.
+fn mc_px(rx, rz): i64 { return MC_CX + (rx * MC_FOCAL) / rz; }
+fn mc_py(ry, rz): i64 { return MC_CY + (ry * MC_FOCAL) / rz; }
+fn mc_wof(rz): i64    { return MC_WSC * rz; }
+
+# ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------
+# ⭐ This is not a paraphrase of the rule. It is the same expression, on the same doubled-integer
+# domain, at the same four draw-rect corners, so that "the game accepts it" and "the kernel
+# accepts it" cannot drift apart. Coordinates arrive in PIXELS, matching the kernel's
+# `gpo_i32(b) >>> 16`.
+fn mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
+    # ⚠ THE CORNERS ARE THE DRAW RECT'S, AND THE RECT NO LONGER STARTS AT THE ORIGIN. Drawing at
+    # dstxy pushes qx1/qy1 outward and grows |D| with them — at an 800x600 console (80,96) that is
+    # ~12%, and on a 2560x1440 console it is far more. Evaluating this at (0,0) while the kernel
+    # evaluates it at dstxy would understate the bound the gate exists to enforce.
+    var qx0 = 2 * MC_DX + 1;
+    var qx1 = 2 * (MC_DX + MC_W - 1) + 1;
+    var qy0 = 2 * MC_DY + 1;
+    var qy1 = 2 * (MC_DY + MC_H - 1) + 1;
+
+    var dax = 2 * x0; var day = 2 * y0;
+    var dbx = 2 * x1; var dby = 2 * y1;
+    var dcx = 2 * x2; var dcy = 2 * y2;
+
+    var W0 = 65536 / w0;
+    var W1 = 65536 / w1;
+    var W2 = 65536 / w2;
+
+    var k = 0;
+    while (k < 4) {
+        var qx = qx0; var qy = qy0;
+        if (k == 1) { qx = qx1; qy = qy0; }
+        if (k == 2) { qx = qx0; qy = qy1; }
+        if (k == 3) { qx = qx1; qy = qy1; }
+        var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
+        var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
+        var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
+
+        var D = e0 * W0 + e1 * W1 + e2 * W2;
+        if (D < 0) { D = 0 - D; }
+        if (D > mc_peak_d) { mc_peak_d = D; }
+        if (D > MC_D_MAX) { return 0; }
+
+        var Nu = e0 * (W0 * u0) + e1 * (W1 * u1) + e2 * (W2 * u2);
+        var Nv = e0 * (W0 * v0) + e1 * (W1 * v1) + e2 * (W2 * v2);
+        if (Nu < 0) { Nu = 0 - Nu; }
+        if (Nv < 0) { Nv = 0 - Nv; }
+        if (Nu > mc_peak_n) { mc_peak_n = Nu; }
+        if (Nv > mc_peak_n) { mc_peak_n = Nv; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+# ---- emit one triangle into a list -----------------------------------------------------------
+# Returns 1 when the triangle was written, 0 when it was DROPPED. A drop is a visible hole, so
+# every drop is counted and the game reports the totals; a run that drops anything is a bug in
+# the geometry, not a tolerable loss.
+fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
+    var n = load64(np);
+    if (n >= MC_TRI_MAX) { return 0; }
+
+    # coordinate window, +-4096 px
+    if (x0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+
+    # w band — the kernel refuses, never rescales
+    if (w0 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w1 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w2 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w0 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w1 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w2 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+
+    # frame area, in the kernel's doubled-integer domain
+    var dax = 2 * x0; var day = 2 * y0;
+    var dbx = 2 * x1; var dby = 2 * y1;
+    var dcx = 2 * x2; var dcy = 2 * y2;
+    var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
+    if (cross < 0) { cross = 0 - cross; }
+    # ⭐ THE AREA-MIN RULE CAN ONLY FIRE AT cross == 0, and that is worth stating because it decides
+    # whether a drop is a hole. a2 is |cross| << 16 and MC_AREA_MIN is 1 << 16, so a2 < MC_AREA_MIN
+    # requires |cross| < 1, i.e. |cross| == 0 — the triangle is EXACTLY collinear and covers no pixel
+    # in any rasteriser. Far tunnel segments produce these routinely: two wall edges a fraction of a
+    # pixel apart round to the same integer column, and the ABI forbids sub-pixel coordinates. So
+    # these drops are provably invisible, unlike a w-band or coordinate drop, which loses real pixels.
+    var a2 = cross << 16;
+    if (a2 < MC_AREA_MIN) {
+        mc_drop_flat = mc_drop_flat + 1;
+        if (mc_trace == 1) {
+            ps("    degenerate: ("); pn(x0); ps(","); pn(y0); ps(") (");
+            pn(x1); ps(","); pn(y1); ps(") ("); pn(x2); ps(","); pn(y2);
+            ps(")  w "); pn(w0); ps("/"); pn(w1); ps("/"); pn(w2); nl();
+        }
+        return 0;
+    }
+    # ⚠ NOT a flat drop — a triangle past the area ceiling is a LARGE one, and losing it loses real
+    # pixels. Counted apart so the gate can hold it to zero while tolerating the degenerate slivers.
+    if (a2 > MC_AREA_MAX) { mc_drop_huge = mc_drop_huge + 1; return 0; }
+
+    if (mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2) == 0) {
+        mc_drop_band = mc_drop_band + 1;
+        return 0;
+    }
+
+    var b = list + n * 64;
+    store32(b +  0, x0 << 16); store32(b +  4, y0 << 16); store32(b +  8, w0);
+    store32(b + 12, u0);       store32(b + 16, v0);
+    store32(b + 20, x1 << 16); store32(b + 24, y1 << 16); store32(b + 28, w1);
+    store32(b + 32, u1);       store32(b + 36, v1);
+    store32(b + 40, x2 << 16); store32(b + 44, y2 << 16); store32(b + 48, w2);
+    store32(b + 52, u2);       store32(b + 56, v2);
+    store32(b + 60, 0);                       # the reserved dword — non-zero is GPO_E_TRILIST
+    store64(np, n + 1);
+    return 1;
+}
+
+# ---- emit a quad as two triangles, corners in order a-b-c-d ----------------------------------
+fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd): i64 {
+    var got = 0;
+    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc);
+    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd);
+    return got;
+}
+
+# ---- build one frame -------------------------------------------------------------------------
+# Segments are walked FAR TO NEAR: op 0x0F REPLACES the destination pixel rather than compositing,
+# so painter's order is the depth test. The tunnel is convex from the inside and nothing
+# interpenetrates, which is what makes that sound here without op 0x0E's z buffer.
+fn mc_build(cam_x, cam_z): i64 {
+    mc_n_a = 0;
+    mc_n_b = 0;                 # ⛔ ALWAYS 0 NOW — see below. Kept so consumers still compile.
+    mc_drop_flat = 0;
+    mc_drop_huge = 0;
+    mc_drop_coord = 0;
+    mc_drop_band = 0;
+
+    # ⛔⛔ ONE RECORD, ONE LIST. The frame used to be two op 0x0F records (floor+ceiling, then
+    # walls) and that is UNSOUND for this op: it replaces its ENTIRE rect, writing bg wherever no
+    # triangle covered the lane, so the second record painted opaque black over everything the first
+    # had drawn. The first iron frame showed the walls and nothing else. Records do not layer.
+    # ⇒ Everything goes in one list against one texture, materials banded along u:
+    #      floor + ceiling  u in [0, MC_TEX_HALF)      the left half — gravel, sleepers, rails
+    #      walls            u in [MC_TEX_HALF, T)      the right half — rock
+    # Painter's order still holds within the record: far to near, and op 0x0F REPLACES, so nearer
+    # geometry overwrites farther. A tunnel is convex from the inside, so that IS the depth test.
+    var k = 8;
+    while (k > 0) {
+        var rzf = MC_ZN + k * MC_SEG;
+        var rzn = MC_ZN + (k - 1) * MC_SEG;
+        var wzf = cam_z + rzf;
+        var wzn = cam_z + rzn;
+
+        var wf = mc_wof(rzf);
+        var wn = mc_wof(rzn);
+
+        var cf = mc_track_x(wzf) - cam_x;
+        var cn = mc_track_x(wzn) - cam_x;
+
+        # v runs along z, one full wrap per segment, anchored to WORLD z so the tunnel scrolls
+        # continuously rather than swimming with the camera
+        var vn = ((wzn % MC_SEG) * MC_TEXFULL) / MC_SEG;
+        var vf = vn + MC_TEXFULL;
+
+        var lf = mc_px(cf - MC_TW, rzf);   var rf = mc_px(cf + MC_TW, rzf);
+        var ln = mc_px(cn - MC_TW, rzn);   var rn = mc_px(cn + MC_TW, rzn);
+        var flf = mc_py(MC_FLOOR_Y, rzf);  var fln = mc_py(MC_FLOOR_Y, rzn);
+        var cef = mc_py(0 - MC_CEIL_Y, rzf); var cen = mc_py(0 - MC_CEIL_Y, rzn);
+
+        var H = MC_TEX_HALF;      # floor material: u in [0, H)
+        var T = MC_TEXFULL;       # rock material:  u in [H, T)
+
+        # floor — far-left, far-right, near-right, near-left
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                lf, flf, wf, 0, vf,   rf, flf, wf, H, vf,
+                rn, fln, wn, H, vn,   ln, fln, wn, 0, vn);
+
+        # ceiling
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                lf, cef, wf, 0, vf,   rf, cef, wf, H, vf,
+                rn, cen, wn, H, vn,   ln, cen, wn, 0, vn);
+
+        # left wall — u runs floor-to-ceiling so the rock does not smear
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                lf, cef, wf, H, vf,   lf, flf, wf, T, vf,
+                ln, fln, wn, T, vn,   ln, cen, wn, H, vn);
+
+        # right wall
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                rf, flf, wf, H, vf,   rf, cef, wf, T, vf,
+                rn, cen, wn, T, vn,   rn, fln, wn, H, vn);
+
+        k = k - 1;
+    }
+    return mc_n_a;
+}
+
+# ---- the cart ---------------------------------------------------------------------------------
+# ⚠ LIVES HERE, not in main.cyr, because the host reference renderer must drive the SAME physics to
+# reproduce the frame the GPU was asked to draw. Two copies of this stepping logic is two things to
+# keep in sync, and a reference that has silently drifted is worse than no reference at all.
+var mc_cart_x = 0;
+var mc_cart_z = 0;
+var mc_speed  = 3;
+var MC_LOOK   = 176;      # how far up the track the cart aims
+
+fn mc_cart_reset(): i64 { mc_cart_x = 0; mc_cart_z = 0; mc_speed = 3; return 0; }
+
+# It follows the rail with a lag rather than sitting exactly on the centre line, so the tunnel
+# sways past instead of sliding straight down the middle. That lag is the whole feel of the thing.
+fn mc_cart_step(): i64 {
+    mc_cart_z = mc_cart_z + mc_speed;
+    var tgt = mc_track_x(mc_cart_z + MC_LOOK);
+    mc_cart_x = mc_cart_x + (tgt - mc_cart_x) / 6;
+    # the ride accelerates, then holds — 3 to 9 world units a frame over about a minute
+    if ((mc_cart_z % 1024) == 0) {
+        if (mc_speed < 9) { mc_speed = mc_speed + 1; }
+    }
+    return 0;
+}
+
+# advance to frame N from a cold start — the reference and the ride must agree on what "frame N" is
+fn mc_cart_to(frame): i64 {
+    mc_cart_reset();
+    var f = 0;
+    while (f < frame) { mc_cart_step(); f = f + 1; }
+    return 0;
+}

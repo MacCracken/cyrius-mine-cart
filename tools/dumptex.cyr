@@ -1,0 +1,64 @@
+# dumptex.cyr — write the two procedural textures out as raw BGRA so a human can LOOK at them.
+#
+# ⭐ WHY THIS EXISTS. The first iron render came back with the surfaces reading as fine pink/white
+# noise where tex.cyr intends mid grey-brown rock and dark gravel. Before theorising about sampling,
+# minification, pixel format or the readback path, settle the cheapest question first: IS THE
+# TEXTURE ITSELF WHAT THE CODE INTENDS? That is answerable on the host in one run, with no GPU and
+# no flash, and it splits the search space in half.
+#
+# ⛔ This is the "localize before theorizing" rule. A photograph of a screen is a poor instrument —
+# gamma, reflection and camera white balance all lie about colour — so do not reason about hue from
+# the photo until the source data is known good.
+
+include "lib/io.cyr"
+include "src/say.cyr"
+include "src/geom.cyr"
+include "src/tex.cyr"
+
+fn dt_stats(name, base): i64 {
+    var minr = 999; var maxr = 0 - 1; var sumr = 0;
+    var ming = 999; var maxg = 0 - 1; var sumg = 0;
+    var minb = 999; var maxb = 0 - 1; var sumb = 0;
+    var mina = 999; var maxa = 0 - 1;
+    var n = MC_TEX * MC_TEX;
+    var i = 0;
+    while (i < n) {
+        var p = load32(base + i * 4) & 0xFFFFFFFF;
+        var a = (p >>> 24) & 0xFF;
+        var r = (p >>> 16) & 0xFF;
+        var g = (p >>> 8) & 0xFF;
+        var b = p & 0xFF;
+        if (r < minr) { minr = r; }   if (r > maxr) { maxr = r; }   sumr = sumr + r;
+        if (g < ming) { ming = g; }   if (g > maxg) { maxg = g; }   sumg = sumg + g;
+        if (b < minb) { minb = b; }   if (b > maxb) { maxb = b; }   sumb = sumb + b;
+        if (a < mina) { mina = a; }   if (a > maxa) { maxa = a; }
+        i = i + 1;
+    }
+    ps(name); ps(":"); nl();
+    ps("  R min "); pn(minr); ps(" max "); pn(maxr); ps(" mean "); pn(sumr / n); nl();
+    ps("  G min "); pn(ming); ps(" max "); pn(maxg); ps(" mean "); pn(sumg / n); nl();
+    ps("  B min "); pn(minb); ps(" max "); pn(maxb); ps(" mean "); pn(sumb / n); nl();
+    ps("  A min "); pn(mina); ps(" max "); pn(maxa); nl();
+    ps("  texel(0,0) = "); pn(load32(base + 0) & 0xFFFFFFFF); nl();
+    ps("  texel(1,0) = "); pn(load32(base + 4) & 0xFFFFFFFF); nl();
+    ps("  texel(64,64) = "); pn(load32(base + (64 * MC_TEX + 64) * 4) & 0xFFFFFFFF); nl();
+    return 0;
+}
+
+fn main(): i64 {
+    mc_tex_init();
+    var bytes = MC_TEX * MC_TEX * 4;
+    ps("dumptex: "); pn(MC_TEX); ps("x"); pn(MC_TEX); ps(", "); pn(bytes);
+    ps(" bytes each"); nl(); nl();
+    dt_stats("tex_a (floor: gravel, sleepers, rails)", &mc_tex_a);
+    nl();
+    dt_stats("tex_b (walls: rock)", &mc_tex_b);
+    file_write_all("/tmp/mc_tex_a.raw", &mc_tex_a, bytes);
+    file_write_all("/tmp/mc_tex_b.raw", &mc_tex_b, bytes);
+    nl();
+    ps("wrote /tmp/mc_tex_a.raw and /tmp/mc_tex_b.raw"); nl();
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

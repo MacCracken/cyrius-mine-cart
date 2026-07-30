@@ -1,0 +1,21 @@
+[package]
+name = "cyrius-mine-cart"
+version = "${file:VERSION}"
+description = "A ride through a curving mine tunnel, rasterised by the AGNOS GPU — the first application to draw with #92 op 0x0F."
+license = "GPL-3.0-only"
+repository = "https://github.com/MacCracken/cyrius-mine-cart"
+language = "cyrius"
+# Pinned to the toolchain agnos itself builds with, so the game and the kernel whose ABI it
+# consumes are compiled by the same compiler. Do not chase the cyrius tip here — the pin that
+# matters is the one the ABI was proven under.
+cyrius = "6.4.78"
+
+[build]
+src = "src/main.cyr"
+output = "build/mine-cart"
+
+# ── Dependencies ─────────────────────────────────────────────────
+# Order matters — Cyrius is single-pass and deps are prepended as includes.
+# string before io (print/slen), args for argc/argv, syscalls for SYS_EXIT.
+[deps]
+stdlib = ["string", "alloc", "io", "args", "syscalls"]
