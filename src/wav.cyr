@@ -84,13 +84,7 @@ fn wav_capture(seconds, pilot): i64 {
     var t = 0;
     while (t < ticks) {
         var word = 0;
-        if (pilot == 1) {
-            if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
-            if (cart_lean >     65536) { word = IN_LEFT; }
-            var cv = 0;
-            if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
-            if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
-        }
+        if (pilot == 1) { word = cart_autopilot(); }
         if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
 
         # hand the mixer this tick's state, then render exactly one tick of audio

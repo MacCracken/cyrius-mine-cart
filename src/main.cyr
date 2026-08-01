@@ -393,7 +393,7 @@ fn mc_sim(ticks, pilot): i64 {
 
     ps("mine-cart: SIM pilot "); pn(pilot); ps(", "); pn(ticks); ps(" ticks at ");
     pn(CFG_TICK_HZ); ps(" Hz ("); pn(ticks / CFG_TICK_HZ); ps(" s)"); nl();
-    ps("    tick   depth  km/h    lean  warn  drl  apex   curve  slip"); nl();
+    ps("    tick   depth  km/h    lean  warn  int  score  jump  duck  slip"); nl();
 
     var deepest = 0;
     var top     = 0;
@@ -408,14 +408,7 @@ fn mc_sim(ticks, pilot): i64 {
     var t = 0;
     while (t < ticks) {
         var word = 0;
-        if (pilot == 1) {
-            # counter-lean proportionally, and brake while the bend is tightening
-            if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
-            if (cart_lean >     65536) { word = IN_LEFT; }
-            var cv = 0;
-            if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
-            if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
-        }
+        if (pilot == 1) { word = cart_autopilot(); }
 
         if (cart_slip == 1) { slip_total = slip_total + 1; cur_slip_run = cur_slip_run + 1; }
         if (cart_slip == 0) { if (cur_slip_run > max_slip_run) { max_slip_run = cur_slip_run; } cur_slip_run = 0; }
@@ -424,10 +417,12 @@ fn mc_sim(ticks, pilot): i64 {
         if (trk_live(trk_abs_seg) == 1) { cvn = fx_abs(trk_curve_at(trk_abs_seg)); }
         if (cvn > max_curve) { max_curve = cvn; }
         if (cart_tick(word) == 0) {
-            ps("    DERAILED at "); pn(trk_depth_m()); ps(" m after "); pn(cart_ticks);
-            ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s)"); 
-            if (cart_slip == 1) { ps(" -- LOST THE RAIL"); }
-            ps(" -- restarting the chapter"); nl();
+            ps("    DIED at "); pn(trk_depth_m()); ps(" m after "); pn(cart_ticks);
+            ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s) -- ");
+            if (cart_death == 1) { ps("DERAILED"); if (cart_slip == 1) { ps(" (lost the rail)"); } }
+            if (cart_death == 2) { ps("FELL INTO A GAP"); }
+            if (cart_death == 3) { ps("CART DESTROYED (integrity gone)"); }
+            nl();
             slip_total = slip_total + cart_slip_ticks;
             cart_reset(cart_seed, cart_chapter);
         }
@@ -436,8 +431,6 @@ fn mc_sim(ticks, pilot): i64 {
         if (cart_kmh() > top) { top = cart_kmh(); }
 
         if ((t % 60) == 0) {
-            var cv2 = 0;
-            if (trk_live(trk_abs_seg) == 1) { cv2 = trk_curve_at(trk_abs_seg); }
             ps("  "); pn(t);
             ps("\t"); pn(trk_depth_m());
             ps("\t"); pn(cart_kmh());
@@ -445,7 +438,10 @@ fn mc_sim(ticks, pilot): i64 {
             ps("\t"); pn(cart_warn());
             ps("\t"); pn(cart_derail);
             ps("\t"); pn(cart_apex_hits);
-            ps("\t"); pn(cv2);
+            ps("\t"); pn(cart_integrity);
+            ps("\t"); pn(cart_score);
+            ps("\t"); pn(cart_jumps);
+            ps("\t"); pn(cart_ducks);
             ps("\t"); pn(cart_slip);
             nl();
         }
@@ -455,6 +451,9 @@ fn mc_sim(ticks, pilot): i64 {
     nl();
     ps("  deepest "); pn(deepest); ps(" m, top speed "); pn(top); ps(" km/h, ");
     pn(cart_apex_hits); ps(" clean apexes, "); pn(cart_derails); ps(" derails"); nl();
+    ps("  score "); pn(cart_score); ps(", "); pn(cart_treasure); ps(" treasure, ");
+    pn(cart_jumps); ps(" jumps, "); pn(cart_ducks); ps(" ducks, ");
+    pn(cart_hits); ps(" beams taken, "); pn(cart_falls); ps(" falls"); nl();
     # ⭐ SLIP IS THE NUMBER THAT SAYS WHETHER THE DIFFICULTY MECHANIC IS ACTUALLY ENGAGING. A run
     # with zero slip ticks never once lost the rail, whatever else it reports.
     ps("  slipping for "); pn(slip_total); ps(" of "); pn(ticks);

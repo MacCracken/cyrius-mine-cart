@@ -56,6 +56,10 @@ var trk_tgt_curve   = 0;   # what it is ramping toward
 var trk_cur_grade   = 0;
 var trk_tgt_grade   = 0;
 var trk_phrase_left = 0;   # segments remaining before a new target is chosen
+var trk_haz_next    = 0;   # absolute segment index of the next hazard
+var trk_haz_pair    = 0;   # >0 = a stacked partner is due this many segments after the last hazard
+var trk_haz_pair_kind = 0; # what that partner will be
+var trk_gap_left    = 0;   # segments remaining in the gap currently being laid
 
 # ---- counters, for the gate ---------------------------------------------------------------------
 var trk_gen_count   = 0;   # segments generated this chapter — proves streaming actually streams
@@ -86,6 +90,14 @@ fn trk_curve_at(abs_seg): i64 { return load64(&trk_curve + trk_slot(abs_seg) * 8
 fn trk_grade_at(abs_seg): i64 { return load64(&trk_grade + trk_slot(abs_seg) * 8); }
 fn trk_kind_at(abs_seg): i64  { return load64(&trk_kind  + trk_slot(abs_seg) * 8); }
 fn trk_flags_at(abs_seg): i64 { return load64(&trk_flags + trk_slot(abs_seg) * 8); }
+fn trk_lane_at(abs_seg): i64  { return load64(&trk_branch_b + trk_slot(abs_seg) * 8); }
+
+# the lateral offset of a pickup lane, in RENDER UNITS. 0 = left, 1 = centre, 2 = right.
+fn trk_lane_x(lane): i64 {
+    if (lane == 0) { return 0 - CFG_PICKUP_LANE_RU; }
+    if (lane == 2) { return CFG_PICKUP_LANE_RU; }
+    return 0;
+}
 
 # the u16 view the design specifies. Storage width, not index width.
 fn trk_pos_seg(): i64 { return trk_abs_seg & 65535; }
@@ -168,9 +180,73 @@ fn trk_gen_one(): i64 {
     if (dg < 0 - CFG_GRADE_RAMP) { dg = 0 - CFG_GRADE_RAMP; }
     trk_cur_grade = trk_cur_grade + dg;
 
-    # -- kind/flags: plain for now. Obstacles, forks and pickups land in later steps, and they land
-    #    HERE rather than in a parallel structure, because the segment is the world.
-    trk_put(abs, trk_cur_curve, trk_cur_grade, KIND_PLAIN, FLAG_NONE, 0, 0);
+    # -- what is ON this segment ------------------------------------------------------------------
+    # ⭐ HAZARDS AND PICKUPS LIVE IN THE SEGMENT, NOT IN A PARALLEL LIST. The segment IS the world, so
+    # there is no second structure to keep in sync, nothing to sort, and streaming a segment out of
+    # the ring disposes of everything on it for free.
+    var kind  = KIND_PLAIN;
+    var flags = FLAG_NONE;
+    var lane  = 0;
+
+    # a gap already in progress keeps laying itself
+    if (trk_gap_left > 0) {
+        kind = KIND_GAP;
+        trk_gap_left = trk_gap_left - 1;
+    }
+    if (trk_gap_left <= 0) {
+        if (kind == KIND_PLAIN) {
+            # ⚠ NOTHING within CFG_HAZ_NONE_SEGS of the gate. A chapter that opens with a hazard
+            # kills the player before they have seen the track, and on a respawn that reads as the
+            # game cheating rather than as a mistake they made.
+            if (abs >= CFG_HAZ_NONE_SEGS) {
+                if (abs >= trk_haz_next) {
+                    # ⭐ STACKED PAIRS ARE WHAT MAKE THIS A RHYTHM RATHER THAN A SET OF EVENTS. A gap
+                    # immediately followed by a beam forces jump->duck with no time to think, which is
+                    # the only way the two verbs ever interact.
+                    # ⚠ Before the gap gate, EVERY hazard is a beam — the cart cannot yet jump.
+                    var pick = 1;
+                    if (abs >= CFG_GAP_NONE_SEGS) { pick = fx_rand_n(2); }
+                    if (pick == 0) { kind = KIND_GAP;  trk_gap_left = CFG_GAP_SEGS - 1; }
+                    if (pick != 0) { kind = KIND_BEAM; }
+                    if (fx_rand_n(100) < CFG_HAZ_PAIR_PCT) {
+                        trk_haz_pair = CFG_HAZ_PAIR_SEGS;
+                        # the partner is always the OTHER verb — a gap-gap pair is just a wider gap
+                        trk_haz_pair_kind = KIND_BEAM;
+                        if (kind == KIND_BEAM) {
+                            trk_haz_pair_kind = KIND_GAP;
+                            # ...unless a gap is still not allowed, in which case there is no pair
+                            if (abs + CFG_HAZ_PAIR_SEGS < CFG_GAP_NONE_SEGS) { trk_haz_pair = 0; }
+                        }
+                    }
+                    trk_haz_next = abs + fx_rand_range(CFG_HAZ_GAP_MIN, CFG_HAZ_GAP_MAX);
+                }
+            }
+        }
+    }
+    # the stacked partner falls due a couple of segments after its opener
+    if (trk_haz_pair > 0) {
+        trk_haz_pair = trk_haz_pair - 1;
+        if (trk_haz_pair == 0) {
+            if (kind == KIND_PLAIN) {
+                kind = trk_haz_pair_kind;
+                if (kind == KIND_GAP) { trk_gap_left = CFG_GAP_SEGS - 1; }
+                # push the next ordinary hazard back so the pair is not immediately crowded
+                if (trk_haz_next < abs + CFG_HAZ_GAP_MIN) { trk_haz_next = abs + CFG_HAZ_GAP_MIN; }
+            }
+        }
+    }
+
+    # treasure goes on segments that are otherwise clear
+    if (kind == KIND_PLAIN) {
+        if (fx_rand_n(100) < CFG_PICKUP_PCT) {
+            kind = KIND_PICKUP;
+            lane = fx_rand_n(CFG_PICKUP_LANES);      # 0 = left, 1 = centre, 2 = right
+        }
+    }
+
+    # ⚠ lane rides in branch_b, which is unused for everything except a fork. Documented here because
+    # a field doing two jobs is exactly the sort of thing that rots silently.
+    trk_put(abs, trk_cur_curve, trk_cur_grade, kind, flags, 0, lane);
 
     trk_gen_to = trk_gen_to + 1;
     trk_gen_count = trk_gen_count + 1;
@@ -206,6 +282,10 @@ fn trk_reset(seed, chapter): i64 {
     trk_cur_grade = 0;
     trk_tgt_grade = 0;
     trk_phrase_left = 0;
+    trk_haz_next = 0;
+    trk_haz_pair = 0;
+    trk_haz_pair_kind = 0;
+    trk_gap_left = 0;
     trk_gen_count = 0;
     trk_clamp_hits = 0;
 

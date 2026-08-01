@@ -35,6 +35,23 @@ var cart_derails    = 0;
 var cart_slip       = 0;   # 1 while the flange has let go — drives sparks, screech and the shake
 var cart_slip_ticks = 0;   # total ticks spent slipping this run
 
+# ---- the hands and the body -------------------------------------------------------------------------
+# ⭐ EXACTLY ONE OF THESE CAN BE NON-ZERO AT A TIME, AND THAT IS THE ENTIRE COST MODEL. You cannot
+# duck out of a jump, you cannot jump out of a crouch, and you cannot whip while crouched. Every one
+# of the three verbs commits you for a fixed number of ticks, so using one is choosing not to have
+# the others — which is what makes a stacked gap-then-beam a real problem rather than two key presses.
+var cart_crouch = 0;       # ticks of committed crouch remaining. CANNOT be cancelled.
+var cart_air    = 0;       # ticks of airborne remaining. Distance covered = speed x time.
+var cart_integrity = 6;
+var cart_score  = 0;
+var cart_treasure = 0;     # treasures collected — also the throw ammo, when combat exists
+var cart_hits   = 0;       # beams taken this run
+var cart_falls  = 0;       # gaps fallen into this run
+var cart_jumps  = 0;
+var cart_ducks  = 0;
+var cart_last_seg = 0;     # the segment the cart was on last tick, for crossing detection
+var cart_death  = 0;       # 0 alive, 1 derail, 2 fell in a gap, 3 integrity gone
+
 # ---- warning level, 0..3 -----------------------------------------------------------------------------
 # ⭐ FOR SPARKS AND WHEEL-LIFT, NOT FOR A NUMBER ON SCREEN. The design brief is explicit that the
 # player must FEEL the margin rather than read a bar, and the primary feedback is already physical:
@@ -94,6 +111,37 @@ fn cart_reset(seed, chapter): i64 {
     cart_apex_armed = 0;
     cart_slip = 0;
     cart_slip_ticks = 0;
+    cart_crouch = 0;
+    cart_air = 0;
+    cart_integrity = CFG_INTEGRITY_MAX;
+    cart_score = 0;
+    cart_treasure = 0;
+    cart_hits = 0;
+    cart_falls = 0;
+    cart_jumps = 0;
+    cart_ducks = 0;
+    cart_last_seg = trk_abs_seg;
+    cart_death = 0;
+    return 0;
+}
+
+# ---- what the player is allowed to do right now ---------------------------------------------------
+fn cart_can_act(): i64 {
+    if (cart_crouch > 0) { return 0; }     # committed: no whip, no jump
+    if (cart_air > 0) { return 0; }        # airborne: no second jump, no duck
+    return 1;
+}
+
+fn cart_airborne(): i64 { if (cart_air > 0) { return 1; } return 0; }
+fn cart_crouching(): i64 { if (cart_crouch > 0) { return 1; } return 0; }
+
+fn cart_damage(n): i64 {
+    cart_integrity = cart_integrity - n;
+    if (cart_integrity <= 0) {
+        cart_integrity = 0;
+        cart_dead = 1;
+        cart_death = 3;
+    }
     return 0;
 }
 
@@ -204,18 +252,166 @@ fn cart_tick(word): i64 {
     if (fx_abs(cart_lean) <  CFG_LEAN_THRESH) { cart_derail = 0; }
     if (cart_derail >= CFG_DERAIL_TICKS) {
         cart_dead = 1;
+        cart_death = 1;
         cart_derails = cart_derails + 1;
         return 0;
+    }
+
+    # ---- the hands: duck and jump ---------------------------------------------------------------
+    # ⚠ TIMERS RUN DOWN BEFORE INPUT IS READ, so a crouch that expires this tick frees the player
+    # this tick. The other order costs a frame of responsiveness on every single action.
+    if (cart_crouch > 0) { cart_crouch = cart_crouch - 1; }
+    if (cart_air > 0) {
+        cart_air = cart_air - 1;
+        # ⛔ LANDING IS WHERE A JUMP IS JUDGED, NOT TAKE-OFF. Coming down still over a gap is the
+        # failure the speed threshold exists to produce: hang time is fixed, so a slow cart simply
+        # does not travel far enough, and no amount of input at the last moment changes that.
+        if (cart_air == 0) {
+            if (trk_live(trk_abs_seg) == 1) {
+                if (trk_kind_at(trk_abs_seg) == KIND_GAP) {
+                    cart_dead = 1;
+                    cart_death = 2;
+                    cart_falls = cart_falls + 1;
+                    return 0;
+                }
+            }
+        }
+    }
+    if (cart_can_act() == 1) {
+        if ((word & IN_JUMP) != 0) { cart_air = CFG_JUMP_TICKS; cart_jumps = cart_jumps + 1; }
+        if (cart_air == 0) {
+            if ((word & IN_DUCK) != 0) { cart_crouch = CFG_CROUCH_TICKS; cart_ducks = cart_ducks + 1; }
+        }
     }
 
     # ---- advance ------------------------------------------------------------------------------------
     trk_advance(cart_speed_sub());
     cart_ticks = cart_ticks + 1;
+
+    # ---- ⭐ THE SEGMENT CROSSING: where everything on the track is resolved ----------------------
+    # ⛔ RESOLVED ON CROSSING, NOT PER TICK. At the cap the cart crosses a segment every ~5.4 ticks,
+    # so a per-tick test would fire the same beam five times and collect the same treasure five times.
+    # Crossing is also the only moment at which "which segment am I on" has an unambiguous answer.
+    # ⚠ A WHILE, not an IF: nothing today crosses two segments in one tick, but a speed tunable is
+    # exactly the kind of number that changes, and a skipped segment is a hazard that never happened.
+    while (cart_last_seg < trk_abs_seg) {
+        cart_last_seg = cart_last_seg + 1;
+        if (trk_live(cart_last_seg) == 0) { }
+        if (trk_live(cart_last_seg) == 1) {
+            var k = trk_kind_at(cart_last_seg);
+
+            # a GAP swallows anything not in the air
+            if (k == KIND_GAP) {
+                if (cart_air == 0) {
+                    cart_dead = 1;
+                    cart_death = 2;
+                    cart_falls = cart_falls + 1;
+                    return 0;
+                }
+            }
+
+            # a BEAM takes the head off anything not crouched. Being airborne does NOT save you —
+            # jumping into a low beam is worse, not better, and that is what makes a stacked
+            # gap-then-beam a genuine problem rather than two independent reflexes.
+            if (k == KIND_BEAM) {
+                if (cart_crouch == 0) {
+                    cart_hits = cart_hits + 1;
+                    cart_damage(CFG_BEAM_DAMAGE);
+                    if (cart_dead == 1) { return 0; }
+                }
+            }
+
+            # TREASURE is a lateral-position test, not a volume. Either the cart was in the right
+            # place as it crossed or it was not.
+            if (k == KIND_PICKUP) {
+                var lx = trk_lane_x(trk_lane_at(cart_last_seg));
+                var d = cart_cam_x() - lx;
+                if (d < 0) { d = 0 - d; }
+                if (d <= CFG_PICKUP_REACH) {
+                    cart_treasure = cart_treasure + 1;
+                    # ⭐ SPEED IS THE SCORE MULTIPLIER, so a treasure taken at the redline is worth
+                    # far more than the same treasure crawled past. Collecting and going fast are the
+                    # same skill, which is what stops the safe line from also being the rich one.
+                    cart_score = cart_score + ((CFG_TREASURE_SCORE * (65536 + cart_speed_frac())) >>> 16);
+                }
+            }
+        }
+    }
     return 1;
 }
 
 # the lateral offset the renderer wants, in whole render units
 fn cart_cam_x(): i64 { return cart_lean >>> 16; }
+
+# ---- the reference pilot ----------------------------------------------------------------------------
+# ⭐ ONE AUTOPILOT, SHARED BY --sim, --wav AND THE FILM TOOL. Three copies of "how a competent player
+# drives" is three things to keep in sync, and a telemetry run that disagrees with the recorded video
+# is worse than having neither. It is deliberately CRUDE — it is a yardstick for tuning, not an AI:
+# if this thing can clear the track effortlessly the track is too easy, and if it cannot survive at
+# all the track is unfair.
+#
+# ⚠ It reads the ring directly, which a human obviously cannot. That is the point: it measures what
+# the track DEMANDS, with reaction time taken out of the question.
+fn cart_ticks_to(abs_seg): i64 {
+    var sp = cart_speed_sub();
+    if (sp <= 0) { return 999999; }
+    var sub = (abs_seg - trk_abs_seg) * CFG_SUB_PER_SEG - trk_pos_sub;
+    if (sub < 0) { return 0; }
+    return sub / sp;
+}
+
+fn cart_autopilot(): i64 {
+    var word = 0;
+
+    # -- hold the rail: counter-lean, and brake when the bend is tightening --------------------------
+    if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
+    if (cart_lean >     65536) { word = IN_LEFT; }
+    var cv = 0;
+    if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
+    if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
+    # ⭐ AND BRAKE WHEN THE RAIL HAS ALREADY LET GO. Steering cannot reach a slip; only speed can.
+    if (cart_slip == 1) { word = word | IN_BRAKE; }
+
+    # -- the hands: scan ahead for the next gap or beam ---------------------------------------------
+    # ⚠ Scans only as far as the ring is live. Reading past that returns a RECYCLED segment — a
+    # hazard that is not there, which would make the pilot duck at random.
+    var i = 0;
+    var seen_gap = 0 - 1;
+    var seen_beam = 0 - 1;
+    while (i < 12) {
+        var a = trk_abs_seg + i;
+        if (trk_live(a) == 1) {
+            var k = trk_kind_at(a);
+            if (k == KIND_GAP)  { if (seen_gap < 0)  { seen_gap = a; } }
+            if (k == KIND_BEAM) { if (seen_beam < 0) { seen_beam = a; } }
+        }
+        i = i + 1;
+    }
+
+    if (cart_can_act() == 1) {
+        var tg = 999999;
+        var tb = 999999;
+        if (seen_gap >= 0)  { tg = cart_ticks_to(seen_gap); }
+        if (seen_beam >= 0) { tb = cart_ticks_to(seen_beam); }
+
+        # ⛔ GAPS OUTRANK BEAMS, ALWAYS, AND THE ASYMMETRY IS THE WHOLE POINT. A gap is instant death;
+        # a beam costs 2 of 6 integrity. So when both are close enough to matter the correct play is
+        # to jump the gap and EAT the beam — a real decision with a real price, rather than a lost
+        # run. An earlier version picked whichever was nearer and died to gaps it had ducked past.
+        var jumped = 0;
+        if (tg <= 1) { word = word | IN_JUMP; jumped = 1; }
+
+        # ⚠ Only duck if the crouch will have EXPIRED before the next gap arrives. Committing to 27
+        # ticks with a gap 15 ticks away is choosing to die, and the pilot must not do it — the same
+        # reasoning a player has to apply, made explicit.
+        if (jumped == 0) {
+            if (tb <= 3) {
+                if (tg > CFG_CROUCH_TICKS) { word = word | IN_DUCK; }
+            }
+        }
+    }
+    return word;
+}
 
 # ---- shared definition of "frame N" ---------------------------------------------------------------
 # ⭐ THE RIDE, THE HOST REFERENCE AND THE ON-IRON VERIFIER MUST AGREE ON WHAT FRAME N IS, or a

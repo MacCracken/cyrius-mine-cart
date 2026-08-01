@@ -55,6 +55,7 @@ var mc_s_rz[24];
 var mc_s_cx[24];
 var mc_s_cy[24];
 var mc_s_v[24];            # texture v at this endpoint, 16.16 texels
+var mc_s_seg[24];          # the ring segment this endpoint sits on — what is ON the track there
 var mc_s_guard = 0;
 var mc_nslab = 0;          # number of ENDPOINTS written (slabs = mc_nslab - 1)
 
@@ -64,7 +65,7 @@ fn mc_bufs_ok(): i64 {
     # understates.
     if ((&mc_vtx_b     - &mc_vtx_a) < MC_TRI_MAX * 64) { return 0; }
     if ((&mc_vtx_guard - &mc_vtx_b) < MC_TRI_MAX * 64) { return 0; }
-    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 4)      { return 0; }
+    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 5)      { return 0; }
     return 1;
 }
 
@@ -287,10 +288,15 @@ fn mc_walk(): i64 {
     store64(&mc_s_cx + 0, 0);
     store64(&mc_s_cy + 0, 0);
     store64(&mc_s_v  + 0, v);
+    store64(&mc_s_seg + 0, trk_abs_seg + ((cam_ru + MC_ZN) >>> 5));
     n = 1;
 
     while (rz < MC_ZF) {
         var step = mc_step_at(rz);
+        # ⭐ REMEMBER WHICH SEGMENT THIS SLAB STARTS ON. Slabs are camera-relative and segments are
+        # world-relative, so the mapping changes every tick — the renderer cannot assume one slab is
+        # one segment (a far slab spans two). What is drawn ON the track has to be looked up here.
+        if (n < MC_SLAB_MAX) { store64(&mc_s_seg + n * 8, trk_abs_seg + ((cam_ru + rz) >>> 5)); }
         var dpsi = mc_integ(cam_ru + rz, cam_ru + rz + step, 0);
         var dphi = mc_integ(cam_ru + rz, cam_ru + rz + step, 1);
         xq = xq + ((step * (2 * psi + dpsi) * MC_TAU_Q16) >>> 17);
@@ -382,10 +388,53 @@ fn mc_build(cam_x): i64 {
         var arn = mc_py(gn - MC_ARCH_Y,       rzn); var arf = mc_py(gf - MC_ARCH_Y,       rzf);
         var cen = mc_py(gn - MC_CEIL_Y,       rzn); var cef = mc_py(gf - MC_CEIL_Y,       rzf);
 
-        # floor — far-left, far-right, near-right, near-left. u spans the floor band.
-        mc_quad(&mc_vtx_a, &mc_n_a,
-                lf, flf, wf, 0, vf,   rf, flf, wf, H, vf,
-                rn, fln, wn, H, vn,   ln, fln, wn, 0, vn);
+        # ---- ⭐ WHAT IS ON THE TRACK -------------------------------------------------------------
+        # ⛔ A HAZARD YOU CANNOT SEE IS NOT A HAZARD, IT IS A COIN FLIP. The simulation had gaps and
+        # beams working — and tested — for a while before any of this existed, which made the game
+        # unplayable by a person while passing every assertion. Drawing them is not polish.
+        var kseg = load64(&mc_s_seg + k * 8);
+        var kind = KIND_PLAIN;
+        if (trk_live(kseg) == 1) { kind = trk_kind_at(kseg); }
+
+        # ⭐ A GAP IS DRAWN BY NOT DRAWING. Omitting the floor quad leaves op 0x0F's background
+        # showing through — an actual hole in the world, at zero triangle cost, and unmistakable.
+        if (kind != KIND_GAP) {
+            # floor — far-left, far-right, near-right, near-left. u spans the floor band.
+            mc_quad(&mc_vtx_a, &mc_n_a,
+                    lf, flf, wf, 0, vf,   rf, flf, wf, H, vf,
+                    rn, fln, wn, H, vn,   ln, fln, wn, 0, vn);
+        }
+
+        # ⚠ A BEAM hangs across the bore at head height. Drawn from the ROCK band so it reads as
+        # structure rather than as a floor decal, and only on the near half of the frustum — a beam
+        # 40 m away is two pixels and just adds noise to the horizon.
+        if (kind == KIND_BEAM) {
+            if (rzn < 220) {
+                var bt_n = mc_py(gn - MC_ARCH_Y, rzn);
+                var bb_n = mc_py(gn - MC_ARCH_Y + 14, rzn);
+                var bt_f = mc_py(gf - MC_ARCH_Y, rzf);
+                var bb_f = mc_py(gf - MC_ARCH_Y + 14, rzf);
+                mc_quad(&mc_vtx_a, &mc_n_a,
+                        lf, bt_f, wf, H, vf,   rf, bt_f, wf, T, vf,
+                        rn, bb_n, wn, T, vn,   ln, bb_n, wn, H, vn);
+            }
+        }
+
+        # ⚠ TREASURE sits in its lane, just above the sleepers. Small, bright, and only drawn near —
+        # the lateral test that collects it does not care whether it was drawn, so a distant one
+        # costing triangles buys nothing.
+        if (kind == KIND_PICKUP) {
+            if (rzn < 180) {
+                var px = trk_lane_x(trk_lane_at(kseg)) - cam_x + cn;
+                var p_l = mc_px(px - 5, rzn);
+                var p_r = mc_px(px + 5, rzn);
+                var p_b = mc_py(gn + MC_FLOOR_Y - 2, rzn);
+                var p_t = mc_py(gn + MC_FLOOR_Y - 16, rzn);
+                mc_quad(&mc_vtx_a, &mc_n_a,
+                        p_l, p_t, wn, 0, vn,   p_r, p_t, wn, H, vn,
+                        p_r, p_b, wn, H, vn,   p_l, p_b, wn, 0, vn);
+            }
+        }
 
         # left wall — u runs floor-to-springing so the rock does not smear
         mc_quad(&mc_vtx_a, &mc_n_a,

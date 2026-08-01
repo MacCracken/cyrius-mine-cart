@@ -267,6 +267,65 @@ var CFG_GRIP_MIN  = 1200;            # floor, so grip never reaches zero and the
 # stays that way. 3x makes losing the rail escalate instead of merely register.
 var CFG_SLIP_GAIN = 196608;          # Q16.16 = 3.0x the excess, applied as outward acceleration
 
+# ---- ⭐⭐ DUCK AND JUMP -------------------------------------------------------------------------
+# ⛔ THE JUMP'S SPEED THRESHOLD IS THE CENTRAL TENSION WITH THE BRAKE AND MUST NOT BE SOFTENED.
+# Hang time is FIXED, so distance covered is simply speed x time — faster carts jump further, with no
+# special case anywhere. A 3-segment gap against a 26-tick hang gives:
+#      100% speed  clears 4.84 segments   CLEARS
+#       75% speed  clears 3.63 segments   CLEARS
+#       67% speed  clears 3.24 segments   just clears
+#       60% speed  clears 2.91 segments   COMES UP SHORT
+#       50% speed  clears 2.42 segments   comes up short
+# ⇒ The brake keeps you on the rail through bends and drops you into holes. That is the decision the
+#   whole game is built around, and the threshold lands at ~62% of the cap exactly as designed.
+var CFG_JUMP_TICKS = 26;             # airborne ticks (0.43 s) — FIXED, so distance = speed x time
+var CFG_GAP_SEGS   = 3;              # gap width in segments (7.68 m)
+
+# ⚠ THE CROUCH CANNOT BE CANCELLED, AND THAT IS THE COST OF USING IT. 27 ticks is 0.45 s of
+# committed vulnerability — you cannot whip, and you cannot stand up early to jump. Ducking a beam
+# just before a gap is therefore a real mistake rather than a free action.
+var CFG_CROUCH_TICKS = 27;
+
+# ---- integrity ------------------------------------------------------------------------------------
+# ⭐ SIX BLOCKS, matching the design plate's CART INTEGRITY row. A beam to the head is survivable;
+# falling into a gap or losing the rail is not. Graded damage makes a run recoverable and a mistake
+# memorable; instant death on everything makes the game a memory test.
+var CFG_INTEGRITY_MAX  = 6;
+var CFG_BEAM_DAMAGE    = 2;          # a low beam at speed costs a third of the cart
+
+# ---- hazard placement -------------------------------------------------------------------------------
+# ⚠ Spacing is in SEGMENTS, and a segment is ~7.7 ticks at the cap. The brief asks for stacked pairs
+# at ~18-tick spacing to force jump->duck chains: 2 segments is ~15 ticks, which is that.
+var CFG_HAZ_GAP_MIN   = 14;          # segments between hazards, minimum
+var CFG_HAZ_GAP_MAX   = 34;          # ...and maximum
+var CFG_HAZ_PAIR_PCT  = 30;          # percent of hazards followed by a stacked partner
+# ⛔⛔ THE PAIR MUST BE SPACED WIDER THAN THE LONGER COMMITMENT, OR THE CHAIN IS IMPOSSIBLE RATHER
+# THAN HARD. A jump locks the player for 26 ticks and a crouch for 27 — about 5 segments at the cap.
+# At the brief's suggested 2-segment spacing the second hazard arrives on tick 10 of a 27-tick
+# crouch, when no input can reach it: duck the beam, fall in the gap, every time, with correct play.
+# The autopilot proved it — 1 jump in 517 ticks and a death in a gap it was never able to answer.
+# ⇒ 6 segments puts the second hazard at ~tick 32, after both commitments have expired. The chain is
+#   now a real jump->land->duck sequence, which is what the brief actually wanted.
+var CFG_HAZ_PAIR_SEGS = 6;           # segments between the two halves of a stacked pair
+var CFG_HAZ_NONE_SEGS = 10;          # no hazard within this many segments of the chapter gate
+# ⛔⛔ GAPS NEED A LONGER RUN-UP THAN BEAMS, AND THE FIRST BUILD GOT THIS WRONG IN A WAY THAT MADE THE
+# GAME UNWINNABLE. The cart leaves the gate at 46% of the cap and a 3-segment gap needs 62% — so a
+# gap at segment 10 cannot be cleared by ANY input. Both pilots died there, at 28 m, every single run.
+# The jump threshold was working exactly as designed; the placement was asking the impossible.
+# ⚠ 5 segments is where jump speed arrives; 26 leaves real margin and, better, means the mine
+# introduces its verbs in order — beams first, gaps only once the cart is up to speed.
+var CFG_GAP_NONE_SEGS = 26;          # no GAP within this many segments of the chapter gate
+
+# ---- pickups ---------------------------------------------------------------------------------------
+# ⭐ COLLECTION IS A LATERAL-POSITION TEST AT THE SEGMENT CROSSING, NOT A COLLISION VOLUME. There is
+# no bounding box and no sweep — the cart either was in the right place when it crossed the segment or
+# it was not. That is cheap, exact, and impossible to tunnel through at any speed.
+var CFG_PICKUP_PCT   = 22;           # percent of non-hazard segments carrying treasure
+var CFG_PICKUP_REACH = 20;           # render units either side that counts as a grab (160 cm)
+var CFG_PICKUP_LANES = 3;            # left / centre / right
+var CFG_PICKUP_LANE_RU = 26;         # lateral offset of the outer lanes, render units
+var CFG_TREASURE_SCORE = 100;        # score per treasure
+
 # ---- the apex bonus -----------------------------------------------------------------------------------
 # ⭐ THE OPTIMAL LINE MUST BE RHYTHMIC, NOT HELD-BRAKE. Braking into a bend and releasing at the apex
 # pays a speed bonus; sitting on the brake through the whole curve does not. Without this the safest

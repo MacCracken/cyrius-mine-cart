@@ -348,6 +348,232 @@ fn ctt_grip(): i64 {
     return 0;
 }
 
+# ---- ⭐⭐ DUCK AND JUMP: the verbs -----------------------------------------------------------------
+# stamp a hazard at a known segment on otherwise clear track
+fn ctt_hazard(at, kind, span): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        var k = KIND_PLAIN;
+        if (i >= at) { if (i < at + span) { k = kind; } }
+        trk_put(i, 0, 0, k, FLAG_NONE, 0, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# run until the cart passes `until` segments or dies. Returns 1 if it survived.
+fn ctt_run_to(seg, word_jump_at, word): i64 {
+    var t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= seg) { return 1; }
+        var w = 0;
+        if (word_jump_at >= 0) {
+            if (cart_ticks_to(word_jump_at) <= 1) { w = word; }
+        }
+        if (cart_tick(w) == 0) { return 0; }
+        t = t + 1;
+    }
+    return 1;
+}
+
+fn ctt_verbs(): i64 {
+    # ---- ⛔ THE JUMP'S SPEED THRESHOLD. The brief calls this the central tension with the brake and
+    # says explicitly not to soften it. These two assertions ARE that instruction.
+    ctt_hazard(20, KIND_GAP, CFG_GAP_SEGS);
+    cart_speed = CFG_SPEED_MAX << 16;
+    var fast = ctt_run_to(30, 20, IN_JUMP);
+    ctt_true("at full speed the jump CLEARS the gap", fast);
+
+    ctt_hazard(20, KIND_GAP, CFG_GAP_SEGS);
+    var t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 30) { t = 900; }
+        var w = IN_BRAKE;                        # hold it well under the threshold
+        if (cart_ticks_to(20) <= 1) { w = w | IN_JUMP; }
+        if (cart_tick(w) == 0) { t = 900; }
+        t = t + 1;
+    }
+    ctt_true("below the threshold the cart COMES UP SHORT", cart_dead == 1);
+    ctt_eq("...and the death is a fall, not a derail", cart_death, 2);
+
+    # not jumping at all is also a fall
+    ctt_hazard(20, KIND_GAP, CFG_GAP_SEGS);
+    cart_speed = CFG_SPEED_MAX << 16;
+    ctt_true("not jumping falls in", ctt_run_to(30, 0 - 1, 0) == 0);
+    ctt_eq("...as a fall", cart_death, 2);
+
+    # ---- the beam ---------------------------------------------------------------------------------
+    ctt_hazard(20, KIND_BEAM, 1);
+    cart_speed = CFG_SPEED_MAX << 16;
+    var before = cart_integrity;
+    ctt_run_to(26, 0 - 1, 0);
+    ctt_eq("a beam taken standing costs integrity", cart_integrity, before - CFG_BEAM_DAMAGE);
+    ctt_eq("...and is survivable", cart_dead, 0);
+    ctt_eq("...and is counted", cart_hits, 1);
+
+    ctt_hazard(20, KIND_BEAM, 1);
+    cart_speed = CFG_SPEED_MAX << 16;
+    t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 26) { t = 900; }
+        var w2 = 0;
+        if (cart_ticks_to(20) <= 3) { w2 = IN_DUCK; }
+        if (cart_tick(w2) == 0) { t = 900; }
+        t = t + 1;
+    }
+    ctt_eq("ducking clears the beam untouched", cart_integrity, CFG_INTEGRITY_MAX);
+    ctt_eq("...and no hit is recorded", cart_hits, 0);
+
+    # ⛔ JUMPING A BEAM DOES NOT HELP. Being airborne is not being ducked, and this asymmetry is what
+    # makes a stacked pair a real choice rather than one input that answers both.
+    ctt_hazard(20, KIND_BEAM, 1);
+    cart_speed = CFG_SPEED_MAX << 16;
+    ctt_run_to(26, 20, IN_JUMP);
+    ctt_true("jumping a beam still takes the hit", cart_hits >= 1);
+
+    # ---- commitment -------------------------------------------------------------------------------
+    ctt_track(0);
+    cart_tick(IN_DUCK);
+    ctt_true("a duck commits", cart_crouching() == 1);
+    ctt_eq("...and blocks acting", cart_can_act(), 0);
+    var c0 = cart_crouch;
+    cart_tick(IN_JUMP);                          # try to cancel out of it
+    ctt_true("the crouch CANNOT be cancelled by jumping", cart_crouching() == 1);
+    ctt_eq("...and no jump happened", cart_airborne(), 0);
+    ctt_eq("...it just runs down", cart_crouch, c0 - 1);
+    # it does expire on its own
+    t = 0;
+    while (t < CFG_CROUCH_TICKS + 2) { cart_tick(0); t = t + 1; }
+    ctt_eq("the crouch expires", cart_crouching(), 0);
+    ctt_eq("...and the player can act again", cart_can_act(), 1);
+
+    ctt_track(0);
+    cart_tick(IN_JUMP);
+    ctt_true("a jump commits", cart_airborne() == 1);
+    cart_tick(IN_DUCK);
+    ctt_eq("cannot duck in mid-air", cart_crouching(), 0);
+    return 0;
+}
+
+# ---- pickups ------------------------------------------------------------------------------------------
+fn ctt_pickup_at(lane): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        var k = KIND_PLAIN;
+        if (i == 20) { k = KIND_PICKUP; }
+        trk_put(i, 0, 0, k, FLAG_NONE, 0, lane);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn ctt_pickups(): i64 {
+    # centre lane, cart on the centre line: collected
+    ctt_pickup_at(1);
+    ctt_run_to(24, 0 - 1, 0);
+    ctt_eq("a pickup in reach is collected", cart_treasure, 1);
+    ctt_true("...and scores", cart_score > 0);
+
+    # ⭐ COLLECTION IS A LATERAL TEST, NOT A VOLUME. Same segment, cart parked in the wrong lane.
+    ctt_pickup_at(0);                            # treasure on the LEFT
+    cart_lean = CFG_PICKUP_LANE_RU << 16;        # cart pinned RIGHT
+    var t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 24) { t = 900; }
+        cart_lean = CFG_PICKUP_LANE_RU << 16;    # hold it there against the spring
+        if (cart_tick(0) == 0) { t = 900; }
+        t = t + 1;
+    }
+    ctt_eq("a pickup out of reach is MISSED", cart_treasure, 0);
+
+    # ⭐ SPEED IS THE MULTIPLIER: the same treasure is worth more taken fast.
+    ctt_pickup_at(1);
+    cart_speed = CFG_SPEED_MIN << 16;
+    t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 24) { t = 900; }
+        cart_speed = CFG_SPEED_MIN << 16;
+        if (cart_tick(IN_BRAKE) == 0) { t = 900; }
+        t = t + 1;
+    }
+    var slow_score = cart_score;
+    ctt_pickup_at(1);
+    cart_speed = CFG_SPEED_MAX << 16;
+    t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 24) { t = 900; }
+        cart_speed = CFG_SPEED_MAX << 16;
+        if (cart_tick(0) == 0) { t = 900; }
+        t = t + 1;
+    }
+    ctt_true("the same treasure scores MORE at speed", cart_score > slow_score);
+    return 0;
+}
+
+# ---- integrity ------------------------------------------------------------------------------------------
+fn ctt_integrity(): i64 {
+    ctt_track(0);
+    ctt_eq("starts whole", cart_integrity, CFG_INTEGRITY_MAX);
+    cart_damage(CFG_BEAM_DAMAGE);
+    ctt_eq("a beam costs its damage", cart_integrity, CFG_INTEGRITY_MAX - CFG_BEAM_DAMAGE);
+    ctt_eq("...and is survivable", cart_dead, 0);
+    cart_damage(CFG_INTEGRITY_MAX);
+    ctt_eq("integrity floors at zero", cart_integrity, 0);
+    ctt_eq("...and an empty cart is destroyed", cart_dead, 1);
+    ctt_eq("...with the right cause", cart_death, 3);
+    return 0;
+}
+
+# ---- generator placement ---------------------------------------------------------------------------------
+fn ctt_placement(): i64 {
+    # ⛔ NO GAP BEFORE THE CART CAN JUMP ONE. This is the assertion that stops the unwinnable opening
+    # the first build shipped: a 3-segment gap at segment 10, against a cart that leaves the gate at
+    # 46% of the cap and needs 62% to clear it. Both pilots died there every single run.
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var early_gap = 0;
+    var early_haz = 0;
+    var t = 0;
+    while (t < 4000) { trk_advance(8533); t = t + 1; }
+    var a = 0;
+    while (a < CFG_GAP_NONE_SEGS) {
+        if (trk_live(a) == 1) {
+            if (trk_kind_at(a) == KIND_GAP) { early_gap = early_gap + 1; }
+            if (a < CFG_HAZ_NONE_SEGS) {
+                if (trk_kind_at(a) == KIND_BEAM) { early_haz = early_haz + 1; }
+            }
+        }
+        a = a + 1;
+    }
+    # (the opening segments have long since scrolled out of the ring, so re-generate a fresh chapter)
+    trk_reset(CFG_SEED_DEFAULT + 3, 1);
+    early_gap = 0; early_haz = 0;
+    a = 0;
+    while (a < CFG_GAP_NONE_SEGS) {
+        if (trk_live(a) == 1) {
+            if (trk_kind_at(a) == KIND_GAP) { early_gap = early_gap + 1; }
+            if (a < CFG_HAZ_NONE_SEGS) {
+                if (trk_kind_at(a) != KIND_PLAIN) {
+                    if (trk_kind_at(a) != KIND_GATE) {
+                        if (trk_kind_at(a) != KIND_PICKUP) { early_haz = early_haz + 1; }
+                    }
+                }
+            }
+        }
+        a = a + 1;
+    }
+    ctt_eq("no gap before the cart can clear one", early_gap, 0);
+    ctt_eq("no hazard at all in the opening segments", early_haz, 0);
+
+    # ⚠ a stacked pair must be spaced wider than the longest commitment, or the chain is impossible
+    ctt_true("pair spacing exceeds the crouch",
+             CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_CROUCH_TICKS);
+    ctt_true("pair spacing exceeds the jump",
+             CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_JUMP_TICKS);
+    return 0;
+}
+
 # ---- the apex bonus ------------------------------------------------------------------------------------
 # ⭐ THE ONE TEST THAT ENCODES THE INTENDED PLAY. Brake into a tightening bend, release as it opens:
 # paid. Sit on the brake the whole way through: not paid. If these two ever agree, the optimal line
@@ -444,6 +670,10 @@ fn cart_selftest(): i64 {
     ctt_speed();
     ctt_lean();
     ctt_grip();
+    ctt_verbs();
+    ctt_pickups();
+    ctt_integrity();
+    ctt_placement();
     ctt_apex();
     ctt_determinism();
 
