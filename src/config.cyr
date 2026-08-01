@@ -218,7 +218,9 @@ var CFG_BRAKE = 6815744;             # Q16.16: 104.0 sub/tick per tick (~1.5 s m
 # sparks and wheel-lift can be hung off them later, not so a number can be displayed.
 var CFG_LEAN_THRESH  = 2228224;      # Q16.16 = 34 ru = 272 cm — past here, the derail clock runs
 var CFG_LEAN_MAX     = 3670016;      # Q16.16 = 56 ru = 448 cm — hard clamp, keeps the cart in the bore
-var CFG_DERAIL_TICKS = 30;           # consecutive ticks past the threshold before the cart is lost
+var CFG_DERAIL_TICKS = 24;           # consecutive ticks past the threshold before the cart is lost
+                                     # ⚠ 24 ticks = 0.4 s. Long enough to be a warning, short enough
+                                     #   that losing the rail at speed is not survivable by waiting.
 
 # ⚠ THE CENTRIFUGAL TERM IS THE WHOLE DIFFICULTY CURVE: force = curve * speed^2. Squaring speed is
 # what makes the brake a real decision rather than a penalty — at half speed a curve pushes a QUARTER
@@ -226,9 +228,44 @@ var CFG_DERAIL_TICKS = 30;           # consecutive ticks past the threshold befo
 # Calibrated so that at the design curve ceiling (1024 brads/seg) and full speed, a player doing
 # NOTHING drifts from centre to the derail threshold in about 2 seconds.
 var CFG_LEAN_FORCE  = 3840;          # Q16.16 ru/tick^2 at curve 1024 and full speed
-var CFG_LEAN_INPUT  = 7200;          # Q16.16 ru/tick^2 of counter-lean authority (~1.9x the force)
+# ⛔⛔ PLAYER AUTHORITY MUST LOSE TO A SLIP, OR LOSING THE RAIL IS DECORATION.
+# At 7200 the player simply out-pushed a full slip by holding a key, and a run could slip for 280
+# ticks without ever being in danger. Sized against the actual forces instead:
+#   gripping, gentle bend, full speed   1440 outward  -> steering holds comfortably
+#   gripping, hard bend, 75% speed      2160 outward  -> steering holds
+#   SLIPPING, mid bend, full speed      3760 outward  -> steering LOSES; shed speed or go wide
+#   SLIPPING, hard bend, full speed     5680 outward  -> steering loses badly
+# ⇒ Steering is how you place the cart on the rail. The brake is the only thing that reaches a slip.
+var CFG_LEAN_INPUT  = 3200;          # Q16.16 ru/tick^2 of counter-lean authority
 var CFG_LEAN_DAMP   = 60293;         # Q16.16 = 0.92 — velocity retained per tick
-var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's gentle self-centring
+var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's self-centring WHILE IT GRIPS
+
+# ---- ⭐⭐ GRIP: THE RAIL HOLDS YOU UNTIL IT CANNOT, AND THAT IS THE WHOLE DIFFICULTY -------------
+# A wheel flange has a finite lateral capacity. Below it the rail simply holds the cart on line and
+# the player has nothing to do; above it the flange lets go and the cart runs wide. That threshold —
+# not a bar, not a timer — is the game.
+#
+# ⛔ AND THE CAPACITY FALLS WITH SPEED, WHICH IS WHAT MAKES THE BRAKE NECESSARY RATHER THAN MERELY
+# REWARDED. Lateral force rises as speed SQUARED while grip falls LINEARLY, so the gap opens fast:
+#
+#      lateral force (Q16.16 ru/tick^2)          grip
+#                  c=384  c=768  c=1024
+#   full speed      1440   2880    3840          2000   <- anything past ~530 curve LETS GO
+#   75% speed        810   1620    2160          2600   <- the hardest bend in the game, held
+#   half speed       360    720     960          3200   <- nothing can break it
+#
+# ⇒ Entering a hard bend at the redline throws the cart off the rail. Braking to three-quarters holds
+#   it. That is the entire risk/reward loop, and it needs no bonus to motivate it.
+var CFG_GRIP_MAX  = 3800;            # Q16.16 ru/tick^2 the flange holds at a standstill
+var CFG_GRIP_FADE = 2200;            # ...of which this much is lost by the speed cap
+var CFG_GRIP_MIN  = 1200;            # floor, so grip never reaches zero and the cart is never doomed
+# ⚠ Once grip breaks, the EXCESS force accelerates the cart outward AND the self-centring stops.
+# Both at once is what makes a slip feel like losing the rail rather than like drifting wide.
+# ⛔ 1.0x WAS FAR TOO GENTLE AND THE TELEMETRY SAID SO: a run slipped for 165 CONSECUTIVE ticks and
+# reached 10 ru of a 34 ru threshold. The rail had let go and nothing happened. Just past the grip
+# limit the excess is by definition tiny, so scaling it 1:1 means a slip starts imperceptibly and
+# stays that way. 3x makes losing the rail escalate instead of merely register.
+var CFG_SLIP_GAIN = 196608;          # Q16.16 = 3.0x the excess, applied as outward acceleration
 
 # ---- the apex bonus -----------------------------------------------------------------------------------
 # ⭐ THE OPTIMAL LINE MUST BE RHYTHMIC, NOT HELD-BRAKE. Braking into a bend and releasing at the apex
@@ -237,6 +274,21 @@ var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's ge
 var CFG_APEX_MIN_CURVE = 192;        # brads/seg below which a bend is too gentle to score
 var CFG_APEX_BONUS     = 1200;       # sub/tick granted on a clean apex release
 var CFG_APEX_DECAY     = 24;         # sub/tick the bonus sheds each tick
+
+# ---- audio ------------------------------------------------------------------------------------------
+# ⭐ THE RAIL-JOINT CLICK RATE IS THE MOST IMPORTANT AUDIO TUNABLE IN THE GAME. It is what makes
+# speed AUDIBLE — the player hears the rail ticking past faster before they read any gauge. One click
+# per 256 cm segment: 2.6 a second at the 24 km/h floor, 10.4 a second at the 96 km/h redline.
+# ⛔ These are the numbers, derived rather than guessed: clicks/s = (m/s) / 2.56, and the phase
+# accumulator wraps at 65536*8, so increment = clicks/s / 48000 * 524288.
+# An earlier guess put this at 934 clicks/second, which is not a rail joint — it is a 934 Hz buzz.
+var CFG_JOINT_BASE = 28;             # phase increment per sample at the brake floor  (2.6 clicks/s)
+var CFG_JOINT_SPAN = 86;             # ...plus this much at the cap                  (10.4 clicks/s)
+# ⚠ CLICK LENGTH IS AS IMPORTANT AS CLICK RATE. Decay is applied per SAMPLE at 48 kHz, so a factor
+# that looks gentle is brutally fast: 0.55/sample decays to nothing in 0.16 ms, which is a tick you
+# cannot hear rather than a rail joint you can. 0.985 gives ~6.4 ms — a short wooden clack.
+var CFG_JOINT_DECAY_N = 985;         # numerator of the per-sample envelope decay
+var CFG_JOINT_DECAY_D = 1000;
 
 # ---- input bits -----------------------------------------------------------------------------------------
 # ⭐ THE SIM SEES ONLY THIS WORD. Not the keyboard, not scancodes, not a device — one bitfield per

@@ -1,0 +1,102 @@
+# film.cyr — render the ride to a raw video stream, on the host, with no GPU.
+#
+# ⭐⭐ WHY THIS EXISTS. The build order's step 4 says to stop and re-tune if the cart is not fun with
+# nothing else in it. That is the right instruction and it has one practical problem: the game needs
+# AGNOS and a GPU to run, so the person who has to answer "is it fun" cannot play it. Asking them
+# anyway is asking them to guess.
+# ⇒ refcore.cyr is a full CPU rasteriser that reproduces exactly what the GPU is asked to draw. It
+#   already exists, for a different reason. Pointing it at every frame of a real run produces a
+#   video, and a video plus the .wav is most of what "does this feel right" actually needs.
+#
+# ⚠ THIS IS THE SAME SIMULATION, NOT A VISUALISATION OF IT. cart_tick, the same track seed, the same
+# autopilot --sim uses. What comes out is the game, rendered slowly.
+#
+# Usage:  cyrius build tools/film.cyr build/film && ./build/film [seconds] [pilot]
+#         writes /tmp/mc_film.raw — 640x400 BGRA frames, back to back, 60 fps.
+
+include "lib/io.cyr"
+include "src/say.cyr"
+include "src/fx.cyr"
+include "src/config.cyr"
+include "src/track.cyr"
+include "src/input.cyr"
+include "src/cart.cyr"
+include "src/audio.cyr"
+include "src/geom.cyr"
+include "src/tex.cyr"
+include "src/refcore.cyr"
+
+fn film_arg(i, dflt): i64 {
+    if (argc() <= i) { return dflt; }
+    var s = argv(i);
+    var v = 0;
+    var k = 0;
+    while (k < mc_slen(s)) { v = v * 10 + (load8(s + k) - 48); k = k + 1; }
+    return v;
+}
+
+fn main(): i64 {
+    args_init();
+    var seconds = film_arg(1, 15);
+    var pilot   = film_arg(2, 1);
+
+    fx_sin_init();
+    mc_tex_init();
+    cart_reset(CFG_SEED_DEFAULT, 0);
+
+    var frames = seconds * CFG_TICK_HZ;
+    ps("film: "); pn(frames); ps(" frames at "); pn(CFG_TICK_HZ); ps(" fps ("); pn(seconds);
+    ps(" s), pilot "); pn(pilot); nl();
+
+    # ⛔ TRUNCATE FIRST. file_write_all opens for write, but every frame after it APPENDS via an
+    # offset write — so a stale longer film from a previous run would leave its tail behind and the
+    # last seconds of the video would be somebody else's ride.
+    # ⚠ file_open bridges the O_* -> AO_* flag difference between Linux and agnos internally, so the
+    # Linux constants are the right ones to pass even though the kernels disagree about the values.
+    var fd = file_open("/tmp/mc_film.raw", O_WRONLY | O_CREAT | O_TRUNC, 420);
+    if (fd < 0) { ps("film: cannot open output"); nl(); return 1; }
+
+    var derails = 0;
+    var f = 0;
+    while (f < frames) {
+        var word = 0;
+        if (pilot == 1) {
+            if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
+            if (cart_lean >     65536) { word = IN_LEFT; }
+            var cv = 0;
+            if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
+            if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
+        }
+        if (cart_tick(word) == 0) {
+            derails = derails + 1;
+            ps("  ** DERAILED at "); pn(trk_depth_m()); ps(" m, frame "); pn(f); ps(" **"); nl();
+            cart_reset(cart_seed, cart_chapter);
+        }
+
+        mc_build(cart_cam_x());
+        # ⛔ rr_record, NOT rr_list — an op 0x0F record REPLACES its whole rect with background first,
+        # and a reference that writes only covered pixels is MORE FORGIVING THAN THE HARDWARE.
+        rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+        sys_write(fd, &rr_fb, MC_W * MC_H * 4);
+
+        # ⚠ Report the SLIP, not just the position. A frame log that shows only depth and speed
+        # cannot distinguish "riding well" from "about to lose it", which is the whole thing the
+        # retune was about.
+        if ((f % 120) == 0) {
+            ps("  "); pn(f); ps("/"); pn(frames); ps("  "); pn(trk_depth_m()); ps(" m  ");
+            pn(cart_kmh()); ps(" km/h  lean "); pn(cart_cam_x());
+            ps("  warn "); pn(cart_warn());
+            if (cart_slip == 1) { ps("  SLIPPING"); }
+            nl();
+        }
+        f = f + 1;
+    }
+    file_close(fd);
+
+    ps("film: done -- "); pn(trk_depth_m()); ps(" m, "); pn(cart_apex_hits);
+    ps(" apexes, "); pn(derails); ps(" derails"); nl();
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

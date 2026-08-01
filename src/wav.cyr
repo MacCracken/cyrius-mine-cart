@@ -1,0 +1,144 @@
+# wav.cyr — write the mix to a .wav file so a person can LISTEN to it.
+#
+# ⭐⭐ WHY THIS EXISTS, AND IT IS NOT A CONVENIENCE. Every other instrument in this repo can be
+# checked by assertion: a record is ABI-legal or it is not, a curve integral matches a closed form or
+# it does not, a replay is byte-identical or it is not. AUDIO IS NOT LIKE THAT. A mixer can pass
+# every numeric test — in range, non-silent, deterministic, correctly attenuated — and still sound
+# like a broken washing machine. Nobody can judge sound they cannot hear, and I cannot hear it.
+# ⇒ The deliverable for the audio step is a FILE THE AUTHOR CAN PLAY. The self-tests bound the
+#   arithmetic; this is what closes the actual question.
+#
+# ⚠ Canonical 44-byte RIFF/WAVE header, PCM, and the same 48000/16/2 the kernel freezes — so the file
+# is a faithful record of exactly the bytes the sound device would have received, not a rendering of
+# them. If the .wav sounds right, the device path is the only thing left to doubt.
+
+var WAV_HDR = 44;
+
+# little-endian scalar writers into a byte buffer
+fn wav_u32(p, v): i64 {
+    store8(p + 0, v & 0xFF);
+    store8(p + 1, (v >>> 8) & 0xFF);
+    store8(p + 2, (v >>> 16) & 0xFF);
+    store8(p + 3, (v >>> 24) & 0xFF);
+    return 0;
+}
+
+fn wav_u16(p, v): i64 {
+    store8(p + 0, v & 0xFF);
+    store8(p + 1, (v >>> 8) & 0xFF);
+    return 0;
+}
+
+fn wav_str4(p, a, b, c, d): i64 {
+    store8(p + 0, a); store8(p + 1, b); store8(p + 2, c); store8(p + 3, d);
+    return 0;
+}
+
+# ⚠ ONE local array per function is the rule in this language — multiple locals alias 8 bytes apart
+# and silently shred each other. The header is the only local buffer here.
+fn wav_header(hdr, frames): i64 {
+    var data_bytes = frames * AUD_BPF;
+    wav_str4(hdr + 0, 82, 73, 70, 70);                   # "RIFF"
+    wav_u32(hdr + 4, 36 + data_bytes);                   # chunk size
+    wav_str4(hdr + 8, 87, 65, 86, 69);                   # "WAVE"
+    wav_str4(hdr + 12, 102, 109, 116, 32);               # "fmt "
+    wav_u32(hdr + 16, 16);                               # PCM fmt chunk size
+    wav_u16(hdr + 20, 1);                                # PCM
+    wav_u16(hdr + 22, AUD_CH);
+    wav_u32(hdr + 24, AUD_RATE);
+    wav_u32(hdr + 28, AUD_RATE * AUD_BPF);               # byte rate
+    wav_u16(hdr + 32, AUD_BPF);                          # block align
+    wav_u16(hdr + 34, 16);                               # bits per sample
+    wav_str4(hdr + 36, 100, 97, 116, 97);                # "data"
+    wav_u32(hdr + 40, data_bytes);
+    return 0;
+}
+
+# ---- the capture buffer ---------------------------------------------------------------------------
+# ⚠ GLOBAL and sized in 8-byte slots. 30 s at 48 kHz stereo is 48000*30*4 = 5,760,000 bytes =
+# 720,000 slots. Declared with headroom and asserted before use, because an overrun here would land
+# in whatever global follows and this repo has already paid for one of those.
+var wav_buf[800000];
+var wav_buf_guard = 0;
+var wav_cap_frames = 1440000;      # 30 s at 48 kHz — (800000*8) / 4 = 1,600,000 available
+
+fn wav_ok(): i64 {
+    if ((&wav_buf_guard - &wav_buf) < WAV_HDR + wav_cap_frames * AUD_BPF) { return 0; }
+    return 1;
+}
+
+# ---- run the simulation and capture what it would have played --------------------------------------
+# ⭐ DRIVEN BY THE REAL SIM AND THE REAL MIXER. It steps cart_tick exactly as the ride does and hands
+# the mixer the same scalars, so the recording is of the game rather than of a test tone. A pilot
+# that never brakes would never record the squeal, so this uses the same crude autopilot --sim does.
+fn wav_capture(seconds, pilot): i64 {
+    fx_sin_init();
+    aud_init();
+    cart_reset(CFG_SEED_DEFAULT, 0);
+
+    var want_frames = seconds * AUD_RATE;
+    if (want_frames > wav_cap_frames) { want_frames = wav_cap_frames; }
+    var ticks = want_frames / AUD_FR_TICK;
+
+    var out = 0;
+    var t = 0;
+    while (t < ticks) {
+        var word = 0;
+        if (pilot == 1) {
+            if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
+            if (cart_lean >     65536) { word = IN_LEFT; }
+            var cv = 0;
+            if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
+            if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
+        }
+        if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
+
+        # hand the mixer this tick's state, then render exactly one tick of audio
+        var braking = 0;
+        if ((word & IN_BRAKE) != 0) { braking = 1; }
+        aud_set_state(cart_speed_frac(), braking, cart_slip);
+        aud_mix(AUD_FR_TICK);
+
+        # copy the tick's PCM into the capture buffer, AFTER the 44-byte header slot
+        # ⚠ There is no file_append_all in this stdlib, so the header and the samples have to leave
+        # in ONE write. Reserving WAV_HDR bytes at the front is cheaper than a second buffer.
+        var i = 0;
+        while (i < AUD_FR_TICK * AUD_BPF) {
+            store8(&wav_buf + WAV_HDR + out * AUD_BPF + i, load8(&aud_pcm + i));
+            i = i + 1;
+        }
+        out = out + AUD_FR_TICK;
+        t = t + 1;
+    }
+    return out;
+}
+
+fn wav_write(path, seconds, pilot): i64 {
+    if (wav_ok() == 0) { ps("wav: capture buffer UNDER-SIZED"); nl(); return 0; }
+
+    var frames = wav_capture(seconds, pilot);
+    ps("  captured "); pn(frames); ps(" frames ("); pn(frames / AUD_RATE); ps(" s), ");
+    pn(cart_apex_hits); ps(" apexes, "); pn(cart_derails); ps(" derails"); nl();
+
+    # the header goes at the FRONT of the same buffer, so header + samples are one write
+    wav_header(&wav_buf, frames);
+
+    # measure what was actually produced, because "wrote a file" is not "wrote audio"
+    var peak = 0;
+    var nonzero = 0;
+    var i = 0;
+    while (i < frames) {
+        var v = load16(&wav_buf + WAV_HDR + i * AUD_BPF) & 0xFFFF;
+        if (v >= 32768) { v = v - 65536; }
+        if (v != 0) { nonzero = nonzero + 1; }
+        if (v < 0) { v = 0 - v; }
+        if (v > peak) { peak = v; }
+        i = i + 1;
+    }
+    ps("  peak "); pn(peak); ps(" of 32767, "); pn((nonzero * 100) / frames);
+    ps("% of frames non-silent"); nl();
+
+    file_write_all(path, &wav_buf, WAV_HDR + frames * AUD_BPF);
+    ps("  wrote "); ps(path); nl();
+    return frames;
+}

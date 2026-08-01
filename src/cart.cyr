@@ -32,6 +32,8 @@ var cart_prev_curve = 0;   # |curve| under the cart last tick
 var cart_apex_armed = 0;   # braking while the bend was tightening
 var cart_apex_hits  = 0;   # clean apexes this run — the thing the score multiplier hangs off
 var cart_derails    = 0;
+var cart_slip       = 0;   # 1 while the flange has let go — drives sparks, screech and the shake
+var cart_slip_ticks = 0;   # total ticks spent slipping this run
 
 # ---- warning level, 0..3 -----------------------------------------------------------------------------
 # ⭐ FOR SPARKS AND WHEEL-LIFT, NOT FOR A NUMBER ON SCREEN. The design brief is explicit that the
@@ -39,6 +41,13 @@ var cart_derails    = 0;
 # lean IS the camera's lateral offset, so drifting wide literally brings the wall closer. This ladder
 # exists so the escalating tells can be hung off it later at the right thresholds.
 fn cart_warn(): i64 {
+    # ⭐ A SLIP IS ALWAYS AT LEAST LEVEL 2, WHEREVER THE CART HAPPENS TO BE. The rail letting go is
+    # the thing the player must feel IMMEDIATELY — waiting for the offset to build first would put
+    # the warning after the mistake instead of at it.
+    if (cart_slip == 1) {
+        if (fx_abs(cart_lean) >= CFG_LEAN_THRESH) { return 3; }
+        return 2;
+    }
     var a = fx_abs(cart_lean);
     if (a >= CFG_LEAN_THRESH) { return 3; }                    # the derail clock is running
     if (a >= (CFG_LEAN_THRESH * 3) / 4) { return 2; }          # wheel lifting, sparks
@@ -83,6 +92,8 @@ fn cart_reset(seed, chapter): i64 {
     cart_ticks    = 0;
     cart_prev_curve = 0;
     cart_apex_armed = 0;
+    cart_slip = 0;
+    cart_slip_ticks = 0;
     return 0;
 }
 
@@ -147,16 +158,36 @@ fn cart_tick(word): i64 {
     var sf  = cart_speed_frac();
     var sf2 = fx_mul(sf, sf);
     var lat = fx_mul((curve * CFG_LEAN_FORCE) >>> 10, sf2);
+    var alat = fx_abs(lat);
     cart_lean_vel = cart_lean_vel - lat;
+
+    # ---- ⭐⭐ GRIP. The one comparison this whole game turns on. --------------------------------
+    # Lateral force rises as speed SQUARED; the flange's capacity falls LINEARLY with speed. When the
+    # first exceeds the second the rail lets go, and the ONLY way back is to shed speed — which is
+    # what makes the brake a necessity rather than a bonus-chasing option.
+    var grip = CFG_GRIP_MAX - fx_mul(sf, CFG_GRIP_FADE);
+    if (grip < CFG_GRIP_MIN) { grip = CFG_GRIP_MIN; }
+    cart_slip = 0;
+    if (alat > grip) { cart_slip = 1; cart_slip_ticks = cart_slip_ticks + 1; }
 
     # player authority
     if ((word & IN_LEFT) != 0)  { cart_lean_vel = cart_lean_vel - CFG_LEAN_INPUT; }
     if ((word & IN_RIGHT) != 0) { cart_lean_vel = cart_lean_vel + CFG_LEAN_INPUT; }
 
-    # ⚠ A GENTLE SELF-CENTRING SPRING, NOT A STRONG ONE. Without it, damping stops the VELOCITY but
-    # never the offset, and the cart drifts wide permanently after one bend. Strong enough and the
-    # rail flies itself and there is no game — this is the single most sensitive number in the file.
-    cart_lean_vel = cart_lean_vel - fx_mul(cart_lean, CFG_LEAN_SPRING);
+    if (cart_slip == 0) {
+        # ⚠ THE RAIL IS HOLDING. It self-centres, and while it does the player has little to do —
+        # which is correct. A game that demands constant correction on a straight is noise.
+        cart_lean_vel = cart_lean_vel - fx_mul(cart_lean, CFG_LEAN_SPRING);
+    }
+    if (cart_slip == 1) {
+        # ⛔ THE RAIL HAS LET GO. Two things happen at once and both matter: the EXCESS force over
+        # the flange's capacity accelerates the cart outward, AND the self-centring stops entirely.
+        # Losing the centring alone would feel like drifting; gaining the excess alone would feel
+        # like a stronger curve. Together it feels like the rail letting go, which is the point.
+        var excess = alat - grip;
+        if (lat > 0) { cart_lean_vel = cart_lean_vel - fx_mul(excess, CFG_SLIP_GAIN); }
+        if (lat < 0) { cart_lean_vel = cart_lean_vel + fx_mul(excess, CFG_SLIP_GAIN); }
+    }
     cart_lean_vel = fx_mul(cart_lean_vel, CFG_LEAN_DAMP);
     cart_lean = cart_lean + cart_lean_vel;
 

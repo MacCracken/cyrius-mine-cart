@@ -111,6 +111,21 @@ fn ctt_track(curve): i64 {
     return 0;
 }
 
+# ⛔ THE CART OUTRUNS A ONE-SHOT STAMP, AND THAT COST A CONFUSING FAILURE. ctt_track paints 48
+# segments; 400 ticks at the redline carries the cart to segment 69 — out onto GENERATED track with
+# real curves, where a "speed" test can slip, derail, and then freeze because cart_tick returns early
+# once the cart is dead. The symptom was "brake bottoms at the floor: got 12208, want 2844", which
+# looks like a brake bug and is not one.
+# ⇒ Re-stamp the window under and ahead of the cart every tick, so a test about speed measures speed.
+fn ctt_hold(curve, word): i64 {
+    var i = 0;
+    while (i <= CFG_GEN_AHEAD) {
+        trk_put(trk_abs_seg + i, curve, 0, KIND_PLAIN, FLAG_NONE, 0, 0);
+        i = i + 1;
+    }
+    return cart_tick(word);
+}
+
 # ---- speed ------------------------------------------------------------------------------------------
 fn ctt_speed(): i64 {
     ctt_track(0);
@@ -118,7 +133,7 @@ fn ctt_speed(): i64 {
 
     # released, the cart reaches the cap and holds there
     var t = 0;
-    while (t < 400) { cart_tick(0); t = t + 1; }
+    while (t < 400) { ctt_hold(0, 0); t = t + 1; }
     # ⭐ the THROTTLE alone reaches the redline and stops there — 103 km/h has to be earned
     ctt_eq("free-runs to the redline, not past it", cart_speed_sub(), CFG_SPEED_BASE);
     ctt_true("throttle-only tops out at 96 km/h", cart_kmh() >= 95);
@@ -126,24 +141,24 @@ fn ctt_speed(): i64 {
     # ...and a bonus lifts it to the plate's top speed, but no further
     cart_bonus = CFG_APEX_BONUS << 16;
     t = 0;
-    while (t < 120) { cart_tick(0); cart_bonus = CFG_APEX_BONUS << 16; t = t + 1; }
+    while (t < 120) { ctt_hold(0, 0); cart_bonus = CFG_APEX_BONUS << 16; t = t + 1; }
     ctt_true("an apex bonus reaches the design top speed", cart_kmh() >= 102);
     ctt_true("...and never exceeds it", cart_speed_sub() <= CFG_SPEED_MAX);
 
     # ⚠ braking bottoms out at the FLOOR, not at zero — the cart always moves forward
     t = 0;
-    while (t < 400) { cart_tick(IN_BRAKE); t = t + 1; }
+    while (t < 400) { ctt_hold(0, IN_BRAKE); t = t + 1; }
     ctt_eq("brake bottoms at the floor", cart_speed_sub(), CFG_SPEED_MIN);
     ctt_true("the cart never stops", cart_speed_sub() > 0);
 
     # the ramps are asymmetric: braking is faster than rebuilding
     ctt_track(0);
     t = 0;
-    while (t < 240) { cart_tick(0); t = t + 1; }
+    while (t < 240) { ctt_hold(0, 0); t = t + 1; }
     var reached = cart_speed_sub();
     ctt_true("~4 s of release reaches the redline", reached >= CFG_SPEED_BASE - 100);
     t = 0;
-    while (t < 90) { cart_tick(IN_BRAKE); t = t + 1; }
+    while (t < 90) { ctt_hold(0, IN_BRAKE); t = t + 1; }
     ctt_true("~1.5 s of brake reaches the floor", cart_speed_sub() <= CFG_SPEED_MIN + 100);
     return 0;
 }
@@ -153,7 +168,7 @@ fn ctt_lean(): i64 {
     # a straight track must never move the cart sideways
     ctt_track(0);
     var t = 0;
-    while (t < 300) { cart_tick(0); t = t + 1; }
+    while (t < 300) { ctt_hold(0, 0); t = t + 1; }
     ctt_eq("straight track leaves lean at zero", cart_lean, 0);
     ctt_eq("straight track never derails", cart_dead, 0);
 
@@ -194,50 +209,64 @@ fn ctt_lean(): i64 {
     }
     ctt_true("an unattended hard bend derails the cart", died);
 
-    # ...and counter-leaning must save it
+    # ⭐⭐ ...and BRAKING must save it, where steering alone no longer can.
+    # ⛔ This assertion used to counter-lean only. Under the grip model that is no longer sufficient
+    # and should not be: lateral force scales with speed SQUARED, so the only lever that reaches a
+    # hard bend at the redline is the brake. Steering places the cart; braking keeps it on the rail.
     ctt_track(CFG_CURVE_MAX);
     t = 0;
     var survived = 1;
     while (t < 600) {
-        # steer INTO the turn: a right-hand bend needs IN_RIGHT
-        var w = 0;
-        if (cart_lean < 0) { w = IN_RIGHT; }
-        if (cart_lean > 0) { w = IN_LEFT; }
-        if (cart_tick(w) == 0) { survived = 0; t = 600; }
+        var w = IN_BRAKE;
+        if (cart_lean < 0) { w = w | IN_RIGHT; }
+        if (cart_lean > 0) { w = w | IN_LEFT; }
+        if (ctt_hold(CFG_CURVE_MAX, w) == 0) { survived = 0; t = 600; }
         t = t + 1;
     }
-    ctt_true("counter-leaning holds the rail", survived);
+    ctt_true("BRAKING through a hard bend holds the rail", survived);
 
-    # the derail clock RESETS on recovery — a long clean run must not be more fragile than a short one
-    # ⚠ AT SPEED. At the gate speed of 48 km/h the force is a QUARTER of what it is at the cap, so an
-    # unattended bend takes ~9 s to reach the threshold rather than ~2 s. That is the speed-squared
-    # law working correctly, and a test that forgets it measures the wrong thing.
+    # ...and steering alone through the same bend does NOT
     ctt_track(CFG_CURVE_MAX);
-    cart_speed = CFG_SPEED_MAX << 16;
     t = 0;
-    while (t < 200) {
-        if (fx_abs(cart_lean) >= CFG_LEAN_THRESH) { t = 200; }
-        cart_tick(0);
-        cart_speed = CFG_SPEED_MAX << 16;              # hold it at the cap
+    var steered_only = 1;
+    while (t < 600) {
+        var w2 = 0;
+        if (cart_lean < 0) { w2 = IN_RIGHT; }
+        if (cart_lean > 0) { w2 = IN_LEFT; }
+        if (ctt_hold(CFG_CURVE_MAX, w2) == 0) { steered_only = 0; t = 600; }
         t = t + 1;
     }
-    ctt_true("the derail clock is running", cart_derail > 0);
-    ctt_true("...but the cart has not died yet", cart_dead == 0);
+    ctt_true("steering ALONE does not hold it -- the brake is the lever", steered_only == 0);
 
-    # ⭐ PROPORTIONAL correction, not a held key. Holding IN_RIGHT for 120 ticks straight overshoots
-    # and trips the threshold on the OTHER side — which is correct, punishing over-correction is part
-    # of the feel, and a test that jams the key is testing the jam.
+    # ---- the derail clock resets on recovery ---------------------------------------------------
+    # ⭐ TESTED ON A BEND THAT DRIFTS YOU WIDE WITHOUT BREAKING GRIP, AND THE DISTINCTION MATTERS.
+    # Past the threshold WITH the rail let go, 24 ticks is not survivable — that is the whole point
+    # of the grip model and an earlier version of this test was asserting the opposite. What is still
+    # true, and worth pinning, is that the clock is CONSECUTIVE: come back inside and it zeroes, so a
+    # long clean run is never more fragile than a short one.
+    # ⚠ Curve 500 at the throttle cap gives ~1699 of lateral force against ~1754 of grip: enough to
+    # push the cart wide, not enough to let go.
+    ctt_track(500);
     t = 0;
-    while (t < 200) {
-        var w = 0;
-        if (cart_lean < 0 - 65536) { w = IN_RIGHT; }
-        if (cart_lean >     65536) { w = IN_LEFT; }
-        cart_tick(w);
-        cart_speed = CFG_SPEED_MAX << 16;
+    while (t < 400) {
+        if (cart_derail > 0) { t = 400; }
+        ctt_hold(500, 0);
+        t = t + 1;
+    }
+    ctt_true("a wide bend starts the derail clock without slipping", cart_derail > 0);
+    ctt_eq("...and the rail has NOT let go", cart_slip, 0);
+
+    # now recover: brake and counter-lean, and the clock must zero
+    t = 0;
+    while (t < 120) {
+        var w = IN_BRAKE;
+        if (cart_lean < 0 - 65536) { w = w | IN_RIGHT; }
+        if (cart_lean >     65536) { w = w | IN_LEFT; }
+        ctt_hold(500, w);
         t = t + 1;
     }
     ctt_eq("recovering resets the derail clock", cart_derail, 0);
-    ctt_eq("...and the cart is still alive", cart_dead, 0);
+    ctt_eq("...and the cart survived", cart_dead, 0);
 
     # ⛔ THE BORE CLAMP IS A RENDERING RULE, NOT A GAMEPLAY ONE — lean outside the tunnel pushes
     # vertices past the coordinate window and the kernel refuses the WHOLE batch.
@@ -254,6 +283,68 @@ fn ctt_lean(): i64 {
     ctt_eq("at the threshold is warning 3", cart_warn(), 3);
     cart_lean = CFG_LEAN_THRESH / 2;
     ctt_true("halfway out is warning 1 or 2", cart_warn() >= 1);
+    return 0;
+}
+
+# ---- ⭐⭐ GRIP: the mechanic the whole difficulty rests on -------------------------------------
+# Its own function because it is its own idea, and because the assertions below are the ones that
+# say "too fast on a bend throws the cart off the rails" is TRUE rather than intended.
+fn ctt_grip(): i64 {
+    # ⛔ A HARD BEND AT FULL SPEED MUST BREAK THE RAIL. If it does not, there is no reason to brake
+    # and the game is a straight line with scenery.
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = CFG_SPEED_MAX << 16;
+    cart_tick(0);
+    ctt_true("full speed through a hard bend BREAKS grip", cart_slip == 1);
+    ctt_eq("...and a slip is at least warning 2, immediately", cart_warn() >= 2, 1);
+
+    # ...and braking must restore it. This is the entire risk/reward loop in two assertions.
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = (CFG_SPEED_MAX / 2) << 16;
+    cart_tick(0);
+    ctt_eq("half speed through the SAME bend holds", cart_slip, 0);
+
+    # a gentle bend at full speed must NOT break grip, or every curve is lethal and the brake is
+    # not a decision but a permanent state
+    ctt_track(384);
+    cart_speed = CFG_SPEED_MAX << 16;
+    cart_tick(0);
+    ctt_eq("a gentle bend at full speed holds", cart_slip, 0);
+
+    # a straight never slips at any speed
+    ctt_track(0);
+    cart_speed = CFG_SPEED_MAX << 16;
+    var st = 0;
+    var slipped = 0;
+    while (st < 120) { cart_tick(0); cart_speed = CFG_SPEED_MAX << 16; if (cart_slip == 1) { slipped = 1; } st = st + 1; }
+    ctt_eq("a straight never slips, at any speed", slipped, 0);
+
+    # ⭐ AND THE PAYOFF: entering a hard bend at the redline and doing nothing must KILL. This is the
+    # assertion that says "too fast on a bend throws the cart off the rails" is actually true.
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = CFG_SPEED_MAX << 16;
+    st = 0;
+    var died = 0;
+    while (st < 300) {
+        if (cart_tick(0) == 0) { died = 1; st = 300; }
+        st = st + 1;
+    }
+    ctt_true("redline into a hard bend, hands off, DERAILS", died);
+
+    # ...while braking through the same bend survives it
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = CFG_SPEED_MAX << 16;
+    st = 0;
+    var lived = 1;
+    while (st < 300) {
+        var w2 = IN_BRAKE;
+        if (cart_lean < 0 - 65536) { w2 = w2 | IN_RIGHT; }
+        if (cart_lean >     65536) { w2 = w2 | IN_LEFT; }
+        if (cart_tick(w2) == 0) { lived = 0; st = 300; }
+        st = st + 1;
+    }
+    ctt_true("braking through the same bend SURVIVES it", lived);
+
     return 0;
 }
 
@@ -352,6 +443,7 @@ fn cart_selftest(): i64 {
     ctt_input();
     ctt_speed();
     ctt_lean();
+    ctt_grip();
     ctt_apex();
     ctt_determinism();
 

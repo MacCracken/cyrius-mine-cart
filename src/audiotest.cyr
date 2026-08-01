@@ -1,0 +1,223 @@
+# audiotest.cyr — what CAN be proven about the audio without hearing it.
+#
+# ⚠ THE LIMIT OF THIS FILE IS THE POINT OF --wav. These assertions bound the arithmetic: the mix
+# stays inside S16, the filter genuinely filters, the click rate genuinely tracks speed, the output
+# is deterministic. NONE of that establishes that it sounds good, or even that it sounds like a mine
+# cart. A mixer can satisfy every test here and still sound like a broken washing machine. The .wav
+# is the instrument for that question and a person is the oracle.
+
+var att_fail = 0;
+var att_ran  = 0;
+
+fn att_eq(name, got, want): i64 {
+    att_ran = att_ran + 1;
+    if (got == want) { return 0; }
+    att_fail = att_fail + 1;
+    ps("    FAIL "); ps(name); ps(": got "); pn(got); ps(", want "); pn(want); nl();
+    return 1;
+}
+
+fn att_true(name, cond): i64 {
+    att_ran = att_ran + 1;
+    if (cond != 0) { return 0; }
+    att_fail = att_fail + 1;
+    ps("    FAIL "); ps(name); ps(": condition false"); nl();
+    return 1;
+}
+
+# read sample i of the mix buffer as a SIGNED value
+# ⚠ load16 ZERO-extends — there is no sign-extending load in this language — so a negative sample
+# reads back as ~65000 unless it is manually converted. This is the single easiest way to conclude
+# the mixer is broken when it is not.
+fn att_sample(i): i64 {
+    var v = load16(&aud_pcm + i * AUD_BPF) & 0xFFFF;
+    if (v >= 32768) { v = v - 65536; }
+    return v;
+}
+
+# ---- range ------------------------------------------------------------------------------------
+# ⛔ A SAMPLE OUTSIDE S16 IS NOT A QUIET BUG. The kernel is a dumb byte-mover: whatever is in the
+# buffer goes to the DAC. An out-of-range value wraps, and a wrapped sample is a full-scale
+# discontinuity — it sounds like a gunshot, at 48000 opportunities a second.
+fn att_range(): i64 {
+    aud_svf_init();
+    var worst = 0;
+    var sp = 0;
+    while (sp <= 65536) {
+        aud_set_state(sp, 1, 1);                 # braking, so the squeal is in the mix too
+        aud_trigger_crack();                  # and the loudest transient
+        aud_set_flood(65536);                 # and the flood band
+        aud_mix(800);
+        var i = 0;
+        while (i < 800) {
+            var v = att_sample(i);
+            if (v > AUD_S16_MAX) { worst = worst + 1; }
+            if (v < AUD_S16_MIN) { worst = worst + 1; }
+            i = i + 1;
+        }
+        sp = sp + 8192;
+    }
+    att_eq("every sample is inside S16, all voices at once", worst, 0);
+    aud_set_flood(0);
+    return 0;
+}
+
+# ---- the filter actually filters ---------------------------------------------------------------
+# ⭐ MEASURED BY ZERO-CROSSING RATE, WHICH IS A REAL SPECTRAL STATEMENT AND COSTS NOTHING.
+# White noise crosses zero on roughly half of all sample pairs. A low-passed signal crosses far less
+# often, and the rate rises with cutoff. So: count crossings at the lowest cutoff bucket and the
+# highest, and require the high bucket to cross MORE. That single comparison catches a filter that
+# is bypassed, a coefficient table that is all zeros, and a state variable that is stuck.
+fn att_zc(): i64 {
+    var prev = 0;
+    var zc = 0;
+    var i = 0;
+    while (i < 800) {
+        var v = att_sample(i);
+        if (i > 0) {
+            if (prev < 0) { if (v >= 0) { zc = zc + 1; } }
+            if (prev >= 0) { if (v < 0) { zc = zc + 1; } }
+        }
+        prev = v;
+        i = i + 1;
+    }
+    return zc;
+}
+
+fn att_filter(): i64 {
+    aud_svf_init();
+    # lowest cutoff bucket: speed 0
+    aud_reset();
+    aud_set_state(0, 0, 0);
+    aud_mix(800); aud_mix(800);              # let the filter settle
+    var zc_low = att_zc();
+
+    # highest cutoff bucket: full speed
+    aud_reset();
+    aud_set_state(65536, 0, 0);
+    aud_mix(800); aud_mix(800);
+    var zc_high = att_zc();
+
+    att_true("a brighter cutoff crosses zero more often", zc_high > zc_low);
+    # ...and both are far below what unfiltered noise would give (~400 crossings in 800 samples)
+    att_true("the low bucket is genuinely dark", zc_low < 200);
+    if (zc_high <= zc_low) {
+        ps("      zc_low="); pn(zc_low); ps(" zc_high="); pn(zc_high); nl();
+    }
+    return 0;
+}
+
+# ---- the rail-joint click tracks speed ------------------------------------------------------------
+# ⭐ THIS IS THE MOST IMPORTANT GAMEPLAY PROPERTY IN THE WHOLE AUDIO FILE. The click rate is what
+# makes speed AUDIBLE — the player hears the rail ticking past faster before they read any gauge.
+# If this ever stops tracking, the game loses its most direct speed feedback and no test that only
+# checks "is there sound" would notice.
+fn att_joints(): i64 {
+    # count clicks directly off the accumulator arithmetic rather than the audio, which is exact
+    # and does not depend on the envelope shape
+    aud_joint_acc = 0;
+    aud_set_state(0, 0, 0);
+    var slow = 0;
+    var i = 0;
+    while (i < 48000) {                       # one second at the floor speed
+        aud_joint_acc = aud_joint_acc + CFG_JOINT_BASE + ((aud_speed_q * CFG_JOINT_SPAN) >>> 16);
+        if (aud_joint_acc >= 65536 * 8) { aud_joint_acc = aud_joint_acc - 65536 * 8; slow = slow + 1; }
+        i = i + 1;
+    }
+    aud_joint_acc = 0;
+    aud_set_state(65536, 0, 0);
+    var fast = 0;
+    i = 0;
+    while (i < 48000) {                       # one second at the cap
+        aud_joint_acc = aud_joint_acc + CFG_JOINT_BASE + ((aud_speed_q * CFG_JOINT_SPAN) >>> 16);
+        if (aud_joint_acc >= 65536 * 8) { aud_joint_acc = aud_joint_acc - 65536 * 8; fast = fast + 1; }
+        i = i + 1;
+    }
+    att_true("rail joints tick at all", slow > 0);
+    att_true("rail joints tick FASTER at speed", fast > slow);
+    # a plausible band: a few a second at the floor, a few dozen at the cap
+    att_true("click rate is a RAIL JOINT, not a buzz", fast < 20);
+    att_true("...and audible at the floor", slow >= 2);
+    if (fast <= slow) { ps("      slow="); pn(slow); ps("/s fast="); pn(fast); ps("/s"); nl(); }
+    return 0;
+}
+
+# ---- determinism -----------------------------------------------------------------------------------
+# ⚠ The audio generator is SEPARATE from the simulation's. This asserts the audio side reproduces,
+# which matters for the .wav being a stable artefact — but the reason the two generators are split is
+# the opposite guarantee: the SIM must not advance its rng because audio ran.
+fn att_determinism(): i64 {
+    aud_svf_init();
+    aud_reset();
+    aud_set_state(32768, 0, 0);
+    aud_mix(800);
+    var h1 = 0;
+    var i = 0;
+    while (i < 800) { h1 = (h1 * 1000003 + att_sample(i)) & 0xFFFFFFFF; i = i + 1; }
+
+    aud_reset();
+    aud_set_state(32768, 0, 0);
+    aud_mix(800);
+    var h2 = 0;
+    i = 0;
+    while (i < 800) { h2 = (h2 * 1000003 + att_sample(i)) & 0xFFFFFFFF; i = i + 1; }
+
+    att_eq("the same audio state renders the same PCM", h1, h2);
+
+    # ⛔ AND THE SIM'S GENERATOR MUST BE UNTOUCHED BY ALL OF THAT. If audio ever drew from fx_rand,
+    # a dropped frame would consume a different number of draws and desynchronise the track from the
+    # input log — the replay guarantee would die silently, and only ten thousand frames later.
+    fx_srand(4242);
+    var before = fx_rand();
+    fx_srand(4242);
+    fx_rand();
+    aud_mix(800);
+    aud_mix(800);
+    var after = fx_rand();
+    fx_srand(4242);
+    fx_rand();
+    var expect = fx_rand();
+    att_eq("mixing does NOT advance the simulation's rng", after, expect);
+    return 0;
+}
+
+# ---- non-silence -------------------------------------------------------------------------------------
+# ⚠ "It ran" is not "it made sound". A mixer that returns all zeros passes a range check perfectly.
+fn att_nonsilent(): i64 {
+    aud_svf_init();
+    aud_reset();
+    aud_set_state(65536, 0, 0);
+    aud_mix(800); aud_mix(800);
+    var nz = 0;
+    var peak = 0;
+    var i = 0;
+    while (i < 800) {
+        var v = att_sample(i);
+        if (v != 0) { nz = nz + 1; }
+        if (v < 0) { v = 0 - v; }
+        if (v > peak) { peak = v; }
+        i = i + 1;
+    }
+    att_true("the mix is not silence", nz > 400);
+    att_true("the mix reaches an audible level", peak > 1000);
+    att_true("...without pinning the rail", peak <= 32768);
+    return 0;
+}
+
+fn aud_selftest(): i64 {
+    att_fail = 0;
+    att_ran  = 0;
+
+    att_true("coefficient table span", aud_ok());
+    att_true("pcm buffer span", aud_pcm_ok());
+    att_nonsilent();
+    att_range();
+    att_filter();
+    att_joints();
+    att_determinism();
+
+    ps("  audio:            "); pn(att_ran); ps(" assertions, ");
+    if (att_fail == 0) { ps("all pass"); nl(); }
+    if (att_fail != 0) { pn(att_fail); ps(" FAILED"); nl(); }
+    return att_fail;
+}

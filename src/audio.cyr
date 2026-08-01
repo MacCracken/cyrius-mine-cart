@@ -1,0 +1,315 @@
+# audio.cyr — the whole soundtrack, synthesised. No samples, no decoder, no allocation in the mix.
+#
+# ⭐ WHAT MAKES A SOUND IN THIS GAME. Four voices, all generated from noise and integers:
+#     RUMBLE   filtered noise, cutoff AND gain track speed — the floor of the mix, always on
+#     JOINTS   a periodic click whose rate is derived from speed, so the rail ticks past faster
+#              as you accelerate. This is the voice that makes speed AUDIBLE rather than merely
+#              visible, and it is worth more than the rumble for that reason.
+#     SQUEAL   a resonant tone while the brake is down
+#     CRACK    a noise burst with fast decay — the whip. Scaffolded; combat is a later step.
+#     FLOOD    a rising noise band — the chapter finale. Scaffolded; the flood is a later step.
+#
+# ⛔⛔ THE FORMAT IS FROZEN BY THE KERNEL AND THERE IS NO CONVERSION LAYER.
+# 48000 Hz, S16 little-endian, 2 channels interleaved, 4 bytes per frame. snd_config #65 hard-rejects
+# anything else — `if (arg2 != 48000) return -1` and the same for 16 bits and 2 channels. The kernel
+# is a dumb byte-mover; the producer resamples or there is no sound.
+# ⭐ 48000 / 60 = EXACTLY 800 frames per simulation tick. No fractional-sample accumulator, no drift,
+# no resampling. That integer relationship is the single luckiest fact in this file.
+#
+# ⛔ NO FLOATING POINT IN THE HOT LOOP, AND THAT IS A DELIBERATE CHOICE RATHER THAN A LIMITATION.
+# Cyrius has f64 as a compiler builtin (f64_add/mul/div/sin/cos/tan/...), it produces correct results,
+# and it builds for --agnos — all measured, not assumed. But cyrius-doom, the only program known to
+# run on real AGNOS iron, uses f64 in ZERO of its source files, and nothing in kernel/core/ring3.cyr
+# saves FPU state across a ring transition. So f64 is used where it is genuinely better — computing
+# filter coefficients on the HOST, offline — and the shipped binary runs pure Q16.16.
+# ⇒ The coefficient table below was generated with f64 by the exact expression in
+#   naad/src/filter.cyr:267, then rounded to Q1.30. Same maths, none of the risk.
+#
+# ⭐ THE ALGORITHMS ARE NOT INVENTED HERE. The state-variable filter is the Cytomic/Simper topology
+# as implemented in naad/src/filter.cyr:349 (_filter_svf_compute_lowpass — the alloc-free path; the
+# four-output variant allocates per sample and would be fatal at 48 kHz). The ring pump follows
+# cyrius-doom/src/audio.cyr:564, which is iron-debugged. Reference implementations that already work
+# beat clever new ones, and both are cited so the derivation is checkable.
+
+# ---- format, frozen ------------------------------------------------------------------------------
+var AUD_RATE      = 48000;
+var AUD_FMT       = 0x1002;      # (bits << 8) | channels — the ONLY value snd_config accepts
+var AUD_CH        = 2;
+var AUD_BPF       = 4;           # bytes per frame, S16 stereo
+var AUD_FR_TICK   = 800;         # 48000 / 60 — exact
+var AUD_RING_FR   = 16384;       # kernel SND_CBL_FRAMES mirror; fill = (RING-1) - snd_avail
+
+# ⚠ RING DEPTH IS A TUNING KNOB WITH A DISPUTED HISTORY, NOT A CONSTANT TO COPY BLIND.
+# cyrius-doom/src/audio.cyr:55 raised this 3072 -> 8192 -> 12288 across iron burns chasing an echo,
+# and its own comment says the root cause is UNDETERMINED: either genuine underrun-replay (the HDA
+# BDL re-plays ~28 ms of stale ring, which sounds like an ECHO rather than like silence) or an
+# inaccurate LPIB register, which is a known-unreliable way to track hardware position.
+# ⇒ Start LOW for latency and raise only if an echo appears on iron. 4800 frames = 100 ms.
+var AUD_TARGET_FR = 4800;
+var AUD_MAX_ITERS = 8;           # cap mix chunks per tick; MAXITERS * AUD_FR_TICK must exceed TARGET
+
+# ---- mix scale -----------------------------------------------------------------------------------
+# Samples are Q16.16 where FX_ONE (65536) is full scale (1.0), converted to S16 on output only.
+var AUD_S16_MAX = 32767;
+var AUD_S16_MIN = 0 - 32768;
+
+# ---- the SVF coefficient table, 16 speed buckets --------------------------------------------------
+# Q1.30 (1073741824 = 1.0). Cutoff sweeps 180 Hz to 1600 Hz logarithmically with speed.
+# ⚠ Q1.30 rather than Q16.16 because a3 at the low end is 0.000137 — nine units in Q16.16, a 5%
+# quantisation error on a filter coefficient that sits inside a feedback loop.
+var AUD_SVF_BUCKETS = 16;
+var AUD_Q30 = 1073741824;
+var aud_svf_a1[16];
+var aud_svf_a2[16];
+var aud_svf_a3[16];
+var aud_svf_guard = 0;
+
+fn aud_ok(): i64 {
+    if ((&aud_svf_a2    - &aud_svf_a1) < 16 * 8) { return 0; }
+    if ((&aud_svf_a3    - &aud_svf_a2) < 16 * 8) { return 0; }
+    if ((&aud_svf_guard - &aud_svf_a3) < 16 * 8) { return 0; }
+    return 1;
+}
+
+fn aud_svf_init(): i64 {
+    store64(&aud_svf_a1 +  0 * 8, 1055997993); store64(&aud_svf_a2 +  0 * 8,  12441259); store64(&aud_svf_a3 +  0 * 8,   146577);   #    180 Hz
+    store64(&aud_svf_a1 +  1 * 8, 1053242562); store64(&aud_svf_a2 +  1 * 8,  14354661); store64(&aud_svf_a3 +  1 * 8,   195640);   #    208 Hz
+    store64(&aud_svf_a1 +  2 * 8, 1050064059); store64(&aud_svf_a2 +  2 * 8,  16555638); store64(&aud_svf_a3 +  2 * 8,   261021);   #    241 Hz
+    store64(&aud_svf_a1 +  3 * 8, 1046399141); store64(&aud_svf_a2 +  3 * 8,  19085176); store64(&aud_svf_a3 +  3 * 8,   348093);   #    279 Hz
+    store64(&aud_svf_a1 +  4 * 8, 1042175523); store64(&aud_svf_a2 +  4 * 8,  21989352); store64(&aud_svf_a3 +  4 * 8,   463964);   #    322 Hz
+    store64(&aud_svf_a1 +  5 * 8, 1037310903); store64(&aud_svf_a2 +  5 * 8,  25319714); store64(&aud_svf_a3 +  5 * 8,   618029);   #    373 Hz
+    store64(&aud_svf_a1 +  6 * 8, 1031711813); store64(&aud_svf_a2 +  6 * 8,  29133585); store64(&aud_svf_a3 +  6 * 8,   822677);   #    431 Hz
+    store64(&aud_svf_a1 +  7 * 8, 1025272427); store64(&aud_svf_a2 +  7 * 8,  33494256); store64(&aud_svf_a3 +  7 * 8,  1094212);   #    499 Hz
+    store64(&aud_svf_a1 +  8 * 8, 1017873358); store64(&aud_svf_a2 +  8 * 8,  38471006); store64(&aud_svf_a3 +  8 * 8,  1454030);   #    577 Hz
+    store64(&aud_svf_a1 +  9 * 8, 1009380487); store64(&aud_svf_a2 +  9 * 8,  44138861); store64(&aud_svf_a3 +  9 * 8,  1930133);   #    668 Hz
+    store64(&aud_svf_a1 + 10 * 8,  999643887); store64(&aud_svf_a2 + 10 * 8,  50577996); store64(&aud_svf_a3 + 10 * 8,  2559045);   #    772 Hz
+    store64(&aud_svf_a1 + 11 * 8,  988496947); store64(&aud_svf_a2 + 11 * 8,  57872657); store64(&aud_svf_a3 + 11 * 8,  3388219);   #    893 Hz
+    store64(&aud_svf_a1 + 12 * 8,  975755792); store64(&aud_svf_a2 + 12 * 8,  66109437); store64(&aud_svf_a3 + 12 * 8,  4479049);   #   1034 Hz
+    store64(&aud_svf_a1 + 13 * 8,  961219171); store64(&aud_svf_a2 + 13 * 8,  75374743); store64(&aud_svf_a3 + 13 * 8,  5910569);   #   1196 Hz
+    store64(&aud_svf_a1 + 14 * 8,  944668980); store64(&aud_svf_a2 + 14 * 8,  85751235); store64(&aud_svf_a3 + 14 * 8,  7783969);   #   1383 Hz
+    store64(&aud_svf_a1 + 15 * 8,  925871622); store64(&aud_svf_a2 + 15 * 8,  97313029); store64(&aud_svf_a3 + 15 * 8, 10228011);   #   1600 Hz
+    return 0;
+}
+
+# ---- the filter ------------------------------------------------------------------------------------
+# Cytomic/Simper state-variable filter, low-pass output. Ported from naad/src/filter.cyr:349.
+#   v3 = in - ic2eq ;  v1 = a1*ic1eq + a2*v3 ;  v2 = ic2eq + a2*ic1eq + a3*v3
+#   ic1eq = 2*v1 - ic1eq ;  ic2eq = 2*v2 - ic2eq ;  lowpass = v2
+# ⚠ Coefficients are Q1.30 and the signal is Q16.16, so a product is >>> 30 to land back in Q16.16.
+# The intermediate is i64: coefficient up to 2^30 times a signal up to ~2^20 is 2^50, comfortable.
+var aud_ic1 = 0;
+var aud_ic2 = 0;
+var aud_bucket = 0;
+
+fn aud_svf_lp(x): i64 {
+    var a1 = load64(&aud_svf_a1 + aud_bucket * 8);
+    var a2 = load64(&aud_svf_a2 + aud_bucket * 8);
+    var a3 = load64(&aud_svf_a3 + aud_bucket * 8);
+    var v3 = x - aud_ic2;
+    var v1 = ((a1 * aud_ic1) >>> 30) + ((a2 * v3) >>> 30);
+    var v2 = aud_ic2 + ((a2 * aud_ic1) >>> 30) + ((a3 * v3) >>> 30);
+    aud_ic1 = 2 * v1 - aud_ic1;
+    aud_ic2 = 2 * v2 - aud_ic2;
+    return v2;
+}
+
+# ---- noise -------------------------------------------------------------------------------------------
+# ⛔ AUDIO USES ITS OWN PRNG STATE, NEVER fx_rand. The simulation's generator must advance ONLY with
+# the simulation, or the replay guarantee dies: a run that dropped a frame would draw a different
+# number of samples and desynchronise the track from the input log. Two generators, one purpose each.
+var aud_rng = 22222;
+
+fn aud_noise(): i64 {
+    var x = aud_rng & 0xFFFFFFFF;
+    x = (x ^ (x << 13)) & 0xFFFFFFFF;
+    x = x ^ (x >> 17);                    # masked non-negative; `>>` is the LOGICAL shift here
+    x = (x ^ (x << 5)) & 0xFFFFFFFF;
+    aud_rng = x;
+    # to signed Q16.16 in roughly [-1, 1]
+    return ((x & 0x1FFFF) - 65536);
+}
+
+# ---- voice state ---------------------------------------------------------------------------------------
+var aud_up        = 0;       # 1 once the device is open
+var aud_slot      = 0 - 1;
+var aud_err       = 0;
+var aud_frames    = 0;       # frames pushed this run — proves the pump actually pumped
+
+var aud_speed_q   = 0;       # 0..65536, speed as a fraction of the cap
+var aud_braking   = 0;
+
+var aud_joint_acc = 0;       # phase accumulator for the rail-joint click
+var aud_joint_env = 0;       # click envelope, Q16.16
+
+var aud_crack_env = 0;       # whip burst envelope
+var aud_flood_amt = 0;       # flood band amount, 0..65536
+
+var aud_squeal_ph = 0;       # brake squeal oscillator phase, brads
+var aud_squeal_env = 0;
+var aud_slip       = 0;      # 1 while the rail has let go — raises and brightens the screech
+
+# ⭐ ONE PLACE THAT CLEARS EVERY VOICE. Without this, state leaks across a chapter restart — a whip
+# crack triggered just before a derail keeps decaying into the next run's first frames, and any test
+# that resets "the obvious few" variables silently measures the leftovers of the previous test.
+fn aud_reset(): i64 {
+    aud_ic1 = 0; aud_ic2 = 0; aud_bucket = 0;
+    aud_rng = 22222;
+    aud_joint_acc = 0; aud_joint_env = 0;
+    aud_crack_env = 0; aud_flood_amt = 0;
+    aud_squeal_ph = 0; aud_squeal_env = 0;
+    aud_speed_q = 0; aud_braking = 0; aud_slip = 0;
+    return 0;
+}
+
+# ---- the mix buffer ---------------------------------------------------------------------------------------
+# ⚠ GLOBAL, and sized in 8-byte slots. 800 frames * 2 channels = 1600 samples, packed as S16 pairs
+# into 3200 bytes = 400 slots. Declared with headroom and asserted at startup.
+var aud_pcm[512];
+var aud_pcm_guard = 0;
+
+fn aud_pcm_ok(): i64 {
+    if ((&aud_pcm_guard - &aud_pcm) < AUD_FR_TICK * AUD_BPF) { return 0; }
+    return 1;
+}
+
+# ---- driving the voices from the simulation ---------------------------------------------------------------
+# ⭐ THE SIM PUSHES, THE MIXER NEVER PULLS. audio reads no game state directly — it is handed a small
+# set of scalars once a tick. That keeps the sim free of audio (so the replay stays exact) and lets
+# the mixer run at a different rate, or not at all, without the simulation noticing.
+fn aud_set_state(speed_q, braking, slipping): i64 {
+    aud_speed_q = speed_q;
+    aud_braking = braking;
+    aud_slip = slipping;
+    # cutoff bucket tracks speed: faster cart, brighter rumble
+    var b = (speed_q * AUD_SVF_BUCKETS) >>> 16;
+    if (b < 0) { b = 0; }
+    if (b > AUD_SVF_BUCKETS - 1) { b = AUD_SVF_BUCKETS - 1; }
+    aud_bucket = b;
+    # ⭐ THE SLIP SCREECH IS THE MOST IMPORTANT SOUND IN THE GAME. The brief asks for the margin to
+    # be FELT rather than read, and losing the rail is the moment that has to land instantly — before
+    # the cart has visibly moved, while there is still time to brake. It is louder and higher than
+    # the brake squeal so the two are never confused: one is you choosing to slow, the other is the
+    # rail letting go.
+    if (slipping == 1) { aud_squeal_env = 62000; }
+    if (slipping == 0) {
+        if (braking == 1) { aud_squeal_env = 38000; }
+        if (braking == 0) { aud_squeal_env = (aud_squeal_env * 3) / 4; }
+    }
+    return 0;
+}
+
+fn aud_trigger_crack(): i64 { aud_crack_env = 65536; return 0; }
+fn aud_set_flood(amt): i64  { aud_flood_amt = amt; return 0; }
+
+# ---- one chunk of PCM ----------------------------------------------------------------------------------------
+# Fills aud_pcm with `frames` interleaved S16 stereo frames. Returns frames written.
+# ⛔ ACCUMULATE IN i64 AND CLAMP EXACTLY ONCE, AT THE END. Clamping each voice as it is added makes
+# the result depend on the ORDER the voices were summed — two mixes with the same content and a
+# different order produce different audio, and the loud passages distort in a way that moves when
+# you add a voice. naad's own mixer re-clamps per stream; that is the thing not to copy.
+fn aud_mix(frames): i64 {
+    var i = 0;
+    while (i < frames) {
+        var acc = 0;
+
+        # -- RUMBLE: filtered noise, gain rising with speed ------------------------------------------
+        var r = aud_svf_lp(aud_noise());
+        acc = acc + ((r * (10500 + ((aud_speed_q * 22500) >>> 16))) >>> 16);
+
+        # -- JOINTS: a click whose RATE derives from speed. This is what makes speed audible. --------
+        # ⚠ The accumulator is in Q16.16 of "clicks per sample"; at the cap that is about 10 a second.
+        aud_joint_acc = aud_joint_acc + CFG_JOINT_BASE + ((aud_speed_q * CFG_JOINT_SPAN) >>> 16);
+        if (aud_joint_acc >= 65536 * 8) {
+            aud_joint_acc = aud_joint_acc - 65536 * 8;
+            aud_joint_env = 65536;
+        }
+        if (aud_joint_env > 0) {
+            acc = acc + ((aud_noise() * ((aud_joint_env * 18500) >>> 16)) >>> 16);
+            aud_joint_env = (aud_joint_env * CFG_JOINT_DECAY_N) / CFG_JOINT_DECAY_D;   # ~6.4 ms clack
+        }
+
+        # -- SQUEAL: a resonant tone while the brake is down -----------------------------------------
+        if (aud_squeal_env > 256) {
+            # a slip screeches HIGHER than a brake squeal, so the two are distinguishable by ear
+            var sq_step = 1900;
+            if (aud_slip == 1) { sq_step = 3400; }
+            aud_squeal_ph = (aud_squeal_ph + sq_step) & 65535;
+            acc = acc + ((fx_sin(aud_squeal_ph) * ((aud_squeal_env * 5200) >>> 16)) >>> 15);
+        }
+
+        # -- CRACK: noise burst, fast decay (the whip; combat is a later step) -----------------------
+        if (aud_crack_env > 256) {
+            acc = acc + ((aud_noise() * ((aud_crack_env * 30000) >>> 16)) >>> 16);
+            aud_crack_env = (aud_crack_env * 88) / 100;
+        }
+
+        # -- FLOOD: a rising noise band (the finale; a later step) -----------------------------------
+        if (aud_flood_amt > 0) {
+            acc = acc + ((aud_noise() * ((aud_flood_amt * 24000) >>> 16)) >>> 16);
+        }
+
+        # -- ONE clamp, at the end -------------------------------------------------------------------
+        if (acc > AUD_S16_MAX) { acc = AUD_S16_MAX; }
+        if (acc < AUD_S16_MIN) { acc = AUD_S16_MIN; }
+
+        # interleaved L then R — hda.cyr reads bytes 0-1 as LEFT, 2-3 as RIGHT
+        store16(&aud_pcm + i * 4 + 0, acc & 0xFFFF);
+        store16(&aud_pcm + i * 4 + 2, acc & 0xFFFF);
+        i = i + 1;
+    }
+    return frames;
+}
+
+# ---- the device ---------------------------------------------------------------------------------------------
+#ifdef CYRIUS_TARGET_AGNOS
+fn aud_init(): i64 {
+    aud_svf_init();
+    var s = syscall(64);                                  # snd_open
+    if (s < 0) { aud_err = 0 - 1; return 0; }
+    if (syscall(65, s, AUD_RATE, AUD_FMT) != 0) {         # snd_config — rejects anything but 48k/16/2
+        aud_err = 0 - 2;
+        syscall(67, s);
+        return 0;
+    }
+    aud_slot = s;
+    aud_up = 1;
+    return 1;
+}
+
+# ⭐ THE PUMP KEEPS THE RING TOPPED TO A DEPTH, IT DOES NOT PUSH A FIXED AMOUNT.
+# The DAC drains at a free-running 48 kHz, independent of the game's 60 Hz tick. Pushing a fixed
+# 800 frames a tick leaves the ring roughly one tick deep, and any jitter in the frame loop underruns
+# it — at which point the cyclic DMA REPLAYS stale ring content, so an underrun sounds like an ECHO
+# rather than like a gap. Driving off snd_avail #69 (ground truth) instead is cyrius-doom's fix.
+# ⚠ snd_write_nb returns 0 for WOULD_BLOCK, which is not an error. Advance by the RETURN, never by
+# the request, or the mix silently runs ahead of what was actually accepted.
+fn aud_tick(): i64 {
+    if (aud_up != 1) { return 0; }
+    var iters = 0;
+    while (iters < AUD_MAX_ITERS) {
+        var av = syscall(69, aud_slot);                   # snd_avail — free frames
+        if (av < 0) { return 0; }                         # slot lost: stop, do not spin
+        var fill = (AUD_RING_FR - 1) - av;                # frames queued ahead of the DAC
+        if (fill >= AUD_TARGET_FR) { return 0; }          # ring topped for this tick
+        aud_mix(AUD_FR_TICK);
+        var got = syscall(66, aud_slot, &aud_pcm, AUD_FR_TICK, 1);   # snd_write_nb
+        if (got <= 0) { return 0; }                       # would block: ring full mid-chunk
+        aud_frames = aud_frames + got;
+        iters = iters + 1;
+    }
+    return 0;
+}
+
+fn aud_close(): i64 {
+    if (aud_up != 1) { return 0; }
+    syscall(67, aud_slot);                                # snd_close zeroes the ring, so the
+    aud_up = 0;                                           # free-running DMA loops silence
+    return 0;
+}
+#else
+# The host has no sound device. aud_mix still runs — that is what --wav and the self-test use, and
+# it is the whole reason the synthesis is separable from the device.
+fn aud_init(): i64 { aud_svf_init(); return 0; }
+fn aud_tick(): i64 { aud_mix(AUD_FR_TICK); aud_frames = aud_frames + AUD_FR_TICK; return 0; }
+fn aud_close(): i64 { return 0; }
+#endif

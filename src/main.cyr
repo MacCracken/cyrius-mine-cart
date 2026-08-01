@@ -45,6 +45,9 @@ include "src/tracktest.cyr"
 include "src/input.cyr"
 include "src/cart.cyr"
 include "src/carttest.cyr"
+include "src/audio.cyr"
+include "src/audiotest.cyr"
+include "src/wav.cyr"
 include "src/geom.cyr"
 include "src/tex.cyr"
 include "src/refcore.cyr"
@@ -71,6 +74,7 @@ fn mc_check(): i64 {
     if (fx_selftest() != 0) { bad = bad + 1; }
     if (trk_selftest() != 0) { bad = bad + 1; }
     if (cart_selftest() != 0) { bad = bad + 1; }
+    if (aud_selftest() != 0) { bad = bad + 1; }
 
     # ---- buffers, MEASURED rather than assumed ----------------------------------------------
     ps("  buffers: vertex lists ");
@@ -327,28 +331,45 @@ fn mc_check(): i64 {
 }
 
 # ---- frame pacing ------------------------------------------------------------------------------
-# ⛔⛔ NEVER SPIN ON THE CLOCK ON AGNOS. A foreground exec runs ring-3 with interrupts DISABLED, so
-# `timer_ticks` — and therefore uptime_ms — only advances inside a kernel `sti` window. A busy-wait
-# like `while (uptime_ms() < deadline) { }` does not merely burn CPU: the clock it is waiting on can
-# never move, and the machine hangs forever with no diagnostic. sleep_ms(#41) opens such a window,
-# which is why pacing MUST go through it.
-# ⚠ 10 ms granularity against a 16.67 ms frame, so this cannot hold 60 Hz exactly — it sleeps the
-# remainder and self-corrects against the real clock rather than accumulating. The SIM is unaffected
-# either way: it is a fixed 60 Hz step that reads no clock at all, so a late frame renders late and
-# simulates identically. Rendering may drop frames; the simulation never does.
-var mc_deadline_ms = 0;
+# ⛔⛔ NEVER SPIN ON THE CLOCK ON AGNOS. A foreground exec runs ring-3 with interrupts DISABLED, so a
+# busy-wait like `while (clock() < deadline) { }` does not merely burn CPU — on the #40 clock the
+# value it is waiting on cannot move, and the machine hangs forever with no diagnostic. sleep_ms(#41)
+# is what opens a kernel `sti` window, which is why pacing goes through it.
+#
+# ⛔⛔ AND THE CLOCK IS #95, NOT #40. THIS COST NOTHING ONLY BECAUSE THE KERNEL SAYS SO OUT LOUD.
+# uptime_ms #40 reads `timer_ticks`, and a FOREGROUND `run` program executes with IF cleared, so the
+# timer never fires and #40 is FROZEN FOR THE WHOLE RUN — agnos kernel/core/syscall.cyr:7440 states
+# it plainly: "Any `run`-launched program timing itself with #40 measures zero." It advances only
+# inside the brief sti window sleep_ms itself opens, which makes it a clock that moves only when you
+# are already asleep: 10 ms granularity against a 16.67 ms frame, and self-referential to boot.
+# ⇒ uptime_us #95 reads rdtsc, needs no interrupts, and is MICROSECONDS. The kernel calls it "the
+#   only correct clock on that path".
+# ⚠ #95 RETURNS -1 WHEN CALIBRATION WAS REFUSED, DELIBERATELY RATHER THAN A PLAUSIBLE ZERO — the
+#   kernel notes that a tool which cannot tell "no clock" from "0 us elapsed" already burned two
+#   flashes. So -1 is handled as "do not pace" rather than arithmetic'd into a huge sleep.
+#
+# ⚠ The SIM is unaffected by any of this: it is a fixed 60 Hz step that reads no clock at all, so a
+# late frame renders late and simulates identically. Rendering may drop frames; the sim never does.
+var mc_deadline_us = 0;
+var mc_clock_ok    = 1;        # 0 once #95 has reported it has no calibrated clock
 
 #ifdef CYRIUS_TARGET_AGNOS
 fn mc_pace(): i64 {
-    var now = syscall(40);                        # uptime_ms
-    if (mc_deadline_ms == 0) { mc_deadline_ms = now; }
-    mc_deadline_ms = mc_deadline_ms + 1000 / CFG_TICK_HZ;
-    var rem = mc_deadline_ms - now;
-    # ⚠ if we fell behind, do NOT sleep and do NOT try to catch up by running extra sim steps —
-    # resync the deadline instead. Catch-up loops turn one slow frame into a spiral.
-    if (rem <= 0) { mc_deadline_ms = now; return 0; }
-    if (rem > 100) { rem = 100; }
-    syscall(41, rem);
+    if (mc_clock_ok == 0) { return 0; }
+    var now = syscall(95);                        # uptime_us — rdtsc, valid with IF=0
+    if (now < 0) { mc_clock_ok = 0; return 0; }   # calibration refused; run unpaced rather than wrong
+    if (mc_deadline_us == 0) { mc_deadline_us = now; }
+    mc_deadline_us = mc_deadline_us + 1000000 / CFG_TICK_HZ;
+    var rem = mc_deadline_us - now;
+    # ⚠ if we fell behind, do NOT sleep and do NOT catch up by running extra sim steps — resync the
+    # deadline instead. A catch-up loop turns one slow frame into a spiral.
+    if (rem <= 0) { mc_deadline_us = now; return 0; }
+    if (rem > 100000) { rem = 100000; }
+    # ⚠ sleep_ms rounds UP to whole 10 ms ticks, so a sub-10 ms remainder would sleep a whole tick and
+    # overshoot the frame. Below that, spend the remainder rather than oversleep it — the deadline is
+    # absolute, so the next frame simply has less to wait for.
+    var rem_ms = rem / 1000;
+    if (rem_ms > 0) { syscall(41, rem_ms); }
     return rem;
 }
 #else
@@ -372,10 +393,18 @@ fn mc_sim(ticks, pilot): i64 {
 
     ps("mine-cart: SIM pilot "); pn(pilot); ps(", "); pn(ticks); ps(" ticks at ");
     pn(CFG_TICK_HZ); ps(" Hz ("); pn(ticks / CFG_TICK_HZ); ps(" s)"); nl();
-    ps("    tick   depth  km/h    lean  warn  drl  apex   curve"); nl();
+    ps("    tick   depth  km/h    lean  warn  drl  apex   curve  slip"); nl();
 
     var deepest = 0;
     var top     = 0;
+    # ⚠ ACCUMULATE ACROSS DEATHS. cart_reset zeroes the per-run counters, so reading them at the end
+    # reports only the LAST life — which for a pilot that dies often is a short, unrepresentative
+    # one. The same mistake the drop counters made, in a different file.
+    var slip_total = 0;
+    var max_lean   = 0;
+    var max_curve  = 0;
+    var max_slip_run = 0;
+    var cur_slip_run = 0;
     var t = 0;
     while (t < ticks) {
         var word = 0;
@@ -388,9 +417,18 @@ fn mc_sim(ticks, pilot): i64 {
             if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
         }
 
+        if (cart_slip == 1) { slip_total = slip_total + 1; cur_slip_run = cur_slip_run + 1; }
+        if (cart_slip == 0) { if (cur_slip_run > max_slip_run) { max_slip_run = cur_slip_run; } cur_slip_run = 0; }
+        if (fx_abs(cart_lean) > max_lean) { max_lean = fx_abs(cart_lean); }
+        var cvn = 0;
+        if (trk_live(trk_abs_seg) == 1) { cvn = fx_abs(trk_curve_at(trk_abs_seg)); }
+        if (cvn > max_curve) { max_curve = cvn; }
         if (cart_tick(word) == 0) {
             ps("    DERAILED at "); pn(trk_depth_m()); ps(" m after "); pn(cart_ticks);
-            ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s) -- restarting the chapter"); nl();
+            ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s)"); 
+            if (cart_slip == 1) { ps(" -- LOST THE RAIL"); }
+            ps(" -- restarting the chapter"); nl();
+            slip_total = slip_total + cart_slip_ticks;
             cart_reset(cart_seed, cart_chapter);
         }
 
@@ -408,6 +446,7 @@ fn mc_sim(ticks, pilot): i64 {
             ps("\t"); pn(cart_derail);
             ps("\t"); pn(cart_apex_hits);
             ps("\t"); pn(cv2);
+            ps("\t"); pn(cart_slip);
             nl();
         }
         t = t + 1;
@@ -416,6 +455,13 @@ fn mc_sim(ticks, pilot): i64 {
     nl();
     ps("  deepest "); pn(deepest); ps(" m, top speed "); pn(top); ps(" km/h, ");
     pn(cart_apex_hits); ps(" clean apexes, "); pn(cart_derails); ps(" derails"); nl();
+    # ⭐ SLIP IS THE NUMBER THAT SAYS WHETHER THE DIFFICULTY MECHANIC IS ACTUALLY ENGAGING. A run
+    # with zero slip ticks never once lost the rail, whatever else it reports.
+    ps("  slipping for "); pn(slip_total); ps(" of "); pn(ticks);
+    ps(" ticks ("); pn((slip_total * 100) / ticks); ps("%), longest unbroken slip ");
+    pn(max_slip_run); ps(" ticks"); nl();
+    ps("  worst lean "); pn(max_lean >>> 16); ps(" ru of "); pn(CFG_LEAN_THRESH >>> 16);
+    ps(" threshold, hardest curve met "); pn(max_curve); ps(" of "); pn(CFG_CURVE_MAX); nl();
     ps("  the generator produced "); pn(trk_gen_count); ps(" segments, ABI curve clamp fired ");
     pn(trk_clamp_hits); ps(" times"); nl();
     return 0;
@@ -449,6 +495,10 @@ fn mc_ride(limit): i64 {
     ps("x"); pn(mc_fbh); ps(" framebuffer"); nl();
 
     cart_reset(CFG_SEED_DEFAULT, 0);
+    # ⚠ Sound is OPTIONAL. A refused device must not stop the ride — aud_tick() is a no-op when the
+    # device never opened, and a game that will not start because the DAC is busy is worse than a
+    # silent one.
+    if (aud_init() != 1) { ps("mine-cart: no sound device -- riding silent"); nl(); }
 
     var drawn = 0;
     var presented = 0;
@@ -472,6 +522,14 @@ fn mc_ride(limit): i64 {
             ps("mine-cart: DERAILED at "); pn(trk_depth_m()); ps(" m -- restarting the chapter"); nl();
             cart_reset(cart_seed, cart_chapter);
         }
+
+        # ⭐ AUDIO IS HANDED THE SIM'S STATE, IT NEVER READS IT. One call in, one pump out — so the
+        # mixer can fall behind, run at a different rate, or fail to open entirely, and the
+        # simulation is bit-identical either way.
+        var aud_braking = 0;
+        if ((word & IN_BRAKE) != 0) { aud_braking = 1; }
+        aud_set_state(cart_speed_frac(), aud_braking, cart_slip);
+        aud_tick();
 
         mc_build(cart_cam_x());
         if (mc_gpu_frame() != 1) {
@@ -499,6 +557,7 @@ fn mc_ride(limit): i64 {
         mc_pace();
     }
 
+    aud_close();
     mc_gpu_free();
     ps("mine-cart: "); pn(presented); ps(" frames PRESENTED, "); pn(drawn); ps(" drawn, ");
     pn(trk_depth_m());
@@ -609,6 +668,7 @@ fn main(): i64 {
     var check  = 0;
     var verify = 0;
     var sim    = 0;
+    var wav    = 0;
     var pilot  = 1;
     var frames = 900;
     var i = 1;
@@ -628,6 +688,7 @@ fn main(): i64 {
             }
         }
         if (mc_streq(a, "--sim") == 1) { sim = 1; }
+        if (mc_streq(a, "--wav") == 1) { wav = 1; }
         if (mc_streq(a, "--pilot") == 1) {
             i = i + 1;
             if (i < argc()) {
@@ -643,6 +704,7 @@ fn main(): i64 {
             ps("  --check      host gate: re-validate every emitted record, needs no GPU"); nl();
             ps("  --verify     GPU vs CPU reference, byte-compared. Needs agnos + a GPU"); nl();
             ps("  --sim        run the simulation headless and print telemetry (tuning)"); nl();
+            ps("  --wav        render 20 s of the mix to /tmp/deepvein.wav and LISTEN to it"); nl();
             ps("  --pilot N    0 = hands off the controls, 1 = crude autopilot (with --sim)"); nl();
             ps("  --frames N   bound the ride (0 = unbounded)"); nl();
             ps("  --trace      report every dropped triangle, for diagnosis"); nl();
@@ -660,6 +722,12 @@ fn main(): i64 {
     if (check == 1) { ps("CHECK (host gate, no GPU needed)"); nl(); return mc_check(); }
     if (verify == 1) { ps("VERIFY (GPU vs CPU reference)"); nl(); return mc_verify(120); }
     if (sim == 1) { ps("SIM (headless, no GPU -- tuning telemetry)"); nl(); return mc_sim(frames, pilot); }
+    if (wav == 1) {
+        ps("WAV (render the mix to /tmp/deepvein.wav so a person can hear it)"); nl();
+        fx_sin_init();
+        wav_write("/tmp/deepvein.wav", 20, pilot);
+        return 0;
+    }
     ps("RIDE ("); pn(frames); ps(" frames)"); nl();
     return mc_ride(frames);
 }
