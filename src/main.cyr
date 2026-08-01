@@ -121,10 +121,17 @@ fn mc_check(): i64 {
     # track, so a gate that forgets this passes every assertion while never once exercising a curve —
     # which is exactly the state where the accumulated centre line, the degenerate-sliver drops and
     # the coordinate window all actually get tested. Straight track is the one case that cannot fail.
+    # ⛔⛔ THE GATE MUST PLAY THE GAME, NOT COAST THROUGH IT. This drove with cart_tick(0) — no
+    # input — which falls into the first gap at 87 m and restarts, forever. It therefore never
+    # reached a 3-track section, and reported "over-budget 0" while real play was dropping 30
+    # triangles a frame and losing the cart entirely. A gate that only probes the opening 87 m of a
+    # 500 m run is not measuring the game.
+    # ⚠ cart_autopilot() is the same reference pilot --sim and the film tool use, so the gate, the
+    # telemetry and the recorded video all traverse identical ground.
     mc_cart_reset();
     var f = 0;
-    while (f < 240) {
-        mc_cart_step();
+    while (f < 900) {
+        if (cart_tick(cart_autopilot()) == 0) { cart_reset(cart_seed, cart_chapter); }
         var n = mc_build(cart_cam_x());
         tris = tris + n;
         if (n < mintri) { mintri = n; }
@@ -203,7 +210,7 @@ fn mc_check(): i64 {
         g = g + 1;
     }
 
-    ps("  "); pn(frames); ps(" frames built ("); pn(240); ps(" on the ride path, 120 at real screen offsets, ");
+    ps("  "); pn(frames); ps(" frames built ("); pn(900); ps(" on the ride path, 120 at real screen offsets, ");
     pn(60); ps(" at extremes), "); pn(tris); ps(" triangles"); nl();
     ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_TRI_MAX);
     ps(" permitted (16 slabs x 6 quads x 2 = 192)"); nl();

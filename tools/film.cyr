@@ -76,11 +76,26 @@ fn main(): i64 {
         # ⚠ Report the SLIP, not just the position. A frame log that shows only depth and speed
         # cannot distinguish "riding well" from "about to lose it", which is the whole thing the
         # retune was about.
+        if (mc_drop_full > 0) {
+            if ((f % 40) == 0) {
+                ps("  ** frame "); pn(f); ps(": "); pn(mc_drop_full);
+                ps(" triangles OVER BUDGET (emitted "); pn(mc_n_a); ps(" of "); pn(MC_TRI_MAX);
+                ps(") -- the cart is being dropped **"); nl();
+            }
+        }
+        if (f == 200) {
+            ps("  cart rect: x "); pn(mc_px(0 - CFG_CART_HW, CFG_CART_RZ)); ps("..");
+            pn(mc_px(CFG_CART_HW, CFG_CART_RZ)); ps("  y ");
+            pn(mc_py(MC_FLOOR_Y - CFG_CART_H, CFG_CART_RZ)); ps("..");
+            pn(mc_py(MC_FLOOR_Y, CFG_CART_RZ));
+            ps("   tris "); pn(mc_n_a); ps(" of "); pn(MC_TRI_MAX); nl();
+        }
         if ((f % 120) == 0) {
             ps("  "); pn(f); ps("/"); pn(frames); ps("  "); pn(trk_depth_m()); ps(" m  ");
             pn(cart_kmh()); ps(" km/h  lean "); pn(cart_cam_x());
             ps("  warn "); pn(cart_warn());
             if (cart_slip == 1) { ps("  SLIPPING"); }
+            if (trk_live(trk_abs_seg) == 1) { if (trk_multi_at(trk_abs_seg) == 1) { ps("  [3-TRACK]"); } }
             nl();
         }
         f = f + 1;

@@ -60,6 +60,7 @@ var trk_haz_next    = 0;   # absolute segment index of the next hazard
 var trk_haz_pair    = 0;   # >0 = a stacked partner is due this many segments after the last hazard
 var trk_haz_pair_kind = 0; # what that partner will be
 var trk_gap_left    = 0;   # segments remaining in the gap currently being laid
+var trk_multi_left  = 0;   # segments remaining in the current 3-track run
 
 # ---- counters, for the gate ---------------------------------------------------------------------
 var trk_gen_count   = 0;   # segments generated this chapter — proves streaming actually streams
@@ -91,6 +92,11 @@ fn trk_grade_at(abs_seg): i64 { return load64(&trk_grade + trk_slot(abs_seg) * 8
 fn trk_kind_at(abs_seg): i64  { return load64(&trk_kind  + trk_slot(abs_seg) * 8); }
 fn trk_flags_at(abs_seg): i64 { return load64(&trk_flags + trk_slot(abs_seg) * 8); }
 fn trk_lane_at(abs_seg): i64  { return load64(&trk_branch_b + trk_slot(abs_seg) * 8); }
+
+fn trk_multi_at(abs_seg): i64 {
+    if ((trk_flags_at(abs_seg) & FLAG_MULTI) != 0) { return 1; }
+    return 0;
+}
 
 # the lateral offset of a pickup lane, in RENDER UNITS. 0 = left, 1 = centre, 2 = right.
 fn trk_lane_x(lane): i64 {
@@ -153,13 +159,31 @@ fn trk_gen_one(): i64 {
         # ⚠ A THIRD OF PHRASES ARE DEAD STRAIGHT ON PURPOSE. Continuous curvature gives the player
         # nowhere to recover lean, and a track with no rest reads as uniformly hard rather than
         # rhythmic. The straights are where the brake-into/release-at-apex loop gets set up.
-        if (fx_rand_n(100) < CFG_STRAIGHT_PCT) {
+        #
+        # ⛔⛔ ONE DRAW, TESTED TWICE — NOT TWO DRAWS. This was two independent `fx_rand_n(100)` calls
+        # against the same threshold, which is not a coin flip with two outcomes, it is two coins:
+        #     both fire     22.4%  (curve overwrites straight)
+        #     only curve    43.6%
+        #     only straight 11.6%  <- the ACTUAL straight rate, against 34% intended
+        #     NEITHER fires 11.6%  <- and this silently inherited the PREVIOUS phrase's target,
+        #                             so a "new" phrase was sometimes just the old one continuing
+        # The comment above said a third and the generator delivered an eighth. Draw once, branch on
+        # the stored value, and the number in config.cyr means what it says.
+        var roll = fx_rand_n(100);
+        if (roll < CFG_STRAIGHT_PCT) {
             trk_tgt_curve = 0;
-        }
-        if (fx_rand_n(100) >= CFG_STRAIGHT_PCT) {
+        } else {
             var mag = fx_rand_range(CFG_CURVE_MAX / 8, CFG_CURVE_MAX);
             if (fx_rand_n(2) == 0) { mag = 0 - mag; }
             trk_tgt_curve = mag;
+        }
+        # a new phrase may open a 3-track run
+        if (trk_multi_left <= 0) {
+            if (abs >= CFG_MULTI_NONE_SEGS) {
+                if (fx_rand_n(100) < CFG_MULTI_PCT) {
+                    trk_multi_left = fx_rand_range(CFG_MULTI_MIN_SEGS, CFG_MULTI_MAX_SEGS);
+                }
+            }
         }
         trk_tgt_grade = fx_rand_range(0 - CFG_GRADE_MAX / 2, CFG_GRADE_MAX) + CFG_GRADE_BIAS;
         if (trk_tgt_grade >  CFG_GRADE_MAX) { trk_tgt_grade =  CFG_GRADE_MAX; }
@@ -187,6 +211,15 @@ fn trk_gen_one(): i64 {
     var kind  = KIND_PLAIN;
     var flags = FLAG_NONE;
     var lane  = 0;
+
+    # ---- multi-rail runs ---------------------------------------------------------------------------
+    # ⚠ Decided at PHRASE boundaries so a 3-track section lines up with a curve phrase rather than
+    # starting mid-bend, and never overlapping a gap — hopping between rails while airborne over a
+    # hole is a combination nothing in the design has an answer for yet.
+    if (trk_multi_left > 0) {
+        flags = flags | FLAG_MULTI;
+        trk_multi_left = trk_multi_left - 1;
+    }
 
     # a gap already in progress keeps laying itself
     if (trk_gap_left > 0) {
@@ -286,6 +319,7 @@ fn trk_reset(seed, chapter): i64 {
     trk_haz_pair = 0;
     trk_haz_pair_kind = 0;
     trk_gap_left = 0;
+    trk_multi_left = 0;
     trk_gen_count = 0;
     trk_clamp_hits = 0;
 

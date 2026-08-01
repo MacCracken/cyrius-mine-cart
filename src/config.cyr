@@ -92,6 +92,17 @@ var FLAG_NONE    = 0;
 var FLAG_LIT     = 1;                # telegraphed branch (an unlit third branch is the shortcut)
 var FLAG_SHORTCUT = 2;
 var FLAG_HAZARD  = 4;
+# ⭐ THREE TRACKS SIDE BY SIDE. Set on every segment of a multi-rail run, so the renderer and the hop
+# logic both read it off the segment rather than tracking a mode.
+var FLAG_MULTI   = 8;
+
+# ---- multi-rail sections ------------------------------------------------------------------------------
+# ⚠ 26 put 54% of all ticks on 3-track sections — measured, not guessed. A section that occupies
+# half the game is not a section, it is the game. 10 makes it an event.
+var CFG_MULTI_PCT      = 10;         # percent of phrases that become a 3-track run
+var CFG_MULTI_MIN_SEGS = 30;         # 77 m — long enough to be a section, not a gimmick
+var CFG_MULTI_MAX_SEGS = 70;         # 179 m
+var CFG_MULTI_NONE_SEGS = 34;        # none before this, so the player meets one track first
 
 # ---- the screen ---------------------------------------------------------------------------------
 # ⛔ BOTH AXES MUST BE MULTIPLES OF GPU_TILE (8) or the record is refused GPO_E_ALIGN — which rejects
@@ -125,11 +136,19 @@ var MC_SUB_PER_RU = 2048;            # 65536 / 32 — cam_ru = pos_sub >>> 11, g
 # ---- the tunnel bore, in render units (+y is DOWN) ------------------------------------------------
 # ⚠ An arched section, not a box: flat floor, walls, chamfers, then a narrower ceiling. The chamfers
 # are what read as an arch at speed and cost 2 quads a slab.
-var MC_TW       = 64;                # half-width          = 512 cm (10.24 m bore)
-var MC_FLOOR_Y  = 56;                # floor below the eye = 448 cm
-var MC_CEIL_Y   = 56;                # ceiling above the eye
-var MC_ARCH_Y   = 28;                # springing line — where the wall stops and the chamfer starts
-var MC_CEIL_HW  = 32;                # ceiling half-width; the chamfer closes MC_TW -> MC_CEIL_HW
+# ⭐⭐ WIDENED FOR THREE RAILS. A three-rail section puts the outer rail centres at +-22 render
+# units. In the old 64 ru bore with a 34 ru derail threshold that placed a cart at 82% of the way to
+# death BEFORE ANY PLAYER ERROR — simply being on an outer rail would have been permanently
+# near-fatal, which is not difficulty, it is a bug wearing difficulty's clothes.
+# ⚠ WIDENING THE BORE MOVES |D|, WHICH IS THE BOUND THAT TURNS A FRAME BLACK ON IRON. It is measured
+# by --check, never estimated: the near-plane wall moves from 640 px to 840 px off centre, and the
+# peak |D| that follows is reported by the gate. If that margin ever approaches 1x, this is the
+# constant that did it.
+var MC_TW       = 84;                # half-width          = 672 cm (13.4 m bore)
+var MC_FLOOR_Y  = 72;                # floor below the eye = 576 cm
+var MC_CEIL_Y   = 72;                # ceiling above the eye
+var MC_ARCH_Y   = 36;                # springing line — where the wall stops and the chamfer starts
+var MC_CEIL_HW  = 42;                # ceiling half-width; the chamfer closes MC_TW -> MC_CEIL_HW
 
 # ---- the slab ladder ------------------------------------------------------------------------------
 # ⭐ NEAR SLABS MUST BE SHORTER THAN FAR ONES. A uniform 32 ru walk makes the first slab 280 px tall
@@ -142,6 +161,20 @@ var MC_LOD1 = 16;                    #                            rz in [64, 128
 var MC_LOD2 = 32;                    #                            rz in [128, 256)
 var MC_LOD3 = 64;                    #                            rz in [256, 512)
 var MC_SLAB_MAX = 24;                # endpoint array capacity; the ladder produces 17
+# ⛔⛔ THE TRIANGLE BUDGET IS 256 PER RECORD AND A 3-TRACK FRAME BLEW THROUGH IT. Measured: 256 of
+# 256 emitted with 16-30 triangles DROPPED, the cart among them — which is why the cart appeared on
+# single-track frames and vanished on multi-track ones. Optional detail is therefore distance-gated:
+# past these depths it is a few pixels tall and costs the same as it does up close.
+var CFG_SIDE_RZ    = 112;            # side tracks are drawn nearer than this
+var CFG_CHAMFER_RZ = 128;            # the arch chamfers are drawn nearer than this
+var CFG_BEAM_RZ    = 128;            # beams
+var CFG_PICKUP_RZ  = 112;            # treasure
+# ⭐⭐ A RESERVE, NOT JUST A BUDGET. Distance gating alone is arithmetic that has to be redone every
+# time anything is added — and it was already wrong once: the analytic worst case said 248 of 256
+# while real play measured 256 of 256 with 1246 triangles dropped, because hazards and pickups were
+# not in the sum. A reserve is a GUARANTEE instead of a calculation: optional detail refuses to emit
+# unless this much room remains, so the cart cannot be the thing that gets dropped.
+var CFG_TRI_RESERVE = 16;
 
 # ---- the curve integral ----------------------------------------------------------------------------
 # round(2*pi * 65536). Converts brads (65536 = one turn) into 16.16 radians.
@@ -161,6 +194,16 @@ var MC_TEXFULL  = 8388608;           # 128 << 16 — one full wrap, in 16.16 tex
 # opaque black over everything the first drew. The whole frame must therefore be ONE record, and one
 # record carries ONE texture. Left half is the floor (ballast, sleepers, rails), right half is rock.
 var MC_TEX_HALF = 4194304;           # 64 << 16 — the u boundary between the two materials
+# ⭐ THE FLOOR BAND IS SUBDIVIDED, and every quad must sample its OWN region. A quad that spanned the
+# whole floor band picked up rail stripes: treasure rendered as fragments of rail, which is exactly
+# what it looked like on screen.
+# ⚠ 47, NOT 48. The floor quad's right edge samples u EXACTLY at this value, so ending it at 48
+# landed on the ore swatch and painted an amber stripe down the right-hand side of the track.
+var MC_TEX_FLOOR    = 3080192;       # 47 << 16 — end of the main floor band
+var MC_TEX_ORE      = 3145728;       # 48 << 16 — the solid ore swatch, sampled as a CONSTANT
+var MC_TEX_CAPDARK  = 3211264;       # 49 << 16 — the far cap's darkness, likewise constant
+var MC_TEX_RAILPAIR = 3276800;       # 50 << 16 — start of the side-track rail-pair strip
+var MC_TEX_CART     = 3080192;       # 47 << 16 — the cart's own plate, sampled as a CONSTANT
 
 # ---- the draw rect's origin on screen ---------------------------------------------------------------------
 # ⚠ BOTH MUST BE MULTIPLES OF 8 or the record is GPO_E_ALIGN. On an 800x600 console the exact centre
@@ -216,18 +259,28 @@ var CFG_BRAKE = 6815744;             # Q16.16: 104.0 sub/tick per tick (~1.5 s m
 # ⭐ THE MARGIN MUST BE FELT, NOT READ. There is no lean bar in the frame; what the player sees is the
 # wall getting closer, because lean IS the camera's lateral offset. The warning levels below exist so
 # sparks and wheel-lift can be hung off them later, not so a number can be displayed.
-var CFG_LEAN_THRESH  = 2228224;      # Q16.16 = 34 ru = 272 cm — past here, the derail clock runs
-var CFG_LEAN_MAX     = 3670016;      # Q16.16 = 56 ru = 448 cm — hard clamp, keeps the cart in the bore
+# ⚠ RAISED WITH THE TRACK SPREAD, NOT WITH THE BORE. The outer track centre sits at 44 ru, so a
+# threshold of 48 would have put a cart at 92% of the way to death just for riding an outer rail.
+# 72 ru puts it at 61%. ⭐ THE BORE DID NOT NEED TO MOVE: peak |D| comes from the near-plane WALLS,
+# not from the tracks, so spreading the tracks inside the existing bore costs nothing on the one
+# bound that turns a frame black.
+var CFG_LEAN_THRESH  = 4718592;      # Q16.16 = 72 ru = 576 cm — past here, the derail clock runs
+var CFG_LEAN_MAX     = 5242880;      # Q16.16 = 80 ru = 640 cm — hard clamp, just inside the bore
 var CFG_DERAIL_TICKS = 24;           # consecutive ticks past the threshold before the cart is lost
                                      # ⚠ 24 ticks = 0.4 s. Long enough to be a warning, short enough
                                      #   that losing the rail at speed is not survivable by waiting.
 
+# ⚠⚠ THESE SCALE WITH CFG_LEAN_THRESH AND MUST BE RE-DERIVED WHENEVER THE BORE CHANGES.
+# Widening the bore for three rails moved the threshold 34 -> 48 ru: the distance to failure grew by
+# 41% while every acceleration stayed put, and the game went from "hands off derails every 7 s" to
+# "hands off never derails at all, worst lean 7 of 48". Difficulty is TIME to the threshold, not the
+# threshold, so the accelerations were scaled by the same 48/34 to preserve it.
 # ⚠ THE CENTRIFUGAL TERM IS THE WHOLE DIFFICULTY CURVE: force = curve * speed^2. Squaring speed is
 # what makes the brake a real decision rather than a penalty — at half speed a curve pushes a QUARTER
 # as hard, so braking into a bend buys far more control than the time it costs.
 # Calibrated so that at the design curve ceiling (1024 brads/seg) and full speed, a player doing
 # NOTHING drifts from centre to the derail threshold in about 2 seconds.
-var CFG_LEAN_FORCE  = 3840;          # Q16.16 ru/tick^2 at curve 1024 and full speed
+var CFG_LEAN_FORCE  = 8145;          # Q16.16 ru/tick^2 at curve 1024 and full speed
 # ⛔⛔ PLAYER AUTHORITY MUST LOSE TO A SLIP, OR LOSING THE RAIL IS DECORATION.
 # At 7200 the player simply out-pushed a full slip by holding a key, and a run could slip for 280
 # ticks without ever being in danger. Sized against the actual forces instead:
@@ -236,7 +289,7 @@ var CFG_LEAN_FORCE  = 3840;          # Q16.16 ru/tick^2 at curve 1024 and full s
 #   SLIPPING, mid bend, full speed      3760 outward  -> steering LOSES; shed speed or go wide
 #   SLIPPING, hard bend, full speed     5680 outward  -> steering loses badly
 # ⇒ Steering is how you place the cart on the rail. The brake is the only thing that reaches a slip.
-var CFG_LEAN_INPUT  = 3200;          # Q16.16 ru/tick^2 of counter-lean authority
+var CFG_LEAN_INPUT  = 6780;          # Q16.16 ru/tick^2 of counter-lean authority
 var CFG_LEAN_DAMP   = 60293;         # Q16.16 = 0.92 — velocity retained per tick
 var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's self-centring WHILE IT GRIPS
 
@@ -256,9 +309,9 @@ var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's se
 #
 # ⇒ Entering a hard bend at the redline throws the cart off the rail. Braking to three-quarters holds
 #   it. That is the entire risk/reward loop, and it needs no bonus to motivate it.
-var CFG_GRIP_MAX  = 3800;            # Q16.16 ru/tick^2 the flange holds at a standstill
-var CFG_GRIP_FADE = 2200;            # ...of which this much is lost by the speed cap
-var CFG_GRIP_MIN  = 1200;            # floor, so grip never reaches zero and the cart is never doomed
+var CFG_GRIP_MAX  = 8055;            # Q16.16 ru/tick^2 the flange holds at a standstill
+var CFG_GRIP_FADE = 4665;            # ...of which this much is lost by the speed cap
+var CFG_GRIP_MIN  = 2550;            # floor, so grip never reaches zero and the cart is never doomed
 # ⚠ Once grip breaks, the EXCESS force accelerates the cart outward AND the self-centring stops.
 # Both at once is what makes a slip feel like losing the rail rather than like drifting wide.
 # ⛔ 1.0x WAS FAR TOO GENTLE AND THE TELEMETRY SAID SO: a run slipped for 165 CONSECUTIVE ticks and
@@ -323,7 +376,60 @@ var CFG_GAP_NONE_SEGS = 26;          # no GAP within this many segments of the c
 var CFG_PICKUP_PCT   = 22;           # percent of non-hazard segments carrying treasure
 var CFG_PICKUP_REACH = 20;           # render units either side that counts as a grab (160 cm)
 var CFG_PICKUP_LANES = 3;            # left / centre / right
-var CFG_PICKUP_LANE_RU = 26;         # lateral offset of the outer lanes, render units
+var CFG_PICKUP_LANE_RU = 44;         # lateral offset of the outer lanes, render units
+                                     # ⚠ EQUAL TO CFG_RAIL_SEP on purpose: a pickup lane IS a rail on
+                                     #   a multi-rail section, so the two must not drift apart.
+
+# ---- rails ------------------------------------------------------------------------------------------
+# ⭐ THREE RAILS SIDE BY SIDE, hopped between with jump + a direction. The outer centres sit at 45% of
+# the derail threshold, so riding an outer rail is a real commitment without being a slow death.
+# ⚠ SEPARATION AND GAUGE ARE CONSTRAINED FROM BOTH SIDES AND THE BAND IS NARROW.
+# From below: separation must exceed twice the gauge or adjacent tracks overlap.
+# From above: the outer track centre must stay well under CFG_LEAN_THRESH, because lean is measured
+#   from the TUNNEL CENTRE — so simply riding an outer rail already spends part of the derail budget.
+#     gauge 8  sep 22 -> tracks span +-30, outer at 45% of threshold   (thin; looked like one rail)
+#     gauge 13 sep 28 -> tracks span +-41, outer at 58%                <- chosen
+#     gauge 16 sep 36 -> tracks span +-52, outer at 75%                (too close to death)
+# ⇒ Three tracks occupy the middle half of the bore with ballast either side. That is a marshalling
+#   chamber rather than a corridor, and it is the widest layout the absolute-lean model allows.
+# ⭐⭐ THE CART IS THE SOURCE OF TRUTH FOR SCALE, AND EVERYTHING BELOW IS DERIVED FROM IT.
+# The gauge and the track separation used to be two numbers picked by eye, which is exactly why they
+# did not relate to each other or to anything the player sees. A track exists to carry a cart, so:
+#     gauge      = the cart's width          (the rails run under its wheels)
+#     separation = the cart's width + clearance  (two carts must pass without touching)
+# ⚠ This is a HAULER, not a hand-pushed ore car. A real narrow-gauge mine car is 1.2-1.6 m on a
+# 600-900 mm gauge; this one carries a core crate at 100 km/h through a 13.4 m bore and has to READ
+# at that speed, so it is scaled to a heavy-haul vehicle at 2.88 m.
+var CFG_CART_HW    = 18;             # cart half-width, render units — 2.88 m wide cart
+var CFG_CART_H     = 22;             # cart body height above the rail head
+# ⛔ THE CART CANNOT BE DRAWN AT THE NEAR PLANE, AND THE ARITHMETIC SAYS SO PLAINLY. The floor sits
+# 72 ru below the eye, so at rz = MC_ZN (32) it projects to y = 920 on a 400 px screen — the near
+# plane is entirely BELOW the view. The floor only enters frame at rz ~115.
+#     rz  32 -> base y 920  OFF BOTTOM
+#     rz 110 -> base y 409  OFF BOTTOM (just)
+#     rz 124 -> base y 385  visible, 92 px wide
+# ⚠ So the cart rides 124 ru (9.9 m) ahead of the camera. That is a chase distance, not a defect —
+# the camera is a drone behind the cart, which is what the design plate's "CART REAR" view is.
+var CFG_CART_RZ    = 124;            # render units ahead of the camera the cart is drawn at
+var CFG_RAIL_CLEAR = 8;              # clearance between adjacent carts, render units (64 cm)
+var CFG_RAIL_SEP   = 44;             # = 2*CFG_CART_HW + CFG_RAIL_CLEAR. 3.52 m centre-to-centre.
+                                     # ⚠ 3 tracks then span +-62 of the +-84 bore, leaving 22 ru of
+                                     #   ballast each side — a chamber with room, not a corridor.
+var CFG_RAILS_MAX  = 3;              # -1 = left, 0 = centre, +1 = right
+# ⚠ Half the gauge, in render units. 8 ru = 128 cm between the rails — a real mine gauge, and narrow
+# enough that three tracks at 22 ru spacing leave a visible 6 ru of ballast between them.
+var CFG_TRACK_HW   = 18;             # = CFG_CART_HW. The rails run under the wheels.
+
+# ---- branch reconvergence -----------------------------------------------------------------------------
+# ⛔ SPECIFIED IN SEGMENTS, NOT TICKS, AND THE BRIEF'S TICK FIGURE CANNOT BE HONOURED AS WRITTEN.
+# The brief asks for reconvergence within 900-1800 ticks. The same stretch of track is 899-1797 ticks
+# at the redline and 3595-7190 at the brake floor — so a tick bound is not a property the generator
+# can guarantee, because it depends on how the player drives. Segments are, and 156-312 segments is
+# exactly the intended figure at speed.
+var CFG_BRANCH_MIN_SEGS = 156;       # 399 m — 900 ticks at the redline
+var CFG_BRANCH_MAX_SEGS = 312;       # 799 m — 1800 ticks at the redline
+var CFG_BRANCH_NECK     = 20;        # sterile segments after the fork mouth (max renderer reach is 16)
+var CFG_BRANCH_TAIL     = 24;        # segments over which the branch ramps back to the trunk's values
 var CFG_TREASURE_SCORE = 100;        # score per treasure
 
 # ---- the apex bonus -----------------------------------------------------------------------------------
@@ -360,6 +466,24 @@ var IN_JUMP  = 8;
 var IN_DUCK  = 16;
 var IN_WHIP  = 32;
 var IN_QUIT  = 64;
+# ⭐⭐ SWITCH IS A DOUBLE-TAP, AND THAT IS WHAT LETS LEAN KEEP THE SAME KEYS.
+# Leaning is a HOLD — a sustained counterweight against the bend. Switching is an INTENT, expressed
+# once. Those are different shapes of input, so they can share a key without ambiguity: hold to lean,
+# tap-tap to switch. No modifier is stolen (SHIFT is the brake), nothing is overloaded by context,
+# and the player never has to know which mode they are in.
+# ⚠ The first tap of a double-tap DOES still lean, briefly. That is correct rather than a compromise:
+# flicking the cart toward the branch you are taking is what you would do anyway.
+var IN_SW_LEFT  = 128;
+var IN_SW_RIGHT = 256;
+# ⚠ HOP is jump + a direction: the cart leaves the rail and comes down on the neighbouring one. It is
+# distinct from a fork (which changes which track EXISTS ahead) — a hop moves between rails that are
+# both already there. Reserved here so the input word's shape is settled before the world model is.
+var IN_HOP_LEFT  = 512;
+var IN_HOP_RIGHT = 1024;
+
+# ⚠ 20 ticks = 0.33 s. Long enough that a deliberate double-tap is comfortable, short enough that two
+# separate lean corrections a third of a second apart are not mistaken for one.
+var CFG_DTAP_TICKS = 20;
 
 # ---- the chapter --------------------------------------------------------------------------------
 # ⭐ ONE SEED PER CHAPTER, AND DEATH REPLAYS IT EXACTLY. The player is meant to learn a specific

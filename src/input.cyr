@@ -67,12 +67,19 @@ fn in_reset(): i64 {
     }
     in_ext_carry = 0;
     in_skip = 0;
+    in_frame = 0;
+    in_last_l = 0 - 999;
+    in_last_r = 0 - 999;
+    in_sw_l = 0;
+    in_sw_r = 0;
+    in_taps_frame = 0 - 1;
     return 0;
 }
 
 # ⭐ EDGES ARE CONSUMED, NOT SAMPLED. Cleared once per tick AFTER the sim has read them, so a press
 # that lands between two ticks is never lost and never counted twice.
 fn in_flush_edges(): i64 {
+    in_tick();
     var i = 0;
     while (i < 256) { store64(&in_edge + i * 8, 0); i = i + 1; }
     return 0;
@@ -131,6 +138,52 @@ fn in_poll(): i64 {
 fn in_poll(): i64 { return 0; }
 #endif
 
+# ---- double-tap detection ------------------------------------------------------------------------
+# ⭐ THIS IS THE ONLY PLACE THAT KNOWS ABOUT TIME ON THE DEVICE SIDE. The simulation still sees one
+# word per tick and no clock; what it now sees is a word that can say "switch left" as well as "lean
+# left". The tap history lives here so the sim stays a pure function of (word, world).
+# ⚠ The counter is advanced by in_flush_edges(), which the frame loop already calls exactly once per
+# tick. Tying it to that rather than to a separate call means it cannot silently fall out of step.
+var in_frame     = 0;
+var in_last_l    = 0 - 999;    # frame of the previous LEFT press
+var in_last_r    = 0 - 999;
+var in_sw_l      = 0;          # latched for exactly one tick
+var in_sw_r      = 0;
+# ⛔ in_word() MUST BE IDEMPOTENT WITHIN A TICK. It reads edges, and edges persist until
+# in_flush_edges() clears them — so calling in_word() twice in one tick would feed the SAME press to
+# the tap detector twice and manufacture a double-tap the player never made. A switch the player did
+# not ask for, at a fork, is about the worst input bug this game could have.
+var in_taps_frame = 0 - 1;
+
+fn in_tick(): i64 {
+    in_frame = in_frame + 1;
+    in_sw_l = 0;
+    in_sw_r = 0;
+    return 0;
+}
+
+# called on the EDGE of a direction press — returns 1 if this completes a double-tap
+fn in_note_tap(is_right): i64 {
+    if (is_right == 0) {
+        var dl = in_frame - in_last_l;
+        in_last_l = in_frame;
+        if (dl <= CFG_DTAP_TICKS) {
+            # ⚠ RESET THE HISTORY ON A COMPLETED TAP, or a THIRD press inside the window reads as a
+            # second double-tap and the player switches twice from one gesture.
+            in_last_l = 0 - 999;
+            return 1;
+        }
+        return 0;
+    }
+    var dr = in_frame - in_last_r;
+    in_last_r = in_frame;
+    if (dr <= CFG_DTAP_TICKS) {
+        in_last_r = 0 - 999;
+        return 1;
+    }
+    return 0;
+}
+
 # ---- THE BOUNDARY -------------------------------------------------------------------------------
 # ⭐ Everything above this line is device-shaped and platform-specific. Everything below sees one
 # integer. Held keys drive continuous controls (lean, brake); edges drive one-shot actions (jump,
@@ -139,6 +192,18 @@ fn in_poll(): i64 { return 0; }
 # player reaching for a cart game reaches for arrows.
 fn in_word(): i64 {
     var w = 0;
+    # ⭐ A DIRECTION EDGE FEEDS THE DOUBLE-TAP DETECTOR *AND* STILL LEANS. Both, not either — see the
+    # note in config.cyr about why the first tap leaning is correct rather than a compromise.
+    # ⚠ Guarded so a second call in the same tick re-reports the same result instead of re-detecting.
+    if (in_taps_frame != in_frame) {
+        in_taps_frame = in_frame;
+        if (in_edge_at(SC_A) == 1)     { if (in_note_tap(0) == 1) { in_sw_l = 1; } }
+        if (in_edge_at(SC_LEFT) == 1)  { if (in_note_tap(0) == 1) { in_sw_l = 1; } }
+        if (in_edge_at(SC_D) == 1)     { if (in_note_tap(1) == 1) { in_sw_r = 1; } }
+        if (in_edge_at(SC_RIGHT) == 1) { if (in_note_tap(1) == 1) { in_sw_r = 1; } }
+    }
+    if (in_sw_l == 1) { w = w | IN_SW_LEFT; }
+    if (in_sw_r == 1) { w = w | IN_SW_RIGHT; }
     if (in_held_at(SC_A) == 1)      { w = w | IN_LEFT; }
     if (in_held_at(SC_LEFT) == 1)   { w = w | IN_LEFT; }
     if (in_held_at(SC_D) == 1)      { w = w | IN_RIGHT; }
@@ -150,5 +215,14 @@ fn in_word(): i64 {
     if (in_edge_at(SC_DOWN) == 1)   { w = w | IN_DUCK; }
     if (in_edge_at(SC_SPACE) == 1)  { w = w | IN_WHIP; }
     if (in_edge_at(SC_ESC) == 1)    { w = w | IN_QUIT; }
+
+    # ⭐ HOP = JUMP + A DIRECTION, held together. Ergonomically this is why the jump key matters: on
+    # SPACE it is thumb-plus-fingers and comfortable to combo; on W it is two adjacent fingers of the
+    # same hand and awkward. The design plate binds W to jump and SPACE to whip, so both are accepted
+    # for now and the question is flagged rather than silently decided.
+    if ((w & IN_JUMP) != 0) {
+        if ((w & IN_LEFT) != 0)  { w = w | IN_HOP_LEFT; }
+        if ((w & IN_RIGHT) != 0) { w = w | IN_HOP_RIGHT; }
+    }
     return w;
 }

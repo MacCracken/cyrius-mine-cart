@@ -75,6 +75,61 @@ fn ctt_input(): i64 {
     in_feed(SC_D);
     ctt_eq("key after Pause still registers", in_held_at(SC_D), 1);
 
+    # ---- ⭐⭐ DOUBLE-TAP: switch without stealing a key ------------------------------------------
+    # Leaning is a HOLD, switching is an INTENT expressed once. Sharing a key is only safe if the two
+    # cannot be confused, so these assertions are the contract that makes the sharing legitimate.
+    in_reset();
+    in_feed(SC_A);
+    ctt_true("a single tap leans", (in_word() & IN_LEFT) != 0);
+    ctt_true("...and does NOT switch", (in_word() & IN_SW_LEFT) == 0);
+    in_feed(SC_A | 128);
+    in_flush_edges();
+    in_feed(SC_A);                               # second tap, well inside the window
+    ctt_true("a double-tap SWITCHES", (in_word() & IN_SW_LEFT) != 0);
+    ctt_true("...and still leans", (in_word() & IN_LEFT) != 0);
+
+    # ⛔ IDEMPOTENT WITHIN A TICK. Edges persist until flushed, so a second in_word() in the same tick
+    # must NOT manufacture a second tap — a switch the player never asked for, at a fork, is the
+    # worst input bug this game could have.
+    in_reset();
+    in_feed(SC_D);
+    in_word(); in_word(); in_word();
+    ctt_true("repeated in_word in one tick does not fake a tap", (in_word() & IN_SW_RIGHT) == 0);
+
+    # ⚠ two taps FURTHER APART than the window are two leans, not a switch
+    in_reset();
+    in_feed(SC_D);
+    in_word();
+    in_feed(SC_D | 128);
+    var gapt = 0;
+    while (gapt < CFG_DTAP_TICKS + 4) { in_flush_edges(); gapt = gapt + 1; }
+    in_feed(SC_D);
+    ctt_true("taps outside the window do NOT switch", (in_word() & IN_SW_RIGHT) == 0);
+
+    # ⚠ a THIRD press inside the window must not fire a second switch off one gesture
+    in_reset();
+    in_feed(SC_A); in_word(); in_feed(SC_A | 128); in_flush_edges();
+    in_feed(SC_A); in_word(); in_feed(SC_A | 128); in_flush_edges();
+    in_feed(SC_A);
+    ctt_true("a third press does not double-fire", (in_word() & IN_SW_LEFT) == 0);
+
+    # left and right are independent
+    in_reset();
+    in_feed(SC_A); in_word(); in_feed(SC_A | 128); in_flush_edges();
+    in_feed(SC_D);
+    ctt_true("a left tap then a right tap is not a switch", (in_word() & IN_SW_RIGHT) == 0);
+
+    # ---- HOP = jump + direction ---------------------------------------------------------------------
+    in_reset();
+    in_feed(SC_W); in_feed(SC_D);
+    var hw = in_word();
+    ctt_true("jump + right is a HOP right", (hw & IN_HOP_RIGHT) != 0);
+    ctt_true("...and still reads as a jump", (hw & IN_JUMP) != 0);
+    in_reset();
+    in_feed(SC_W);
+    ctt_true("jump alone is not a hop", (in_word() & IN_HOP_RIGHT) == 0);
+    ctt_true("...nor the other way", (in_word() & IN_HOP_LEFT) == 0);
+
     # ---- the boundary word --------------------------------------------------------------------------
     in_reset();
     ctt_eq("no input -> empty word", in_word(), 0);

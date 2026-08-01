@@ -74,22 +74,52 @@ fn mc_tex_floor(): i64 {
                 r = 26 + m; g = 30 + m; b = 34 + m;
             }
 
-            # ⚠ BOTH RAILS INSIDE u 0..63 — the right half is rock. The rail centres sit at about a
-            # third of the bore width either side of centre, matching the design plate.
-            # Emissive core with a one-texel bloom shoulder, so the rail reads as lit rather than
-            # painted even when it is only two pixels wide at distance.
-            if (x >= 19) { if (x <= 23) { r = 79;  g = 227; b = 255; } }
-            if (x >= 41) { if (x <= 45) { r = 79;  g = 227; b = 255; } }
-            if (x == 18) { r = 34; g = 96;  b = 116; }
-            if (x == 24) { r = 34; g = 96;  b = 116; }
-            if (x == 40) { r = 34; g = 96;  b = 116; }
-            if (x == 46) { r = 34; g = 96;  b = 116; }
-            # a brighter running crown along the rail head
-            if (x == 21) { r = 168; g = 236; b = 255; }
-            if (x == 43) { r = 168; g = 236; b = 255; }
+            # ⭐⭐ THE FLOOR BAND IS NOW u 0..47, NOT u 0..63, AND THE REST IS RESERVED.
+            # The right edge of the old floor band is carved into two fixed-purpose regions, because
+            # a quad that samples "the floor" was picking up rail stripes and rendering treasure as
+            # fragments of rail — see MC_TEX_FLOOR / MC_TEX_ORE / MC_TEX_RAILPAIR in config.cyr.
+            #   u 0..47   the main track floor: ballast, sleepers, ONE pair of rails
+            #   u 48..49  solid swatches, sampled with a CONSTANT attribute (ore, cap darkness)
+            #   u 50..63  a RAIL-PAIR STRIP for side tracks in multi-rail sections
+            # ⛔⛔ NO RAILS IN THE FLOOR BAND ANY MORE, AND THIS IS THE FIX FOR THE WHOLE PROBLEM.
+            # The rails used to be painted into the floor texture, which stretches across the ENTIRE
+            # bore — so the "track" was as wide as the tunnel (a 4.6 m gauge), and side tracks drawn
+            # at +-22 ru landed inside it. On screen that read as a bundle of rails bunched to one
+            # side rather than as three tracks.
+            # ⇒ The floor is now BALLAST ONLY, and every track — including the main one — is drawn as
+            #   its own narrow strip quad from the rail-pair region below. A track becomes an OBJECT
+            #   with a position and a width, which is the only way three of them can coexist.
 
-            # the far-darkness texel the cap quad samples
-            if (x == 0) { if (y == 0) { r = 10; g = 23; b = 32; } }
+            # ---- u 48..49: SOLID SWATCHES, sampled with a constant attribute -----------------------
+            # ⚠ These must be uniform down the whole column: a constant-attribute quad samples ONE
+            # texel, and if v ever drifts it must land on the same colour rather than on a sleeper.
+            if (x == 48) { r = 214; g = 158; b = 74; }      # ore — treasure, warm against all that cyan
+            if (x == 49) { r = 10;  g = 23;  b = 32; }      # the darkness the far cap recedes into
+            # ⭐ the cart's own plate. Dark steel, cold, so it sits as a silhouette against the rails
+            # rather than competing with them — it is the frame of reference, not the subject.
+            # ⛔ IT WAS INVISIBLE AT (26,38,46) — near-identical to the ballast it sits on, so the
+            # cart only showed up in frames where it happened to overlap a black gap. With no
+            # lighting in op 0x0F, CONTRAST IS THE ONLY WAY ANYTHING READS. Mid steel is bright
+            # enough to separate from the floor and cold enough not to compete with the rails, which
+            # have to stay the brightest thing in the frame.
+            if (x == 47) {
+                r = 74; g = 92; b = 104;
+                if ((y & 15) < 3) { r = 148; g = 168; b = 180; }   # a lit capping rail along the top
+            }
+
+            # ---- u 50..63: THE RAIL-PAIR STRIP for side tracks ------------------------------------
+            # ⭐ ONE QUAD PER SIDE TRACK INSTEAD OF TWO. A side track needs two rails, and drawing
+            # them as separate quads costs 4 triangles a slab per track — 128 across the frustum,
+            # against ~48 spare. A single strip carrying both rails costs 2, which fits.
+            if (x >= 50) {
+                var sn = mc_hash(x, y) % 14;
+                r = 8 + sn; g = 20 + sn; b = 28 + sn;             # darker ballast, so it reads as separate
+                if ((y & 31) < 9) { r = 22; g = 26; b = 30; }     # its own sleepers
+                if (x >= 53) { if (x <= 54) { r = 79; g = 227; b = 255; } }
+                if (x >= 59) { if (x <= 60) { r = 79; g = 227; b = 255; } }
+                if (x == 53) { r = 168; g = 236; b = 255; }
+                if (x == 59) { r = 168; g = 236; b = 255; }
+            }
 
             store32(&mc_tex_a + (y * MC_TEX + x) * 4, mc_rgb(r, g, b));
             x = x + 1;
