@@ -1,0 +1,253 @@
+# track.cyr — the segment ring, the streaming generator, and the position carry.
+#
+# ⭐ THE TRACK IS THE WORLD. There is no 3D scene here, no mesh, no spatial index. A flat array of
+# 256 cm segments carrying a curvature and a pitch IS the entire world state, and everything the
+# player sees is derived from walking it. That is not a shortcut around a 3D engine — it is what
+# makes a 60 Hz fixed-point simulation on a machine with no FPU tractable, and what makes the
+# replay test possible: the whole world is a few kilobytes of integers.
+#
+# ⛔⛔ THE RING INDEX IS A MASK, NEVER A MODULO, AND THIS IS NOT A MICRO-OPTIMISATION.
+# The obvious index is `pos_seg % 96`. It is wrong, and wrong in the worst way — it works perfectly
+# for two hours and twenty minutes and then corrupts the world in one tick. pos_seg is a u16 and
+# wraps 65535 -> 0; 65535 % 96 = 63 while 0 % 96 = 0, so at the wrap the ring jumps 64 entries
+# sideways and the cart is suddenly reading somebody else's track. `& 95` is not a fix, it is a
+# different wrong answer.
+# ⇒ Two defences, both applied here:
+#     1. The ring is 128 slots so the index is `& 127`, which has no wrong answer.
+#     2. The authoritative position is an ABSOLUTE, MONOTONIC segment counter that never wraps.
+#        The u16 pos_seg the design specifies is a VIEW of it (trk_pos_seg()), not the source of
+#        truth. A u16 is the right size to store and the wrong size to index with.
+
+# ---- the ring, struct-of-arrays ----------------------------------------------------------------
+# ⚠ ONE ARRAY PER FIELD, NOT AN ARRAY OF RECORDS. There is no struct in this language, and beyond a
+# handful of instances an interleaved layout means every access is a multiply plus an offset that
+# has to be kept in sync by hand across every call site. Six flat arrays cost six names and nothing
+# else.
+#
+# ⭐ EACH FIELD IS A FULL i64 SLOT EVEN THOUGH THE DESIGN CALLS THEM i16/u8/u16, AND THAT IS
+# DELIBERATE. Packing them would save 5 KB of a 2 MB binary and buy, in exchange, the single
+# nastiest trap in this language: load32/load16/load8 ALL ZERO-EXTEND — there is no sign-extending
+# load — so a negative curve stored as an i16 reads back as ~65000 instead of -500. The value is
+# plausible, the compiler is silent, and the track bends the wrong way. Full slots make every read
+# already-signed and correct.
+# ⇒ The declared widths are still enforced, on the WRITE side, by trk_put(). The contract is kept
+#   where it can be checked instead of where it can silently rot.
+var trk_curve[128];        # i16  brads of heading change across this segment, + = right
+var trk_grade[128];        # i16  brads of pitch,                             + = down
+var trk_kind[128];         # u8   KIND_*
+var trk_flags[128];        # u8   FLAG_* bitfield
+var trk_branch_a[128];     # u16  segment index of the default (straight) branch
+var trk_branch_b[128];     # u16  segment index of the alternate branch
+var trk_guard = 0;         # ⛔ overrun sentinel — see trk_ok()
+
+# ---- position ----------------------------------------------------------------------------------
+# ⭐ trk_abs_seg IS THE TRUTH. It counts segments since the chapter gate and never wraps in any
+# plausible session: at 28 m/s a u16's worth of segments is 167 km, and this is an i64.
+var trk_abs_seg = 0;       # absolute segment index since the chapter gate (monotonic)
+var trk_pos_sub = 0;       # 0..65535 within the current segment
+var trk_gen_to  = 0;       # absolute index of the next segment the generator must produce
+
+# ---- generator state ---------------------------------------------------------------------------
+# ⚠ ALL OF IT MUST BE RESET BY trk_reset(). Generator state that survives a death is state that
+# makes the "identical chapter" promise false — the seed would be right and the phrase phase wrong.
+var trk_seed        = 0;
+var trk_cur_curve   = 0;   # the curve the generator is currently emitting
+var trk_tgt_curve   = 0;   # what it is ramping toward
+var trk_cur_grade   = 0;
+var trk_tgt_grade   = 0;
+var trk_phrase_left = 0;   # segments remaining before a new target is chosen
+
+# ---- counters, for the gate ---------------------------------------------------------------------
+var trk_gen_count   = 0;   # segments generated this chapter — proves streaming actually streams
+var trk_clamp_hits  = 0;   # times the ABI curvature clamp fired. MUST be 0 in normal play.
+
+# ⛔ MEASURE THE POOLS. A global `var X[N]` is N*8 bytes and a LOCAL `var X[N]` is N bytes — an 8x
+# asymmetry with no diagnostic. This repo lost a hardware burn to an under-sized buffer whose
+# overflow landed on a triangle count and read as "the GPU did nothing".
+# ⚠ Compared as a >= BYTE assertion and never divided to derive a capacity: a global with N >= 2 can
+# carry up to 8 bytes of alignment padding BEFORE it, so a span to the next symbol overstates by up
+# to 8 and never understates.
+fn trk_ok(): i64 {
+    if ((&trk_grade    - &trk_curve)    < 128 * 8) { return 0; }
+    if ((&trk_kind     - &trk_grade)    < 128 * 8) { return 0; }
+    if ((&trk_flags    - &trk_kind)     < 128 * 8) { return 0; }
+    if ((&trk_branch_a - &trk_flags)    < 128 * 8) { return 0; }
+    if ((&trk_branch_b - &trk_branch_a) < 128 * 8) { return 0; }
+    if ((&trk_guard    - &trk_branch_b) < 128 * 8) { return 0; }
+    return 1;
+}
+
+# ---- accessors ----------------------------------------------------------------------------------
+# The ring slot for an absolute segment index. `& CFG_RING_MASK` — see the file header for why this
+# is not `%`.
+fn trk_slot(abs_seg): i64 { return abs_seg & CFG_RING_MASK; }
+
+fn trk_curve_at(abs_seg): i64 { return load64(&trk_curve + trk_slot(abs_seg) * 8); }
+fn trk_grade_at(abs_seg): i64 { return load64(&trk_grade + trk_slot(abs_seg) * 8); }
+fn trk_kind_at(abs_seg): i64  { return load64(&trk_kind  + trk_slot(abs_seg) * 8); }
+fn trk_flags_at(abs_seg): i64 { return load64(&trk_flags + trk_slot(abs_seg) * 8); }
+
+# the u16 view the design specifies. Storage width, not index width.
+fn trk_pos_seg(): i64 { return trk_abs_seg & 65535; }
+
+# ⭐ Is this absolute index actually backed by live data? A read outside the live window is reading
+# a segment the ring has already recycled, which silently returns a DIFFERENT part of the track
+# rather than failing. The renderer must never walk past this.
+fn trk_live(abs_seg): i64 {
+    if (abs_seg < 0) { return 0; }
+    if (abs_seg >= trk_gen_to) { return 0; }
+    if (abs_seg < trk_gen_to - CFG_RING_LIVE) { return 0; }
+    return 1;
+}
+
+# ---- writing a segment ---------------------------------------------------------------------------
+# ⛔ THE DECLARED FIELD WIDTHS ARE ENFORCED HERE AND NOWHERE ELSE. Storing an out-of-range value into
+# a full i64 slot would "work" and then overflow the moment anyone packs these fields for real, or
+# feeds a curve past the ABI cliff into the projector. Clamping on the write side means every read
+# in the engine is known-good without a check.
+fn trk_put(abs_seg, curve, grade, kind, flags, ba, bb): i64 {
+    # ⛔ THE ABI CLAMP. Past this the accumulated centre-line pushes a vertex outside the +-4096 px
+    # coordinate window, and the kernel refuses the WHOLE BATCH rather than dropping one triangle.
+    # A counted clamp, because a generator that reaches it is a generator bug and the gate asserts
+    # this stays zero — silently clamping would hide the bug behind a track that merely feels wrong.
+    if (curve > CFG_CURVE_ABI_MAX)     { curve = CFG_CURVE_ABI_MAX;     trk_clamp_hits = trk_clamp_hits + 1; }
+    if (curve < 0 - CFG_CURVE_ABI_MAX) { curve = 0 - CFG_CURVE_ABI_MAX; trk_clamp_hits = trk_clamp_hits + 1; }
+    # i16 storage domain
+    if (grade >  32767) { grade =  32767; }
+    if (grade < 0 - 32768) { grade = 0 - 32768; }
+    var s = trk_slot(abs_seg);
+    store64(&trk_curve    + s * 8, curve);
+    store64(&trk_grade    + s * 8, grade);
+    store64(&trk_kind     + s * 8, kind  & 255);
+    store64(&trk_flags    + s * 8, flags & 255);
+    store64(&trk_branch_a + s * 8, ba & 65535);
+    store64(&trk_branch_b + s * 8, bb & 65535);
+    return 0;
+}
+
+# ---- the generator --------------------------------------------------------------------------------
+# ⭐ STREAMING, AND STRICTLY IN ORDER. Segment N is produced exactly once, immediately after N-1,
+# and never regenerated. That ordering is what makes the stream a pure function of the seed: the
+# generator consumes the rng in a fixed sequence, so segment 400 is the same integer whether the
+# player reached it in one run or after nine deaths.
+# ⛔ NEVER call this to "re-derive" a segment that has scrolled out of the ring. It would consume rng
+# draws out of order and desynchronise every segment after it.
+fn trk_gen_one(): i64 {
+    var abs = trk_gen_to;
+
+    # -- a new phrase? Pick fresh targets. --------------------------------------------------------
+    if (trk_phrase_left <= 0) {
+        trk_phrase_left = fx_rand_range(CFG_PHRASE_MIN, CFG_PHRASE_MAX);
+        # ⚠ A THIRD OF PHRASES ARE DEAD STRAIGHT ON PURPOSE. Continuous curvature gives the player
+        # nowhere to recover lean, and a track with no rest reads as uniformly hard rather than
+        # rhythmic. The straights are where the brake-into/release-at-apex loop gets set up.
+        if (fx_rand_n(100) < CFG_STRAIGHT_PCT) {
+            trk_tgt_curve = 0;
+        }
+        if (fx_rand_n(100) >= CFG_STRAIGHT_PCT) {
+            var mag = fx_rand_range(CFG_CURVE_MAX / 8, CFG_CURVE_MAX);
+            if (fx_rand_n(2) == 0) { mag = 0 - mag; }
+            trk_tgt_curve = mag;
+        }
+        trk_tgt_grade = fx_rand_range(0 - CFG_GRADE_MAX / 2, CFG_GRADE_MAX) + CFG_GRADE_BIAS;
+        if (trk_tgt_grade >  CFG_GRADE_MAX) { trk_tgt_grade =  CFG_GRADE_MAX; }
+        if (trk_tgt_grade < 0 - CFG_GRADE_MAX) { trk_tgt_grade = 0 - CFG_GRADE_MAX; }
+    }
+    trk_phrase_left = trk_phrase_left - 1;
+
+    # -- ramp toward the target, never step ------------------------------------------------------
+    # ⚠ A step change in curvature is a visible HINGE in the rail — the tunnel kinks at that seam
+    # instead of bending. Curvature has to be continuous even though nothing forces it to be.
+    var dc = trk_tgt_curve - trk_cur_curve;
+    if (dc >  CFG_CURVE_RAMP) { dc =  CFG_CURVE_RAMP; }
+    if (dc < 0 - CFG_CURVE_RAMP) { dc = 0 - CFG_CURVE_RAMP; }
+    trk_cur_curve = trk_cur_curve + dc;
+
+    var dg = trk_tgt_grade - trk_cur_grade;
+    if (dg >  CFG_GRADE_RAMP) { dg =  CFG_GRADE_RAMP; }
+    if (dg < 0 - CFG_GRADE_RAMP) { dg = 0 - CFG_GRADE_RAMP; }
+    trk_cur_grade = trk_cur_grade + dg;
+
+    # -- kind/flags: plain for now. Obstacles, forks and pickups land in later steps, and they land
+    #    HERE rather than in a parallel structure, because the segment is the world.
+    trk_put(abs, trk_cur_curve, trk_cur_grade, KIND_PLAIN, FLAG_NONE, 0, 0);
+
+    trk_gen_to = trk_gen_to + 1;
+    trk_gen_count = trk_gen_count + 1;
+    return 0;
+}
+
+# Top the ring up so there are always CFG_GEN_AHEAD segments in front of the cart.
+# ⚠ Bounded by the ring size, not by the loop condition alone: generating more than CFG_RING_LIVE
+# ahead would overwrite the segment the cart is standing on.
+fn trk_stream(): i64 {
+    var want = trk_abs_seg + CFG_GEN_AHEAD;
+    var limit = trk_abs_seg + CFG_RING_LIVE - 1;
+    if (want > limit) { want = limit; }
+    while (trk_gen_to <= want) { trk_gen_one(); }
+    return 0;
+}
+
+# ---- reset / seeding -------------------------------------------------------------------------------
+# ⭐ DEATH RETURNS THE PLAYER TO THE SAME TRACK, NOT TO A NEW SAMPLE. The chapter index is mixed into
+# the seed rather than the generator being run forward, so chapter 3 of seed 7714 is the same 245 m
+# of mine every single time, from a cold start, in any order.
+# ⚠ The multiplier is a large odd constant so adjacent chapters do not produce correlated streams —
+# seeds that differ by 1 in a xorshift produce visibly similar first draws.
+fn trk_reset(seed, chapter): i64 {
+    trk_seed = seed;
+    fx_srand(seed + chapter * 2654435761);
+
+    trk_abs_seg = 0;
+    trk_pos_sub = 0;
+    trk_gen_to  = 0;
+    trk_cur_curve = 0;
+    trk_tgt_curve = 0;
+    trk_cur_grade = 0;
+    trk_tgt_grade = 0;
+    trk_phrase_left = 0;
+    trk_gen_count = 0;
+    trk_clamp_hits = 0;
+
+    # ⚠ THE FIRST SEGMENTS ARE FORCED STRAIGHT AND LEVEL. A chapter that opens mid-curve gives the
+    # player a lean to fight before they have seen the track, and on a respawn that reads as the
+    # game killing them for the restart rather than for a mistake.
+    var i = 0;
+    while (i < 4) {
+        trk_put(trk_gen_to, 0, 0, KIND_GATE, FLAG_NONE, 0, 0);
+        trk_gen_to = trk_gen_to + 1;
+        trk_gen_count = trk_gen_count + 1;
+        i = i + 1;
+    }
+    trk_stream();
+    return 0;
+}
+
+# ---- the position carry -----------------------------------------------------------------------------
+# ⛔ OVERFLOW IS NORMAL AND CORRECT HERE. pos_sub is meant to exceed 65535 every few ticks — that is
+# what crossing a segment boundary IS. Clamping it (the instinct, because the field is "a u16")
+# would pin the cart at the end of a segment forever. The carry is a WHILE, not an IF, so that a
+# speed high enough to cross two segments in one tick still lands correctly; at the design top speed
+# of 28.6 m/s that is 12203 sub-units a tick and a boundary every 5.4 ticks, so the second iteration
+# never runs today — but a speed tunable is exactly the kind of number that changes.
+#
+# ⚠ speed_sub is sub-units per tick. At 60 Hz: 8533 = 20.0 m/s, 12203 = 28.6 m/s (the design top).
+fn trk_advance(speed_sub): i64 {
+    if (speed_sub < 0) { speed_sub = 0; }
+    trk_pos_sub = trk_pos_sub + speed_sub;
+    while (trk_pos_sub >= CFG_SUB_PER_SEG) {
+        trk_pos_sub = trk_pos_sub - CFG_SUB_PER_SEG;
+        trk_abs_seg = trk_abs_seg + 1;
+    }
+    trk_stream();
+    return 0;
+}
+
+# ---- derived position -------------------------------------------------------------------------------
+# Depth travelled, in centimetres. This is the score axis the HUD shows in metres.
+# ⚠ `>>> 8` not `/ 256`: those are DIFFERENT operations for negative values (one floors, the other
+# truncates toward zero), and mixing the two rounding conventions in one pipeline is how a position
+# drifts by an ulp in a direction-dependent way. pos_sub is non-negative here, but the convention is
+# uniform across the engine so that no call site has to know that.
+fn trk_depth_cm(): i64 { return trk_abs_seg * CFG_SEG_CM + (trk_pos_sub >>> 8); }
+fn trk_depth_m(): i64  { return trk_depth_cm() / 100; }

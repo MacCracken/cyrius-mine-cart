@@ -20,6 +20,11 @@
 
 include "lib/io.cyr"
 include "src/say.cyr"
+include "src/fx.cyr"
+include "src/config.cyr"
+include "src/track.cyr"
+include "src/input.cyr"
+include "src/cart.cyr"
 include "src/geom.cyr"
 include "src/tex.cyr"
 include "src/refcore.cyr"
@@ -52,15 +57,15 @@ fn main(): i64 {
     mc_tex_init();
     rr_clear();
 
-    # drive the SAME cart physics the ride uses — mc_cart_to lives in geom.cyr so there is exactly
+    # drive the SAME cart physics the ride uses — mc_cart_to lives in cart.cyr so there is exactly
     # one definition of "frame N" shared by the reference, the ride and the on-iron verifier.
     mc_cart_to(frame);
-    mc_build(mc_cart_x, mc_cart_z);
+    mc_build(cart_cam_x());
 
     ps("refrender: frame "); pn(frame); ps("  dstxy ("); pn(MC_DX); ps(","); pn(MC_DY);
-    ps(")  cart_x "); pn(mc_cart_x);
-    ps("  cart_z "); pn(mc_cart_z); nl();
-    ps("  ONE record, "); pn(mc_n_a); ps(" triangles (floor, ceiling, both walls)"); nl();
+    ps(")  lean "); pn(cart_cam_x());
+    ps(" ru  depth "); pn(trk_depth_m()); ps(" m  "); pn(cart_kmh()); ps(" km/h"); nl();
+    ps("  ONE record, "); pn(mc_n_a); ps(" triangles (far cap, floor, walls, chamfers, ceiling)"); nl();
 
     # RECORD ORDER, exactly as mc_gpu_frame dispatches it: A with the floor texture, then B with rock
     # ⛔ rr_record, NOT rr_list — an op 0x0F record REPLACES its whole rect with bg first.

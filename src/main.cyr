@@ -35,6 +35,16 @@
 
 include "lib/io.cyr"
 include "src/say.cyr"
+# ⚠ fx BEFORE geom: geom's curve integration is built on fx_mul/fx_sin, and Cyrius is single-pass —
+# a function must be defined before the line that calls it. fxtest needs say.cyr's ps/pn/nl.
+include "src/fx.cyr"
+include "src/fxtest.cyr"
+include "src/config.cyr"
+include "src/track.cyr"
+include "src/tracktest.cyr"
+include "src/input.cyr"
+include "src/cart.cyr"
+include "src/carttest.cyr"
 include "src/geom.cyr"
 include "src/tex.cyr"
 include "src/refcore.cyr"
@@ -49,6 +59,18 @@ include "src/gpu.cyr"
 fn mc_check(): i64 {
     var bad = 0;
     ps("mine-cart: host gate -- will the kernel accept what this game emits?"); nl(); nl();
+
+    # ---- ⭐ THE ARITHMETIC COMES FIRST, BEFORE ANY GEOMETRY CLAIM ----------------------------
+    # ⛔ Every record this gate goes on to validate is BUILT out of fx_mul, fx_sin and the track
+    # integrator. If the fixed-point core is wrong then the records may still be perfectly ABI-legal
+    # — right shape, right ranges, right reserved dwords — while describing the wrong tunnel. That
+    # is the same class of failure as the burn this repo already paid for: every assertion passing
+    # over a picture that was wrong. So the substrate is proven before anything built on it is.
+    # ⚠ Branch on != 0; never return this count as an exit status. Process exit codes truncate to 8
+    # bits, so a suite with exactly 256 failures would exit 0 and read as a pass.
+    if (fx_selftest() != 0) { bad = bad + 1; }
+    if (trk_selftest() != 0) { bad = bad + 1; }
+    if (cart_selftest() != 0) { bad = bad + 1; }
 
     # ---- buffers, MEASURED rather than assumed ----------------------------------------------
     ps("  buffers: vertex lists ");
@@ -89,14 +111,17 @@ fn mc_check(): i64 {
     var dr_huge  = 0;
     var dr_coord = 0;
     var dr_band  = 0;
+    var dr_full  = 0;
 
-    mc_cart_x = 0;
-    mc_cart_z = 0;
-    mc_speed  = 3;
+    # ⛔ SEED THE RING BEFORE RIDING IT. Zeroed track globals are a perfectly legal PERFECTLY STRAIGHT
+    # track, so a gate that forgets this passes every assertion while never once exercising a curve —
+    # which is exactly the state where the accumulated centre line, the degenerate-sliver drops and
+    # the coordinate window all actually get tested. Straight track is the one case that cannot fail.
+    mc_cart_reset();
     var f = 0;
     while (f < 240) {
         mc_cart_step();
-        var n = mc_build(mc_cart_x, mc_cart_z);
+        var n = mc_build(cart_cam_x());
         tris = tris + n;
         if (n < mintri) { mintri = n; }
         if (n > maxtri) { maxtri = n; }
@@ -104,6 +129,7 @@ fn mc_check(): i64 {
         dr_huge  = dr_huge  + mc_drop_huge;
         dr_coord = dr_coord + mc_drop_coord;
         dr_band  = dr_band  + mc_drop_band;
+        dr_full  = dr_full  + mc_drop_full;
         frames = frames + 1;
         mc_ck_list(&mc_vtx_a, mc_n_a);
         mc_ck_list(&mc_vtx_b, mc_n_b);
@@ -132,11 +158,12 @@ fn mc_check(): i64 {
         var q = 0;
         while (q < 60) {
             mc_cart_step();
-            mc_build(mc_cart_x, mc_cart_z);
+            mc_build(cart_cam_x());
             dr_flat  = dr_flat  + mc_drop_flat;
             dr_huge  = dr_huge  + mc_drop_huge;
             dr_coord = dr_coord + mc_drop_coord;
             dr_band  = dr_band  + mc_drop_band;
+            dr_full  = dr_full  + mc_drop_full;
             frames = frames + 1;
             mc_ck_list(&mc_vtx_a, mc_n_a);
             q = q + 1;
@@ -147,19 +174,25 @@ fn mc_check(): i64 {
     MC_DY = saved_dy;
 
     # pass 2 — the extremes. ABI only.
+    # ⚠ THE EXTREMES ARE NOW DRIVEN BY THE TRACK, NOT BY A CLOSED FORM. There is no mc_track_x any
+    # more — curvature lives in the ring, so the only way to reach a hard-curving stretch is to ride
+    # to one. Each probe advances the sim and then jams the cart to a wall, which exercises the
+    # coordinate window against REAL accumulated centre-line offsets rather than invented ones.
     var g = 0;
     while (g < 60) {
-        var cz = g * 97;
+        var q = 0;
+        while (q < 17) { mc_cart_step(); q = q + 1; }
         var cx = 0;
         if ((g % 4) == 1) { cx = MC_TW - 2; }
         if ((g % 4) == 2) { cx = 2 - MC_TW; }
-        if ((g % 4) == 3) { cx = mc_track_x(cz) + MC_TW - 2; }
-        var n2 = mc_build(cx, cz);
+        if ((g % 4) == 3) { cx = 0 - (MC_TW - 2); }
+        var n2 = mc_build(cx);
         tris = tris + n2;
         dr_flat  = dr_flat  + mc_drop_flat;
         dr_huge  = dr_huge  + mc_drop_huge;
         dr_coord = dr_coord + mc_drop_coord;
         dr_band  = dr_band  + mc_drop_band;
+        dr_full  = dr_full  + mc_drop_full;
         frames = frames + 1;
         mc_ck_list(&mc_vtx_a, mc_n_a);
         mc_ck_list(&mc_vtx_b, mc_n_b);
@@ -168,14 +201,19 @@ fn mc_check(): i64 {
 
     ps("  "); pn(frames); ps(" frames built ("); pn(240); ps(" on the ride path, 120 at real screen offsets, ");
     pn(60); ps(" at extremes), "); pn(tris); ps(" triangles"); nl();
-    ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_BG_TRIS + 8 * 8);
-    ps(" possible"); nl();
+    ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_TRI_MAX);
+    ps(" permitted (16 slabs x 6 quads x 2 = 192)"); nl();
 
     # ---- drops, and the distinction that decides whether one is a hole -----------------------
+    # ⭐ dr_full IS THE NEWEST AND WAS THE MOST DANGEROUS OMISSION. mc_emit's over-budget path used
+    # to `return 0` without touching any counter, so a frame that silently lost its last N triangles
+    # reported a perfectly clean tally — "0 dropped" over a tunnel with the far end missing. It is
+    # grouped with the pixel-losing drops because that is exactly what it is.
     ps("  dropped: coord "); pn(dr_coord); ps("  w-band "); pn(dr_band);
-    ps("  oversize "); pn(dr_huge); ps(" -- these LOSE PIXELS: ");
-    if (dr_coord + dr_band + dr_huge == 0) { ps("none"); nl(); }
-    if (dr_coord + dr_band + dr_huge != 0) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("  oversize "); pn(dr_huge); ps("  over-budget "); pn(dr_full);
+    ps(" -- these LOSE PIXELS: ");
+    if (dr_coord + dr_band + dr_huge + dr_full == 0) { ps("none"); nl(); }
+    if (dr_coord + dr_band + dr_huge + dr_full != 0) { ps("FAIL"); nl(); bad = bad + 1; }
     ps("  dropped: degenerate "); pn(dr_flat);
     ps(" -- cross is EXACTLY 0 (see geom.cyr), so these cover no pixel and are not holes"); nl();
 
@@ -232,14 +270,14 @@ fn mc_check(): i64 {
     var fdy = MC_DY;
     MC_DX = 0; MC_DY = 0;
     mc_cart_to(60);
-    mc_build(mc_cart_x, mc_cart_z);
+    mc_build(cart_cam_x());
     var n0 = mc_n_a;
     var probe0x = mc_i32(&mc_vtx_a + 0) >>> 16;
     var probe0y = mc_i32(&mc_vtx_a + 4) >>> 16;
     var lastx = mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16;
     MC_DX = 80; MC_DY = 96;
     mc_cart_to(60);
-    mc_build(mc_cart_x, mc_cart_z);
+    mc_build(cart_cam_x());
     var shifted = 0;
     if (mc_n_a == n0) {
         if ((mc_i32(&mc_vtx_a + 0) >>> 16) - probe0x == 80) {
@@ -288,6 +326,101 @@ fn mc_check(): i64 {
     return 90;
 }
 
+# ---- frame pacing ------------------------------------------------------------------------------
+# ⛔⛔ NEVER SPIN ON THE CLOCK ON AGNOS. A foreground exec runs ring-3 with interrupts DISABLED, so
+# `timer_ticks` — and therefore uptime_ms — only advances inside a kernel `sti` window. A busy-wait
+# like `while (uptime_ms() < deadline) { }` does not merely burn CPU: the clock it is waiting on can
+# never move, and the machine hangs forever with no diagnostic. sleep_ms(#41) opens such a window,
+# which is why pacing MUST go through it.
+# ⚠ 10 ms granularity against a 16.67 ms frame, so this cannot hold 60 Hz exactly — it sleeps the
+# remainder and self-corrects against the real clock rather than accumulating. The SIM is unaffected
+# either way: it is a fixed 60 Hz step that reads no clock at all, so a late frame renders late and
+# simulates identically. Rendering may drop frames; the simulation never does.
+var mc_deadline_ms = 0;
+
+#ifdef CYRIUS_TARGET_AGNOS
+fn mc_pace(): i64 {
+    var now = syscall(40);                        # uptime_ms
+    if (mc_deadline_ms == 0) { mc_deadline_ms = now; }
+    mc_deadline_ms = mc_deadline_ms + 1000 / CFG_TICK_HZ;
+    var rem = mc_deadline_ms - now;
+    # ⚠ if we fell behind, do NOT sleep and do NOT try to catch up by running extra sim steps —
+    # resync the deadline instead. Catch-up loops turn one slow frame into a spiral.
+    if (rem <= 0) { mc_deadline_ms = now; return 0; }
+    if (rem > 100) { rem = 100; }
+    syscall(41, rem);
+    return rem;
+}
+#else
+fn mc_pace(): i64 { return 0; }
+#endif
+
+# ---- ⭐ --sim: THE TUNING INSTRUMENT ------------------------------------------------------------
+# Runs the simulation headless, with no GPU and no keyboard, and prints what the cart actually did.
+# This exists because step 4's whole question — "is it fun with nothing else in it?" — cannot be
+# answered from a passing test suite, and on a host with no AGNOS there is otherwise no way to see
+# the numbers move at all.
+#
+# Two scripted drivers, because the interesting question is the GAP between them:
+#   pilot 0  hands off the controls entirely — how long does an unattended cart survive?
+#   pilot 1  a crude autopilot that counter-leans and brakes into bends — what does competence buy?
+# If those two produce similar depths, the track is not demanding enough. If pilot 0 dies instantly,
+# it is too demanding. The distance between them IS the difficulty.
+fn mc_sim(ticks, pilot): i64 {
+    fx_sin_init();
+    cart_reset(CFG_SEED_DEFAULT, 0);
+
+    ps("mine-cart: SIM pilot "); pn(pilot); ps(", "); pn(ticks); ps(" ticks at ");
+    pn(CFG_TICK_HZ); ps(" Hz ("); pn(ticks / CFG_TICK_HZ); ps(" s)"); nl();
+    ps("    tick   depth  km/h    lean  warn  drl  apex   curve"); nl();
+
+    var deepest = 0;
+    var top     = 0;
+    var t = 0;
+    while (t < ticks) {
+        var word = 0;
+        if (pilot == 1) {
+            # counter-lean proportionally, and brake while the bend is tightening
+            if (cart_lean < 0 - 65536) { word = IN_RIGHT; }
+            if (cart_lean >     65536) { word = IN_LEFT; }
+            var cv = 0;
+            if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
+            if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
+        }
+
+        if (cart_tick(word) == 0) {
+            ps("    DERAILED at "); pn(trk_depth_m()); ps(" m after "); pn(cart_ticks);
+            ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s) -- restarting the chapter"); nl();
+            cart_reset(cart_seed, cart_chapter);
+        }
+
+        if (trk_depth_m() > deepest) { deepest = trk_depth_m(); }
+        if (cart_kmh() > top) { top = cart_kmh(); }
+
+        if ((t % 60) == 0) {
+            var cv2 = 0;
+            if (trk_live(trk_abs_seg) == 1) { cv2 = trk_curve_at(trk_abs_seg); }
+            ps("  "); pn(t);
+            ps("\t"); pn(trk_depth_m());
+            ps("\t"); pn(cart_kmh());
+            ps("\t"); pn(cart_lean >>> 16);
+            ps("\t"); pn(cart_warn());
+            ps("\t"); pn(cart_derail);
+            ps("\t"); pn(cart_apex_hits);
+            ps("\t"); pn(cv2);
+            nl();
+        }
+        t = t + 1;
+    }
+
+    nl();
+    ps("  deepest "); pn(deepest); ps(" m, top speed "); pn(top); ps(" km/h, ");
+    pn(cart_apex_hits); ps(" clean apexes, "); pn(cart_derails); ps(" derails"); nl();
+    ps("  the generator produced "); pn(trk_gen_count); ps(" segments, ABI curve clamp fired ");
+    pn(trk_clamp_hits); ps(" times"); nl();
+    return 0;
+}
+
 # ---- the ride --------------------------------------------------------------------------------
 fn mc_ride(limit): i64 {
     mc_sin_init();
@@ -315,13 +448,32 @@ fn mc_ride(limit): i64 {
     ps(" perspective-correct textured triangles on the GPU, into a "); pn(mc_fbw);
     ps("x"); pn(mc_fbh); ps(" framebuffer"); nl();
 
+    cart_reset(CFG_SEED_DEFAULT, 0);
+
     var drawn = 0;
     var presented = 0;
     var f = 0;
     while (1 == 1) {
         if (limit > 0) { if (f >= limit) { f = limit; break; } }
-        mc_cart_step();
-        mc_build(mc_cart_x, mc_cart_z);
+
+        # ---- ⭐ THE SIM STEP, AND THE ONE-WORD BOUNDARY IT SEES ---------------------------------
+        # in_poll() drains the keyboard; in_word() collapses it to a bitfield; cart_tick() is a pure
+        # function of that word and the world. Nothing below reads a clock, so the simulation is
+        # identical whether the renderer keeps up or not — which is the property the replay test will
+        # depend on, and the reason rendering is allowed to drop frames and the sim never is.
+        in_poll();
+        var word = in_word();
+        in_flush_edges();
+        if ((word & IN_QUIT) != 0) { break; }
+
+        if (cart_tick(word) == 0) {
+            # ⭐ DEATH RESTARTS AT THE CHAPTER GATE WITH THE SAME SEED — the player is meant to learn
+            # this specific stretch of mine, so they get the SAME track back, not a new sample.
+            ps("mine-cart: DERAILED at "); pn(trk_depth_m()); ps(" m -- restarting the chapter"); nl();
+            cart_reset(cart_seed, cart_chapter);
+        }
+
+        mc_build(cart_cam_x());
         if (mc_gpu_frame() != 1) {
             ps("mine-cart: frame refused at "); pn(f); ps(" -- #92 returned "); pn(mc_gpu_err);
             nl();
@@ -344,12 +496,15 @@ fn mc_ride(limit): i64 {
         if (presented >= 0) { presented = presented + 1; }
         drawn = drawn + 1;
         f = f + 1;
+        mc_pace();
     }
 
     mc_gpu_free();
     ps("mine-cart: "); pn(presented); ps(" frames PRESENTED, "); pn(drawn); ps(" drawn, ");
-    pn(mc_cart_z);
-    ps(" world units of track, dropped "); pn(mc_drop_flat + mc_drop_huge + mc_drop_coord + mc_drop_band);
+    pn(trk_depth_m());
+    ps(" m of shaft, "); pn(cart_apex_hits); ps(" clean apexes, "); pn(cart_derails);
+    ps(" derails, dropped ");
+    pn(mc_drop_huge + mc_drop_coord + mc_drop_band + mc_drop_full);
     ps(" triangles, peak |D| "); pn(mc_peak_d); nl();
     if (drawn == 0) { return 6; }
     return 95;
@@ -369,7 +524,7 @@ fn mc_verify(frame): i64 {
     if (mc_gpu_init() != 1) { ps("mine-cart: GPU setup failed"); nl(); return 4; }
 
     mc_cart_to(frame);
-    mc_build(mc_cart_x, mc_cart_z);
+    mc_build(cart_cam_x());
     ps("mine-cart: VERIFY frame "); pn(frame); ps(" -- GPU vs CPU reference, "); pn(mc_n_a);
     ps(" triangles in ONE op 0x0F record at ("); pn(MC_DX); ps(","); pn(MC_DY); ps(")"); nl();
 
@@ -453,6 +608,8 @@ fn main(): i64 {
 
     var check  = 0;
     var verify = 0;
+    var sim    = 0;
+    var pilot  = 1;
     var frames = 900;
     var i = 1;
     while (i < argc()) {
@@ -470,10 +627,27 @@ fn main(): i64 {
                 frames = v;
             }
         }
+        if (mc_streq(a, "--sim") == 1) { sim = 1; }
+        if (mc_streq(a, "--pilot") == 1) {
+            i = i + 1;
+            if (i < argc()) {
+                var sp = argv(i);
+                var pv = 0;
+                var pk = 0;
+                while (pk < mc_slen(sp)) { pv = pv * 10 + (load8(sp + pk) - 48); pk = pk + 1; }
+                pilot = pv;
+            }
+        }
         if (mc_streq(a, "--help") == 1) {
-            ps("mine-cart [--check] [--frames N]"); nl();
-            ps("  --check    host gate: re-validate every emitted record, needs no GPU"); nl();
-            ps("  --frames N bound the ride (0 = unbounded)"); nl();
+            ps("DEEPVEIN / mine-cart"); nl();
+            ps("  --check      host gate: re-validate every emitted record, needs no GPU"); nl();
+            ps("  --verify     GPU vs CPU reference, byte-compared. Needs agnos + a GPU"); nl();
+            ps("  --sim        run the simulation headless and print telemetry (tuning)"); nl();
+            ps("  --pilot N    0 = hands off the controls, 1 = crude autopilot (with --sim)"); nl();
+            ps("  --frames N   bound the ride (0 = unbounded)"); nl();
+            ps("  --trace      report every dropped triangle, for diagnosis"); nl();
+            nl();
+            ps("  Controls: A/D or arrows lean, SHIFT brake, ESC quit."); nl();
             return 0;
         }
         i = i + 1;
@@ -485,6 +659,7 @@ fn main(): i64 {
     ps("mine-cart: argc "); pn(argc()); ps(" -- mode ");
     if (check == 1) { ps("CHECK (host gate, no GPU needed)"); nl(); return mc_check(); }
     if (verify == 1) { ps("VERIFY (GPU vs CPU reference)"); nl(); return mc_verify(120); }
+    if (sim == 1) { ps("SIM (headless, no GPU -- tuning telemetry)"); nl(); return mc_sim(frames, pilot); }
     ps("RIDE ("); pn(frames); ps(" frames)"); nl();
     return mc_ride(frames);
 }

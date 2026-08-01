@@ -1,0 +1,202 @@
+# cart.cyr — speed, brake, lean and derail. The whole game, before there is a game.
+#
+# ⭐⭐ THIS IS THE STEP THE PROJECT LIVES OR DIES ON, AND THE BUILD ORDER SAYS SO EXPLICITLY: if the
+# cart is not fun with NOTHING else in it — no obstacles, no forks, no pursuers, no flood — then
+# none of those will save it. Everything after this is content hung on whatever feel exists here.
+# So the code is small and the constants are all in config.cyr, because this is the file that gets
+# retuned rather than rewritten.
+#
+# ⭐ THE CENTRAL TENSION, STATED ONCE: lateral force is curve * speed^2. Squaring the speed is what
+# makes braking a genuine decision instead of a penalty — at half speed a bend pushes a QUARTER as
+# hard. The player who brakes into a curve buys far more control than the time it costs, and the
+# apex bonus pays them back for releasing early. Take the square away and the optimal play collapses
+# into holding the brake, which is safe, slow and dull.
+#
+# ⛔ THE SIM READS ONE INPUT WORD PER TICK AND NO CLOCK. mc_tick(word) is a pure function of
+# (word, world state). No wall-clock reads, no keyboard polling, no rng draws outside the generator.
+# That is what makes the replay test possible, and it is load-bearing rather than tidy.
+
+# ---- cart state -----------------------------------------------------------------------------------
+var cart_speed    = 0;     # Q16.16 sub-units per tick
+var cart_lean     = 0;     # Q16.16 render units, + = right of the centre line
+var cart_lean_vel = 0;     # Q16.16 render units per tick
+var cart_derail   = 0;     # consecutive ticks past the lean threshold
+var cart_dead     = 0;     # 1 = derailed, waiting for the restart
+var cart_bonus    = 0;     # Q16.16 sub/tick of apex bonus riding on top of the cap
+var cart_ticks    = 0;     # ticks survived this run
+var cart_chapter  = 0;
+var cart_seed     = 0;
+
+# apex-detector state
+var cart_prev_curve = 0;   # |curve| under the cart last tick
+var cart_apex_armed = 0;   # braking while the bend was tightening
+var cart_apex_hits  = 0;   # clean apexes this run — the thing the score multiplier hangs off
+var cart_derails    = 0;
+
+# ---- warning level, 0..3 -----------------------------------------------------------------------------
+# ⭐ FOR SPARKS AND WHEEL-LIFT, NOT FOR A NUMBER ON SCREEN. The design brief is explicit that the
+# player must FEEL the margin rather than read a bar, and the primary feedback is already physical:
+# lean IS the camera's lateral offset, so drifting wide literally brings the wall closer. This ladder
+# exists so the escalating tells can be hung off it later at the right thresholds.
+fn cart_warn(): i64 {
+    var a = fx_abs(cart_lean);
+    if (a >= CFG_LEAN_THRESH) { return 3; }                    # the derail clock is running
+    if (a >= (CFG_LEAN_THRESH * 3) / 4) { return 2; }          # wheel lifting, sparks
+    if (a >= CFG_LEAN_THRESH / 2) { return 1; }                # riding wide
+    return 0;
+}
+
+# how far into the derail, 0..CFG_DERAIL_TICKS — for the escalating shake
+fn cart_derail_frac(): i64 { return cart_derail; }
+
+# ---- speed as a fraction of the cap, Q16.16 in [0, 1] -------------------------------------------------
+# ⚠ Normalised BEFORE squaring. Squaring raw sub-units-per-tick would overflow the Q16.16 range and,
+# worse, make CFG_LEAN_FORCE depend on the speed cap — retuning top speed would silently retune the
+# difficulty of every curve in the game.
+fn cart_speed_frac(): i64 {
+    var s = cart_speed >>> 16;
+    if (s < 0) { s = 0; }
+    if (s > CFG_SPEED_MAX) { s = CFG_SPEED_MAX; }
+    return fx_div(s, CFG_SPEED_MAX);
+}
+
+fn cart_speed_sub(): i64 { return cart_speed >>> 16; }
+
+# km/h, for the HUD. sub/tick * 60 ticks/s / 256 sub-per-cm = cm/s; * 36 / 1000 = km/h.
+fn cart_kmh(): i64 { return (cart_speed_sub() * 60 * 36) / (256 * 1000); }
+
+# ---- reset ---------------------------------------------------------------------------------------------
+# ⭐ DEATH RESTARTS AT THE CHAPTER GATE WITH THE SAME SEED. The player is meant to learn a specific
+# stretch of mine, so a retry must hand them back the SAME track — not a fresh sample from the same
+# distribution. Re-seeding rather than rewinding is what guarantees that from a cold start too.
+fn cart_reset(seed, chapter): i64 {
+    cart_seed = seed;
+    cart_chapter = chapter;
+    trk_reset(seed, chapter);
+    in_reset();
+    cart_speed    = CFG_SPEED_START << 16;
+    cart_lean     = 0;
+    cart_lean_vel = 0;
+    cart_derail   = 0;
+    cart_dead     = 0;
+    cart_bonus    = 0;
+    cart_ticks    = 0;
+    cart_prev_curve = 0;
+    cart_apex_armed = 0;
+    return 0;
+}
+
+# ---- one simulation tick --------------------------------------------------------------------------------
+# word is the input bitfield. Returns 1 while the cart is alive, 0 on the tick it derails.
+fn cart_tick(word): i64 {
+    if (cart_dead == 1) { return 0; }
+
+    var braking = 0;
+    if ((word & IN_BRAKE) != 0) { braking = 1; }
+
+    # ---- speed ------------------------------------------------------------------------------------
+    # ⚠ The ramps are ASYMMETRIC by design: braking is fast and rebuilding speed is slow, so an
+    # unnecessary brake costs real time. That asymmetry is most of what makes the line matter.
+    if (braking == 1) { cart_speed = cart_speed - CFG_BRAKE; }
+    if (braking == 0) { cart_speed = cart_speed + CFG_ACCEL; }
+
+    # the apex bonus rides ABOVE the normal cap and bleeds off
+    if (cart_bonus > 0) {
+        cart_bonus = cart_bonus - (CFG_APEX_DECAY << 16);
+        if (cart_bonus < 0) { cart_bonus = 0; }
+    }
+    # ⚠ TWO CEILINGS. The throttle alone reaches the REDLINE; the apex bonus lifts that toward the
+    # absolute ceiling and no further. Clamping to CFG_SPEED_MAX afterwards is what stops a stack of
+    # bonuses turning into unbounded speed.
+    var cap = (CFG_SPEED_BASE << 16) + cart_bonus;
+    if (cap > (CFG_SPEED_MAX << 16)) { cap = CFG_SPEED_MAX << 16; }
+    if (cart_speed > cap) { cart_speed = cap; }
+    if (cart_speed < (CFG_SPEED_MIN << 16)) { cart_speed = CFG_SPEED_MIN << 16; }
+
+    # ---- the curve under the cart -------------------------------------------------------------------
+    var curve = 0;
+    if (trk_live(trk_abs_seg) == 1) { curve = trk_curve_at(trk_abs_seg); }
+    var acurve = fx_abs(curve);
+
+    # ---- ⭐ THE APEX BONUS: brake IN, release AT the apex -----------------------------------------------
+    # Armed while the bend is TIGHTENING and the player is on the brake; paid when the bend starts
+    # opening again and the brake is already off. Sitting on the brake through the whole curve never
+    # pays, which is the entire reason this exists — without it the safest line is also the slowest
+    # and the optimal play is to hold the brake and be bored.
+    if (acurve >= CFG_APEX_MIN_CURVE) {
+        if (acurve > cart_prev_curve) {
+            if (braking == 1) { cart_apex_armed = 1; }
+        }
+        if (acurve < cart_prev_curve) {
+            if (cart_apex_armed == 1) {
+                if (braking == 0) {
+                    cart_bonus = cart_bonus + (CFG_APEX_BONUS << 16);
+                    cart_apex_hits = cart_apex_hits + 1;
+                    cart_apex_armed = 0;
+                }
+            }
+        }
+    }
+    # leaving the bend entirely disarms — a bonus must be earned inside one curve, not banked
+    if (acurve < CFG_APEX_MIN_CURVE) { cart_apex_armed = 0; }
+    cart_prev_curve = acurve;
+
+    # ---- lean --------------------------------------------------------------------------------------
+    # ⭐ CENTRIFUGAL FORCE IS OUTWARD: a right-hand bend (positive curve) throws the cart LEFT, so the
+    # player counter-leans RIGHT to hold the rail. That matches the hands — you steer into the turn.
+    var sf  = cart_speed_frac();
+    var sf2 = fx_mul(sf, sf);
+    var lat = fx_mul((curve * CFG_LEAN_FORCE) >>> 10, sf2);
+    cart_lean_vel = cart_lean_vel - lat;
+
+    # player authority
+    if ((word & IN_LEFT) != 0)  { cart_lean_vel = cart_lean_vel - CFG_LEAN_INPUT; }
+    if ((word & IN_RIGHT) != 0) { cart_lean_vel = cart_lean_vel + CFG_LEAN_INPUT; }
+
+    # ⚠ A GENTLE SELF-CENTRING SPRING, NOT A STRONG ONE. Without it, damping stops the VELOCITY but
+    # never the offset, and the cart drifts wide permanently after one bend. Strong enough and the
+    # rail flies itself and there is no game — this is the single most sensitive number in the file.
+    cart_lean_vel = cart_lean_vel - fx_mul(cart_lean, CFG_LEAN_SPRING);
+    cart_lean_vel = fx_mul(cart_lean_vel, CFG_LEAN_DAMP);
+    cart_lean = cart_lean + cart_lean_vel;
+
+    # ⛔ HARD CLAMP AT THE BORE. Not a gameplay rule — a RENDERING one. cam_x feeds the projector, and
+    # a cart outside the tunnel pushes vertices past the +-4096 px coordinate window, which does not
+    # clip one triangle: it makes the kernel refuse the WHOLE BATCH and the screen goes black.
+    if (cart_lean >  CFG_LEAN_MAX) { cart_lean =  CFG_LEAN_MAX; cart_lean_vel = 0; }
+    if (cart_lean < 0 - CFG_LEAN_MAX) { cart_lean = 0 - CFG_LEAN_MAX; cart_lean_vel = 0; }
+
+    # ---- derail ------------------------------------------------------------------------------------
+    # ⚠ CONSECUTIVE ticks, and the counter RESETS the moment the cart comes back inside. A cumulative
+    # counter would make a long clean run more fragile than a short one, which is exactly backwards.
+    if (fx_abs(cart_lean) >= CFG_LEAN_THRESH) { cart_derail = cart_derail + 1; }
+    if (fx_abs(cart_lean) <  CFG_LEAN_THRESH) { cart_derail = 0; }
+    if (cart_derail >= CFG_DERAIL_TICKS) {
+        cart_dead = 1;
+        cart_derails = cart_derails + 1;
+        return 0;
+    }
+
+    # ---- advance ------------------------------------------------------------------------------------
+    trk_advance(cart_speed_sub());
+    cart_ticks = cart_ticks + 1;
+    return 1;
+}
+
+# the lateral offset the renderer wants, in whole render units
+fn cart_cam_x(): i64 { return cart_lean >>> 16; }
+
+# ---- shared definition of "frame N" ---------------------------------------------------------------
+# ⭐ THE RIDE, THE HOST REFERENCE AND THE ON-IRON VERIFIER MUST AGREE ON WHAT FRAME N IS, or a
+# byte-compare between GPU and CPU is comparing two different moments and its result means nothing.
+# One definition, here, driven by the real cart_tick with NO input — deterministic from a cold start.
+fn mc_cart_reset(): i64 { return cart_reset(CFG_SEED_DEFAULT, 0); }
+
+fn mc_cart_step(): i64 { return cart_tick(0); }
+
+fn mc_cart_to(frame): i64 {
+    mc_cart_reset();
+    var f = 0;
+    while (f < frame) { cart_tick(0); f = f + 1; }
+    return 0;
+}

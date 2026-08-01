@@ -1,0 +1,225 @@
+# fx.cyr — Q16.16 fixed point, a 256-entry Q1.15 sine table, and xorshift32.
+#
+# ⭐ WHAT THIS FILE IS FOR. Every number in DEEPVEIN's simulation passes through here. There is no
+# FPU on the target and no libm to call, so "the maths" is not a detail underneath the game — it IS
+# the game's substrate, and a rounding rule that differs by one ulp between two call sites is a
+# desync that only shows up ten thousand frames later. This file exists so there is exactly ONE
+# definition of each operation and exactly one place to be wrong.
+#
+# ⛔⛔ THE TRAP THAT DOMINATES THIS ENTIRE FILE, AND WHICH COST NOTHING ONLY BECAUSE IT WAS MEASURED
+# BEFORE A LINE WAS WRITTEN:
+#
+#     IN CYRIUS, `>>` IS THE **LOGICAL** SHIFT AND `>>>` IS THE **ARITHMETIC** SHIFT.
+#
+# That is INVERTED from C, Java, JavaScript, Rust and every other language anyone reaching for this
+# file has in their fingers. Verified two ways — by objdump (`>>` emits `shr`, `>>>` emits `sar`)
+# and at runtime:
+#
+#     (0 - 16) >>  2  =  4611686018427387900      <- (2^64-16)/4, the unsigned answer
+#     (0 - 16) >>> 2  =  -4                       <- the one you meant
+#
+# The consequence for fx_mul, measured on -2.5 * 3.0 (expected -491520):
+#
+#     (a * b) >>> 16  =  -491520                  <- correct
+#     (a * b) >>  16  =  281474976219136          <- garbage
+#
+# ⚠ AND THIS IS WHY IT IS DANGEROUS RATHER THAN MERELY SURPRISING: for NON-NEGATIVE values the two
+# shifts are IDENTICAL. A `>>` typo in this file compiles, passes every straight-line test, ships,
+# and produces a correct-looking game right up until the track first curves LEFT or the cart leans
+# to a negative offset. It is invisible in exactly the states you test first.
+# ⇒ Every right shift of a possibly-signed quantity in this codebase is `>>>`. `>>` appears ONLY on
+#   values that have been explicitly masked non-negative, and each such site says so.
+
+# ---- the format ------------------------------------------------------------------------------
+# Q16.16 signed: 16 integer bits, 16 fraction bits, carried in an i64 register. The VALUE range that
+# survives fx_mul is what matters, not the register width — see the fx_mul note.
+var FX_SHIFT = 16;
+var FX_ONE   = 65536;         # 1.0
+var FX_HALF  = 32768;         # 0.5
+
+# The largest magnitude fx_div may be handed. `(a << 16)` overflows i64 above 2^47, silently, and
+# turns a positive input into a large negative output with no trap (measured: fx_div(1<<47, ONE)
+# returned -140737488355328). Clamping is the only defence the language offers.
+var FX_DIV_MAX = 140737488355327;    # 2^47 - 1
+
+# ---- multiply --------------------------------------------------------------------------------
+# ⭐ THE i64 INTERMEDIATE IS THE WHOLE POINT. a and b are each Q16.16, so the product is Q32.32 and
+# needs 64 bits BEFORE the shift brings it back to Q16.16. Doing this in 32 bits — which is what a
+# naive port does — discards the high half and is the classic fixed-point bug. Cyrius has no 32-bit
+# arithmetic type, so we get the wide intermediate for free; the discipline that remains is to shift
+# AFTER multiplying, never before.
+#
+# ⚠ SAFE INPUT RANGE: |a| * |b| must stay under 2^63. With both operands Q16.16 that is
+# |a_real| * |b_real| < 2^31 — e.g. two values under 46340.0 each. Speeds, leans, curvatures and
+# screen offsets are all far inside that. Overflow WRAPS SILENTLY (measured: (1<<40)*(1<<40) == 0),
+# so there is no runtime signal; it is bounded by design, not by check.
+fn fx_mul(a, b): i64 { return (a * b) >>> 16; }
+
+# ---- divide ----------------------------------------------------------------------------------
+# ⛔ DIVIDE BY ZERO IS FATAL AND SILENT: SIGFPE, exit 136, no diagnostic printed. In a 60 Hz sim loop
+# that is the process vanishing mid-frame with nothing on stdout to say why. Every denominator is
+# guarded here rather than at each of the dozens of call sites.
+# ⚠ Returns a saturated value on divide-by-zero rather than 0, because 0 is a plausible-looking
+# answer that propagates quietly, while a saturated one shows up immediately as a pinned control.
+fn fx_div(a, b): i64 {
+    if (a > FX_DIV_MAX) { a = FX_DIV_MAX; }
+    if (a < 0 - FX_DIV_MAX) { a = 0 - FX_DIV_MAX; }
+    if (b == 0) {
+        if (a >= 0) { return 2147483647; }
+        return 0 - 2147483647;
+    }
+    return (a << 16) / b;
+}
+
+# ---- lerp ------------------------------------------------------------------------------------
+# t is Q16.16 in [0, FX_ONE]. Written as a + (b-a)*t rather than a*(1-t) + b*t because the latter
+# needs two multiplies and, more importantly, does not return EXACTLY b at t == FX_ONE — an endpoint
+# that misses by one ulp makes a "finished" animation never quite finish.
+fn fx_lerp(a, b, t): i64 { return a + (((b - a) * t) >>> 16); }
+
+# clamp helper — used everywhere lean, speed and curvature are bounded
+fn fx_clamp(v, lo, hi): i64 {
+    if (v < lo) { return lo; }
+    if (v > hi) { return hi; }
+    return v;
+}
+
+fn fx_abs(v): i64 { if (v < 0) { return 0 - v; } return v; }
+
+# ---- the sine table --------------------------------------------------------------------------
+# 256 entries, Q1.15 (32767 = 1.0), spanning ONE FULL TURN. Angles are u16 "brads" with
+# 65536 = a full turn, so the table index is angle >>> 8 and there is no range reduction, no
+# quadrant mirroring and no branch — the u16 wrap IS the modulo.
+#
+# ⭐ COSINE IS THE SAME TABLE AT +64. A quarter turn is 65536/4 = 16384 brads = 64 table entries, and
+# 64 divides 256 exactly, so cos(x) == sin(x + 16384) is EXACT at every entry — verified to zero
+# error across all 256 indices, not approximately.
+#
+# ⚠ 32767 rather than 32768 as the scale: 32768 does not fit in the signed 16-bit range these values
+# are conceptually in, and a table that peaks one above its own format is the sort of thing that
+# survives host testing and overflows on a narrower target.
+var fx_sintab[256];
+var fx_sintab_guard = 0;      # ⛔ overrun sentinel — see fx_ok()
+
+# ⛔ MEASURE THE POOL, DO NOT TRUST THE DECLARATION. A global `var X[N]` is N*8 BYTES here, but a
+# LOCAL `var X[N]` is N bytes — an 8x asymmetry with no diagnostic either way. This repo's history
+# includes an under-sized buffer whose overflow landed on a triangle COUNT and read as "the GPU did
+# nothing". The span is asserted, never assumed.
+# ⚠ Asserted as a >= BYTE comparison and never divided to derive a capacity: a global with N >= 2
+# gets up to 8 bytes of alignment padding inserted BEFORE it, so the span to the next symbol
+# OVERSTATES by up to 8 and never understates.
+fn fx_ok(): i64 {
+    if ((&fx_sintab_guard - &fx_sintab) < 256 * 8) { return 0; }
+    return 1;
+}
+
+fn fx_sin_init(): i64 {
+    store64(&fx_sintab +   0 * 8,      0); store64(&fx_sintab +   1 * 8,    804); store64(&fx_sintab +   2 * 8,   1608); store64(&fx_sintab +   3 * 8,   2410); store64(&fx_sintab +   4 * 8,   3212); store64(&fx_sintab +   5 * 8,   4011); store64(&fx_sintab +   6 * 8,   4808); store64(&fx_sintab +   7 * 8,   5602);
+    store64(&fx_sintab +   8 * 8,   6393); store64(&fx_sintab +   9 * 8,   7179); store64(&fx_sintab +  10 * 8,   7962); store64(&fx_sintab +  11 * 8,   8739); store64(&fx_sintab +  12 * 8,   9512); store64(&fx_sintab +  13 * 8,  10278); store64(&fx_sintab +  14 * 8,  11039); store64(&fx_sintab +  15 * 8,  11793);
+    store64(&fx_sintab +  16 * 8,  12539); store64(&fx_sintab +  17 * 8,  13279); store64(&fx_sintab +  18 * 8,  14010); store64(&fx_sintab +  19 * 8,  14732); store64(&fx_sintab +  20 * 8,  15446); store64(&fx_sintab +  21 * 8,  16151); store64(&fx_sintab +  22 * 8,  16846); store64(&fx_sintab +  23 * 8,  17530);
+    store64(&fx_sintab +  24 * 8,  18204); store64(&fx_sintab +  25 * 8,  18868); store64(&fx_sintab +  26 * 8,  19519); store64(&fx_sintab +  27 * 8,  20159); store64(&fx_sintab +  28 * 8,  20787); store64(&fx_sintab +  29 * 8,  21403); store64(&fx_sintab +  30 * 8,  22005); store64(&fx_sintab +  31 * 8,  22594);
+    store64(&fx_sintab +  32 * 8,  23170); store64(&fx_sintab +  33 * 8,  23731); store64(&fx_sintab +  34 * 8,  24279); store64(&fx_sintab +  35 * 8,  24811); store64(&fx_sintab +  36 * 8,  25329); store64(&fx_sintab +  37 * 8,  25832); store64(&fx_sintab +  38 * 8,  26319); store64(&fx_sintab +  39 * 8,  26790);
+    store64(&fx_sintab +  40 * 8,  27245); store64(&fx_sintab +  41 * 8,  27683); store64(&fx_sintab +  42 * 8,  28105); store64(&fx_sintab +  43 * 8,  28510); store64(&fx_sintab +  44 * 8,  28898); store64(&fx_sintab +  45 * 8,  29268); store64(&fx_sintab +  46 * 8,  29621); store64(&fx_sintab +  47 * 8,  29956);
+    store64(&fx_sintab +  48 * 8,  30273); store64(&fx_sintab +  49 * 8,  30571); store64(&fx_sintab +  50 * 8,  30852); store64(&fx_sintab +  51 * 8,  31113); store64(&fx_sintab +  52 * 8,  31356); store64(&fx_sintab +  53 * 8,  31580); store64(&fx_sintab +  54 * 8,  31785); store64(&fx_sintab +  55 * 8,  31971);
+    store64(&fx_sintab +  56 * 8,  32137); store64(&fx_sintab +  57 * 8,  32285); store64(&fx_sintab +  58 * 8,  32412); store64(&fx_sintab +  59 * 8,  32521); store64(&fx_sintab +  60 * 8,  32609); store64(&fx_sintab +  61 * 8,  32678); store64(&fx_sintab +  62 * 8,  32728); store64(&fx_sintab +  63 * 8,  32757);
+    store64(&fx_sintab +  64 * 8,  32767); store64(&fx_sintab +  65 * 8,  32757); store64(&fx_sintab +  66 * 8,  32728); store64(&fx_sintab +  67 * 8,  32678); store64(&fx_sintab +  68 * 8,  32609); store64(&fx_sintab +  69 * 8,  32521); store64(&fx_sintab +  70 * 8,  32412); store64(&fx_sintab +  71 * 8,  32285);
+    store64(&fx_sintab +  72 * 8,  32137); store64(&fx_sintab +  73 * 8,  31971); store64(&fx_sintab +  74 * 8,  31785); store64(&fx_sintab +  75 * 8,  31580); store64(&fx_sintab +  76 * 8,  31356); store64(&fx_sintab +  77 * 8,  31113); store64(&fx_sintab +  78 * 8,  30852); store64(&fx_sintab +  79 * 8,  30571);
+    store64(&fx_sintab +  80 * 8,  30273); store64(&fx_sintab +  81 * 8,  29956); store64(&fx_sintab +  82 * 8,  29621); store64(&fx_sintab +  83 * 8,  29268); store64(&fx_sintab +  84 * 8,  28898); store64(&fx_sintab +  85 * 8,  28510); store64(&fx_sintab +  86 * 8,  28105); store64(&fx_sintab +  87 * 8,  27683);
+    store64(&fx_sintab +  88 * 8,  27245); store64(&fx_sintab +  89 * 8,  26790); store64(&fx_sintab +  90 * 8,  26319); store64(&fx_sintab +  91 * 8,  25832); store64(&fx_sintab +  92 * 8,  25329); store64(&fx_sintab +  93 * 8,  24811); store64(&fx_sintab +  94 * 8,  24279); store64(&fx_sintab +  95 * 8,  23731);
+    store64(&fx_sintab +  96 * 8,  23170); store64(&fx_sintab +  97 * 8,  22594); store64(&fx_sintab +  98 * 8,  22005); store64(&fx_sintab +  99 * 8,  21403); store64(&fx_sintab + 100 * 8,  20787); store64(&fx_sintab + 101 * 8,  20159); store64(&fx_sintab + 102 * 8,  19519); store64(&fx_sintab + 103 * 8,  18868);
+    store64(&fx_sintab + 104 * 8,  18204); store64(&fx_sintab + 105 * 8,  17530); store64(&fx_sintab + 106 * 8,  16846); store64(&fx_sintab + 107 * 8,  16151); store64(&fx_sintab + 108 * 8,  15446); store64(&fx_sintab + 109 * 8,  14732); store64(&fx_sintab + 110 * 8,  14010); store64(&fx_sintab + 111 * 8,  13279);
+    store64(&fx_sintab + 112 * 8,  12539); store64(&fx_sintab + 113 * 8,  11793); store64(&fx_sintab + 114 * 8,  11039); store64(&fx_sintab + 115 * 8,  10278); store64(&fx_sintab + 116 * 8,   9512); store64(&fx_sintab + 117 * 8,   8739); store64(&fx_sintab + 118 * 8,   7962); store64(&fx_sintab + 119 * 8,   7179);
+    store64(&fx_sintab + 120 * 8,   6393); store64(&fx_sintab + 121 * 8,   5602); store64(&fx_sintab + 122 * 8,   4808); store64(&fx_sintab + 123 * 8,   4011); store64(&fx_sintab + 124 * 8,   3212); store64(&fx_sintab + 125 * 8,   2410); store64(&fx_sintab + 126 * 8,   1608); store64(&fx_sintab + 127 * 8,    804);
+    store64(&fx_sintab + 128 * 8,      0); store64(&fx_sintab + 129 * 8,   -804); store64(&fx_sintab + 130 * 8,  -1608); store64(&fx_sintab + 131 * 8,  -2410); store64(&fx_sintab + 132 * 8,  -3212); store64(&fx_sintab + 133 * 8,  -4011); store64(&fx_sintab + 134 * 8,  -4808); store64(&fx_sintab + 135 * 8,  -5602);
+    store64(&fx_sintab + 136 * 8,  -6393); store64(&fx_sintab + 137 * 8,  -7179); store64(&fx_sintab + 138 * 8,  -7962); store64(&fx_sintab + 139 * 8,  -8739); store64(&fx_sintab + 140 * 8,  -9512); store64(&fx_sintab + 141 * 8, -10278); store64(&fx_sintab + 142 * 8, -11039); store64(&fx_sintab + 143 * 8, -11793);
+    store64(&fx_sintab + 144 * 8, -12539); store64(&fx_sintab + 145 * 8, -13279); store64(&fx_sintab + 146 * 8, -14010); store64(&fx_sintab + 147 * 8, -14732); store64(&fx_sintab + 148 * 8, -15446); store64(&fx_sintab + 149 * 8, -16151); store64(&fx_sintab + 150 * 8, -16846); store64(&fx_sintab + 151 * 8, -17530);
+    store64(&fx_sintab + 152 * 8, -18204); store64(&fx_sintab + 153 * 8, -18868); store64(&fx_sintab + 154 * 8, -19519); store64(&fx_sintab + 155 * 8, -20159); store64(&fx_sintab + 156 * 8, -20787); store64(&fx_sintab + 157 * 8, -21403); store64(&fx_sintab + 158 * 8, -22005); store64(&fx_sintab + 159 * 8, -22594);
+    store64(&fx_sintab + 160 * 8, -23170); store64(&fx_sintab + 161 * 8, -23731); store64(&fx_sintab + 162 * 8, -24279); store64(&fx_sintab + 163 * 8, -24811); store64(&fx_sintab + 164 * 8, -25329); store64(&fx_sintab + 165 * 8, -25832); store64(&fx_sintab + 166 * 8, -26319); store64(&fx_sintab + 167 * 8, -26790);
+    store64(&fx_sintab + 168 * 8, -27245); store64(&fx_sintab + 169 * 8, -27683); store64(&fx_sintab + 170 * 8, -28105); store64(&fx_sintab + 171 * 8, -28510); store64(&fx_sintab + 172 * 8, -28898); store64(&fx_sintab + 173 * 8, -29268); store64(&fx_sintab + 174 * 8, -29621); store64(&fx_sintab + 175 * 8, -29956);
+    store64(&fx_sintab + 176 * 8, -30273); store64(&fx_sintab + 177 * 8, -30571); store64(&fx_sintab + 178 * 8, -30852); store64(&fx_sintab + 179 * 8, -31113); store64(&fx_sintab + 180 * 8, -31356); store64(&fx_sintab + 181 * 8, -31580); store64(&fx_sintab + 182 * 8, -31785); store64(&fx_sintab + 183 * 8, -31971);
+    store64(&fx_sintab + 184 * 8, -32137); store64(&fx_sintab + 185 * 8, -32285); store64(&fx_sintab + 186 * 8, -32412); store64(&fx_sintab + 187 * 8, -32521); store64(&fx_sintab + 188 * 8, -32609); store64(&fx_sintab + 189 * 8, -32678); store64(&fx_sintab + 190 * 8, -32728); store64(&fx_sintab + 191 * 8, -32757);
+    store64(&fx_sintab + 192 * 8, -32767); store64(&fx_sintab + 193 * 8, -32757); store64(&fx_sintab + 194 * 8, -32728); store64(&fx_sintab + 195 * 8, -32678); store64(&fx_sintab + 196 * 8, -32609); store64(&fx_sintab + 197 * 8, -32521); store64(&fx_sintab + 198 * 8, -32412); store64(&fx_sintab + 199 * 8, -32285);
+    store64(&fx_sintab + 200 * 8, -32137); store64(&fx_sintab + 201 * 8, -31971); store64(&fx_sintab + 202 * 8, -31785); store64(&fx_sintab + 203 * 8, -31580); store64(&fx_sintab + 204 * 8, -31356); store64(&fx_sintab + 205 * 8, -31113); store64(&fx_sintab + 206 * 8, -30852); store64(&fx_sintab + 207 * 8, -30571);
+    store64(&fx_sintab + 208 * 8, -30273); store64(&fx_sintab + 209 * 8, -29956); store64(&fx_sintab + 210 * 8, -29621); store64(&fx_sintab + 211 * 8, -29268); store64(&fx_sintab + 212 * 8, -28898); store64(&fx_sintab + 213 * 8, -28510); store64(&fx_sintab + 214 * 8, -28105); store64(&fx_sintab + 215 * 8, -27683);
+    store64(&fx_sintab + 216 * 8, -27245); store64(&fx_sintab + 217 * 8, -26790); store64(&fx_sintab + 218 * 8, -26319); store64(&fx_sintab + 219 * 8, -25832); store64(&fx_sintab + 220 * 8, -25329); store64(&fx_sintab + 221 * 8, -24811); store64(&fx_sintab + 222 * 8, -24279); store64(&fx_sintab + 223 * 8, -23731);
+    store64(&fx_sintab + 224 * 8, -23170); store64(&fx_sintab + 225 * 8, -22594); store64(&fx_sintab + 226 * 8, -22005); store64(&fx_sintab + 227 * 8, -21403); store64(&fx_sintab + 228 * 8, -20787); store64(&fx_sintab + 229 * 8, -20159); store64(&fx_sintab + 230 * 8, -19519); store64(&fx_sintab + 231 * 8, -18868);
+    store64(&fx_sintab + 232 * 8, -18204); store64(&fx_sintab + 233 * 8, -17530); store64(&fx_sintab + 234 * 8, -16846); store64(&fx_sintab + 235 * 8, -16151); store64(&fx_sintab + 236 * 8, -15446); store64(&fx_sintab + 237 * 8, -14732); store64(&fx_sintab + 238 * 8, -14010); store64(&fx_sintab + 239 * 8, -13279);
+    store64(&fx_sintab + 240 * 8, -12539); store64(&fx_sintab + 241 * 8, -11793); store64(&fx_sintab + 242 * 8, -11039); store64(&fx_sintab + 243 * 8, -10278); store64(&fx_sintab + 244 * 8,  -9512); store64(&fx_sintab + 245 * 8,  -8739); store64(&fx_sintab + 246 * 8,  -7962); store64(&fx_sintab + 247 * 8,  -7179);
+    store64(&fx_sintab + 248 * 8,  -6393); store64(&fx_sintab + 249 * 8,  -5602); store64(&fx_sintab + 250 * 8,  -4808); store64(&fx_sintab + 251 * 8,  -4011); store64(&fx_sintab + 252 * 8,  -3212); store64(&fx_sintab + 253 * 8,  -2410); store64(&fx_sintab + 254 * 8,  -1608); store64(&fx_sintab + 255 * 8,   -804);
+    return 0;
+}
+
+# raw table lookup — index = angle >>> 8, exactly as the design specifies. Q1.15 out.
+# `& 255` rather than `& 0xFF` for the index and `& 65535` on the angle: the angle is a u16 brad, so
+# the wrap is the modulo and there is no out-of-range case to handle.
+fn fx_sin_raw(brads): i64 { return load64(&fx_sintab + ((brads >>> 8) & 255) * 8); }
+
+# interpolated sine — Q1.15 out, the low 8 brad bits linearly blended between table entries.
+# ⚠ THE INTERPOLATION IS NOT COSMETIC. The raw table steps every 256 brads; at the scale the track
+# curve integrates over, that quantisation puts a visible HINGE at every step boundary — this repo's
+# previous curve code carries the same warning ("without the interpolation the track kinks once every
+# 32 world units ... every seam would visibly hinge"). Interpolating drops the worst-case angular
+# error to 0.006 degrees of arc, measured across all 65536 brad values.
+# ⭐ Integer throughout, so it stays bit-exact for the replay determinism test.
+fn fx_sin(brads): i64 {
+    var i = (brads >>> 8) & 255;
+    var f = brads & 255;
+    var a = load64(&fx_sintab + i * 8);
+    var b = load64(&fx_sintab + ((i + 1) & 255) * 8);
+    return a + (((b - a) * f) >>> 8);
+}
+
+# cosine — the same table a quarter turn along. 16384 brads = 64 entries, exact at every index.
+fn fx_cos(brads): i64 { return fx_sin((brads + 16384) & 65535); }
+
+# sine/cosine delivered as Q16.16 instead of Q1.15, for mixing straight into fx_mul chains.
+# 32767 -> 65534 rather than 65536, i.e. 0.99997 rather than 1.0. That 3-in-100000 shortfall is
+# deliberate: doubling is exact and reversible, whereas scaling by 65536/32767 needs a divide and
+# would make the value depend on rounding mode.
+fn fx_sin16(brads): i64 { return fx_sin(brads) * 2; }
+fn fx_cos16(brads): i64 { return fx_cos(brads) * 2; }
+
+# ---- xorshift32 ------------------------------------------------------------------------------
+# ⭐ ONE GENERATOR, SEEDED ONCE, ADVANCED ONLY BY THE SIM. Determinism is the entire regression
+# strategy on this target: same seed plus same input log must reproduce frame 10000 byte-identically,
+# because that replay is the only test that can run without a GPU or a person. Any renderer-side or
+# audio-side call into this generator would break that, so there are none.
+#
+# ⚠ Marsaglia's xorshift32 needs UNSIGNED 32-bit arithmetic. The state is masked to 32 bits after
+# every step, which makes it non-negative, which makes `>>` (logical, in this language) and `>>>`
+# (arithmetic) produce identical results here. `>>` is written because it is the shift the algorithm
+# specifies; the mask above it is what makes that safe.
+var fx_rng = 2463534242;      # Marsaglia's canonical non-zero default
+
+# ⛔ ZERO IS AN ABSORBING STATE for xorshift — seed 0 yields 0 forever, and a "random" track that is
+# perfectly straight is a bug that reads as a design choice.
+fn fx_srand(s): i64 {
+    s = s & 0xFFFFFFFF;
+    if (s == 0) { s = 2463534242; }
+    fx_rng = s;
+    return 0;
+}
+
+fn fx_rand(): i64 {
+    var x = fx_rng & 0xFFFFFFFF;
+    x = (x ^ (x << 13)) & 0xFFFFFFFF;
+    x = x ^ (x >> 17);                    # masked non-negative above; `>>` is the logical shift
+    x = (x ^ (x << 5)) & 0xFFFFFFFF;
+    fx_rng = x;
+    return x;
+}
+
+# uniform in [0, n) for n > 0.
+# ⚠ Modulo bias is real but bounded: n is never larger than a few thousand here against a 2^32 range,
+# so the bias is under one part in a million and costs less than a rejection loop would cost in
+# determinism surface area.
+fn fx_rand_n(n): i64 {
+    if (n <= 0) { return 0; }
+    return fx_rand() % n;
+}
+
+# uniform in [lo, hi] inclusive
+fn fx_rand_range(lo, hi): i64 {
+    if (hi <= lo) { return lo; }
+    return lo + fx_rand_n(hi - lo + 1);
+}

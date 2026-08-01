@@ -1,0 +1,362 @@
+# carttest.cyr — self-test for the input decode and the cart physics.
+#
+# ⭐ THE INPUT TESTS MATTER AS MUCH AS THE PHYSICS ONES. Every hazard in the AGNOS keyboard drain is
+# silent: a dropped edge is a jump that "didn't register", a mishandled 0xE0 is an arrow key that
+# does something else, a lost break code is a brake that never releases. None of them crash, none of
+# them log, and all of them are indistinguishable from the player being wrong. They are tested here
+# with synthetic byte streams so they can be proven without a keyboard, on the host, before iron.
+
+var ctt_fail = 0;
+var ctt_ran  = 0;
+
+fn ctt_eq(name, got, want): i64 {
+    ctt_ran = ctt_ran + 1;
+    if (got == want) { return 0; }
+    ctt_fail = ctt_fail + 1;
+    ps("    FAIL "); ps(name); ps(": got "); pn(got); ps(", want "); pn(want); nl();
+    return 1;
+}
+
+fn ctt_true(name, cond): i64 {
+    ctt_ran = ctt_ran + 1;
+    if (cond != 0) { return 0; }
+    ctt_fail = ctt_fail + 1;
+    ps("    FAIL "); ps(name); ps(": condition false"); nl();
+    return 1;
+}
+
+# ---- input decode ---------------------------------------------------------------------------------
+fn ctt_input(): i64 {
+    in_reset();
+
+    # a plain press and release
+    in_feed(SC_A);
+    ctt_eq("A press -> held", in_held_at(SC_A), 1);
+    ctt_eq("A press -> edge", in_edge_at(SC_A), 1);
+    in_flush_edges();
+    ctt_eq("edge is consumed", in_edge_at(SC_A), 0);
+    ctt_eq("held survives the flush", in_held_at(SC_A), 1);
+    in_feed(SC_A | 128);
+    ctt_eq("A release -> not held", in_held_at(SC_A), 0);
+
+    # ⛔ HAZARD 1: a make AND break of the same key inside ONE drain. Held-state differencing sees
+    # nothing happened; the edge must still fire exactly once or a fast tap is silently swallowed.
+    in_reset();
+    in_feed(SC_SPACE);
+    in_feed(SC_SPACE | 128);
+    ctt_eq("tap in one drain -> not held", in_held_at(SC_SPACE), 0);
+    ctt_eq("tap in one drain -> ONE edge", in_edge_at(SC_SPACE), 1);
+
+    # ⛔ HAZARD 2: 0xE0 arriving as the LAST byte of a drain, its scancode in the NEXT one.
+    in_reset();
+    in_feed(224);                                   # drain N ends here
+    ctt_eq("dangling E0 is remembered", in_ext_carry, 1);
+    in_feed(75);                                    # drain N+1 begins: 0x4B = LEFT
+    ctt_eq("split E0 decodes as LEFT", in_held_at(SC_LEFT), 1);
+    ctt_eq("carry is cleared after use", in_ext_carry, 0);
+    # ...and the same key released the same way
+    in_feed(224);
+    in_feed(75 | 128);
+    ctt_eq("split E0 release clears LEFT", in_held_at(SC_LEFT), 0);
+
+    # ⚠ and the extended key must NOT collide with the plain key of the same scancode
+    in_reset();
+    in_feed(75);                                    # plain 0x4B, not an arrow
+    ctt_eq("plain 0x4B is not LEFT", in_held_at(SC_LEFT), 0);
+    ctt_true("plain 0x4B lands on its own index", in_held_at(75) == 1);
+
+    # ⛔ HAZARD 3: 0xE1 Pause. Its embedded 0x1D/0x9D would otherwise decode as left-Ctrl.
+    in_reset();
+    in_feed(225);
+    in_feed(29); in_feed(69); in_feed(225); in_feed(157); in_feed(197);
+    ctt_eq("Pause sequence is fully swallowed", in_held_at(29), 0);
+    ctt_eq("Pause leaves no residue", in_held_at(69), 0);
+    # the very next real key still works
+    in_feed(SC_D);
+    ctt_eq("key after Pause still registers", in_held_at(SC_D), 1);
+
+    # ---- the boundary word --------------------------------------------------------------------------
+    in_reset();
+    ctt_eq("no input -> empty word", in_word(), 0);
+    in_feed(SC_A);
+    ctt_true("A sets IN_LEFT", (in_word() & IN_LEFT) != 0);
+    in_feed(SC_LSHIFT);
+    ctt_true("Shift sets IN_BRAKE", (in_word() & IN_BRAKE) != 0);
+    ctt_true("LEFT and BRAKE coexist", (in_word() & IN_LEFT) != 0);
+    # ⭐ JUMP IS AN EDGE, NOT A HELD KEY — holding W must not re-fire every tick
+    in_reset();
+    in_feed(SC_W);
+    ctt_true("W sets IN_JUMP on the edge", (in_word() & IN_JUMP) != 0);
+    in_flush_edges();
+    ctt_true("held W does NOT re-fire IN_JUMP", (in_word() & IN_JUMP) == 0);
+    ctt_eq("...but W is still held", in_held_at(SC_W), 1);
+    # arrows are accepted alongside A/D
+    in_reset();
+    in_feed(224); in_feed(77);
+    ctt_true("RIGHT arrow sets IN_RIGHT", (in_word() & IN_RIGHT) != 0);
+    return 0;
+}
+
+# ---- a controlled track ---------------------------------------------------------------------------
+# ⚠ The generator emits phrases, so "ride until you hit a hard bend" is not a test — it is a wait.
+# This stamps a KNOWN constant curve over the live window so the physics can be measured against a
+# number rather than against whatever the seed happened to produce.
+fn ctt_track(curve): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        trk_put(i, curve, 0, KIND_PLAIN, FLAG_NONE, 0, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# ---- speed ------------------------------------------------------------------------------------------
+fn ctt_speed(): i64 {
+    ctt_track(0);
+    ctt_eq("starts at the gate speed", cart_speed_sub(), CFG_SPEED_START);
+
+    # released, the cart reaches the cap and holds there
+    var t = 0;
+    while (t < 400) { cart_tick(0); t = t + 1; }
+    # ⭐ the THROTTLE alone reaches the redline and stops there — 103 km/h has to be earned
+    ctt_eq("free-runs to the redline, not past it", cart_speed_sub(), CFG_SPEED_BASE);
+    ctt_true("throttle-only tops out at 96 km/h", cart_kmh() >= 95);
+    ctt_true("throttle-only does not reach 103", cart_kmh() < 100);
+    # ...and a bonus lifts it to the plate's top speed, but no further
+    cart_bonus = CFG_APEX_BONUS << 16;
+    t = 0;
+    while (t < 120) { cart_tick(0); cart_bonus = CFG_APEX_BONUS << 16; t = t + 1; }
+    ctt_true("an apex bonus reaches the design top speed", cart_kmh() >= 102);
+    ctt_true("...and never exceeds it", cart_speed_sub() <= CFG_SPEED_MAX);
+
+    # ⚠ braking bottoms out at the FLOOR, not at zero — the cart always moves forward
+    t = 0;
+    while (t < 400) { cart_tick(IN_BRAKE); t = t + 1; }
+    ctt_eq("brake bottoms at the floor", cart_speed_sub(), CFG_SPEED_MIN);
+    ctt_true("the cart never stops", cart_speed_sub() > 0);
+
+    # the ramps are asymmetric: braking is faster than rebuilding
+    ctt_track(0);
+    t = 0;
+    while (t < 240) { cart_tick(0); t = t + 1; }
+    var reached = cart_speed_sub();
+    ctt_true("~4 s of release reaches the redline", reached >= CFG_SPEED_BASE - 100);
+    t = 0;
+    while (t < 90) { cart_tick(IN_BRAKE); t = t + 1; }
+    ctt_true("~1.5 s of brake reaches the floor", cart_speed_sub() <= CFG_SPEED_MIN + 100);
+    return 0;
+}
+
+# ---- lean and derail -----------------------------------------------------------------------------------
+fn ctt_lean(): i64 {
+    # a straight track must never move the cart sideways
+    ctt_track(0);
+    var t = 0;
+    while (t < 300) { cart_tick(0); t = t + 1; }
+    ctt_eq("straight track leaves lean at zero", cart_lean, 0);
+    ctt_eq("straight track never derails", cart_dead, 0);
+
+    # ⭐ DIRECTION: a right-hand bend (positive curve) throws the cart LEFT
+    ctt_track(CFG_CURVE_MAX);
+    t = 0;
+    while (t < 40) { cart_tick(0); t = t + 1; }
+    ctt_true("right bend pushes the cart LEFT", cart_lean < 0);
+    ctt_track(0 - CFG_CURVE_MAX);
+    t = 0;
+    while (t < 40) { cart_tick(0); t = t + 1; }
+    ctt_true("left bend pushes the cart RIGHT", cart_lean > 0);
+
+    # ⭐ SPEED SQUARED: the same bend at half speed must push MUCH less than half as hard.
+    # This is the property the whole risk/reward of the brake rests on.
+    ctt_track(CFG_CURVE_MAX);
+    t = 0;
+    while (t < 240) { cart_tick(0); t = t + 1; }        # get to full speed first
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = CFG_SPEED_MAX << 16;
+    t = 0;
+    while (t < 30) { cart_tick(0); t = t + 1; }
+    var lean_fast = fx_abs(cart_lean);
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = (CFG_SPEED_MAX / 2) << 16;
+    t = 0;
+    while (t < 30) { cart_tick(IN_BRAKE); t = t + 1; }  # hold it near half speed
+    var lean_slow = fx_abs(cart_lean);
+    ctt_true("half speed pushes far less than half as hard", lean_slow * 2 < lean_fast);
+
+    # ⛔ AN UNATTENDED HARD BEND MUST KILL. If it does not, the derail rule is decoration.
+    ctt_track(CFG_CURVE_MAX);
+    t = 0;
+    var died = 0;
+    while (t < 600) {
+        if (cart_tick(0) == 0) { died = 1; t = 600; }
+        t = t + 1;
+    }
+    ctt_true("an unattended hard bend derails the cart", died);
+
+    # ...and counter-leaning must save it
+    ctt_track(CFG_CURVE_MAX);
+    t = 0;
+    var survived = 1;
+    while (t < 600) {
+        # steer INTO the turn: a right-hand bend needs IN_RIGHT
+        var w = 0;
+        if (cart_lean < 0) { w = IN_RIGHT; }
+        if (cart_lean > 0) { w = IN_LEFT; }
+        if (cart_tick(w) == 0) { survived = 0; t = 600; }
+        t = t + 1;
+    }
+    ctt_true("counter-leaning holds the rail", survived);
+
+    # the derail clock RESETS on recovery — a long clean run must not be more fragile than a short one
+    # ⚠ AT SPEED. At the gate speed of 48 km/h the force is a QUARTER of what it is at the cap, so an
+    # unattended bend takes ~9 s to reach the threshold rather than ~2 s. That is the speed-squared
+    # law working correctly, and a test that forgets it measures the wrong thing.
+    ctt_track(CFG_CURVE_MAX);
+    cart_speed = CFG_SPEED_MAX << 16;
+    t = 0;
+    while (t < 200) {
+        if (fx_abs(cart_lean) >= CFG_LEAN_THRESH) { t = 200; }
+        cart_tick(0);
+        cart_speed = CFG_SPEED_MAX << 16;              # hold it at the cap
+        t = t + 1;
+    }
+    ctt_true("the derail clock is running", cart_derail > 0);
+    ctt_true("...but the cart has not died yet", cart_dead == 0);
+
+    # ⭐ PROPORTIONAL correction, not a held key. Holding IN_RIGHT for 120 ticks straight overshoots
+    # and trips the threshold on the OTHER side — which is correct, punishing over-correction is part
+    # of the feel, and a test that jams the key is testing the jam.
+    t = 0;
+    while (t < 200) {
+        var w = 0;
+        if (cart_lean < 0 - 65536) { w = IN_RIGHT; }
+        if (cart_lean >     65536) { w = IN_LEFT; }
+        cart_tick(w);
+        cart_speed = CFG_SPEED_MAX << 16;
+        t = t + 1;
+    }
+    ctt_eq("recovering resets the derail clock", cart_derail, 0);
+    ctt_eq("...and the cart is still alive", cart_dead, 0);
+
+    # ⛔ THE BORE CLAMP IS A RENDERING RULE, NOT A GAMEPLAY ONE — lean outside the tunnel pushes
+    # vertices past the coordinate window and the kernel refuses the WHOLE batch.
+    ctt_track(0);
+    t = 0;
+    while (t < 600) { cart_tick(IN_RIGHT); t = t + 1; }
+    ctt_true("lean is clamped inside the bore", fx_abs(cart_lean) <= CFG_LEAN_MAX);
+    ctt_true("cam_x stays well inside the half-width", fx_abs(cart_cam_x()) < MC_TW);
+
+    # the warning ladder tracks the margin
+    ctt_track(0);
+    ctt_eq("centred is warning 0", cart_warn(), 0);
+    cart_lean = CFG_LEAN_THRESH;
+    ctt_eq("at the threshold is warning 3", cart_warn(), 3);
+    cart_lean = CFG_LEAN_THRESH / 2;
+    ctt_true("halfway out is warning 1 or 2", cart_warn() >= 1);
+    return 0;
+}
+
+# ---- the apex bonus ------------------------------------------------------------------------------------
+# ⭐ THE ONE TEST THAT ENCODES THE INTENDED PLAY. Brake into a tightening bend, release as it opens:
+# paid. Sit on the brake the whole way through: not paid. If these two ever agree, the optimal line
+# has collapsed into holding the brake and the game is a patience test.
+fn ctt_apex(): i64 {
+    # a bend that tightens then opens — stamped by hand so the shape is known
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        var c = 0;
+        if (i < 8)  { c = 0; }
+        if (i >= 8) { if (i < 16) { c = 256 + (i - 8) * 96; } }     # tightening
+        if (i >= 16) { if (i < 24) { c = 928 - (i - 16) * 96; } }   # opening
+        trk_put(i, c, 0, KIND_PLAIN, FLAG_NONE, 0, 0);
+        i = i + 1;
+    }
+    var start_hits = cart_apex_hits;
+    var t = 0;
+    while (t < 300) {
+        # brake while the bend tightens, release once it starts opening
+        var w = 0;
+        var cv = 0;
+        if (trk_live(trk_abs_seg) == 1) { cv = fx_abs(trk_curve_at(trk_abs_seg)); }
+        if (cv > cart_prev_curve) { w = IN_BRAKE; }
+        if (cart_lean < 0) { w = w | IN_RIGHT; }
+        if (cart_tick(w) == 0) { t = 300; }
+        t = t + 1;
+    }
+    ctt_true("braking in and releasing at the apex PAYS", cart_apex_hits > start_hits);
+
+    # the same bend, brake held throughout — must NOT pay
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        var c2 = 0;
+        if (i >= 8)  { if (i < 16) { c2 = 256 + (i - 8) * 96; } }
+        if (i >= 16) { if (i < 24) { c2 = 928 - (i - 16) * 96; } }
+        trk_put(i, c2, 0, KIND_PLAIN, FLAG_NONE, 0, 0);
+        i = i + 1;
+    }
+    start_hits = cart_apex_hits;
+    t = 0;
+    while (t < 300) {
+        var w2 = IN_BRAKE;
+        if (cart_lean < 0) { w2 = w2 | IN_RIGHT; }
+        if (cart_tick(w2) == 0) { t = 300; }
+        t = t + 1;
+    }
+    ctt_eq("holding the brake through the bend pays NOTHING", cart_apex_hits, start_hits);
+    return 0;
+}
+
+# ---- determinism ------------------------------------------------------------------------------------------
+# ⭐ THIS IS THE SHAPE OF THE STEP-11 REPLAY TEST, ARRIVING EARLY BECAUSE IT COSTS NOTHING TO DO SO.
+# The sim is a pure function of (input word, world state) — no clock, no keyboard, no rng outside the
+# generator — so a scripted word sequence must reproduce the identical end state every time.
+fn ctt_run_sum(seed, ticks): i64 {
+    cart_reset(seed, 0);
+    var h = 0;
+    var t = 0;
+    while (t < ticks) {
+        # a deterministic pseudo-player: leans against the drift and brakes periodically
+        var w = 0;
+        if (cart_lean < 0) { w = IN_RIGHT; }
+        if (cart_lean > 0) { w = IN_LEFT; }
+        if ((t % 37) < 11) { w = w | IN_BRAKE; }
+        cart_tick(w);
+        h = (h * 1000003 + cart_lean + cart_speed * 7 + trk_abs_seg * 13) & 0xFFFFFFFF;
+        t = t + 1;
+    }
+    return h;
+}
+
+fn ctt_determinism(): i64 {
+    var a = ctt_run_sum(CFG_SEED_DEFAULT, 900);
+    var b = ctt_run_sum(CFG_SEED_DEFAULT, 900);
+    ctt_eq("the same input log replays identically", a, b);
+    # and it survives an unrelated run in between — the death-and-retry path
+    ctt_run_sum(CFG_SEED_DEFAULT + 5, 400);
+    var c = ctt_run_sum(CFG_SEED_DEFAULT, 900);
+    ctt_eq("replay survives an intervening run", a, c);
+    var d = ctt_run_sum(CFG_SEED_DEFAULT + 1, 900);
+    ctt_true("a different seed diverges", a != d);
+    return 0;
+}
+
+# ---- the suite -------------------------------------------------------------------------------------------
+fn cart_selftest(): i64 {
+    ctt_fail = 0;
+    ctt_ran  = 0;
+
+    ctt_true("input pool spans", in_ok());
+    ctt_input();
+    ctt_speed();
+    ctt_lean();
+    ctt_apex();
+    ctt_determinism();
+
+    ps("  cart + input:     "); pn(ctt_ran); ps(" assertions, ");
+    if (ctt_fail == 0) { ps("all pass"); nl(); }
+    if (ctt_fail != 0) { pn(ctt_fail); ps(" FAILED"); nl(); }
+    return ctt_fail;
+}

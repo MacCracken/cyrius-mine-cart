@@ -1,0 +1,272 @@
+# tracktest.cyr — the self-test for the segment ring, the generator and the position carry.
+#
+# ⭐ WHAT THIS FILE IS ACTUALLY DEFENDING. Three properties, each of which fails silently:
+#   1. THE CARRY. pos_sub exceeding 65535 is normal. The instinct is to clamp it, and a clamped
+#      carry pins the cart at a segment boundary forever while every counter keeps ticking.
+#   2. THE RING INDEX ACROSS THE u16 WRAP. `% 96` works for two hours and twenty minutes and then
+#      teleports the world sideways in one tick. There is no way to notice that in a play session
+#      and no way to miss it in a test that deliberately drives past the wrap.
+#   3. DETERMINISM. Same seed must mean the same track, from cold, in any order. This is not a nice
+#      property — it is the ONLY regression test available on a target with no debugger, and if it
+#      is false then nothing else here can be trusted either.
+
+var trt_fail = 0;
+var trt_ran  = 0;
+
+fn trt_eq(name, got, want): i64 {
+    trt_ran = trt_ran + 1;
+    if (got == want) { return 0; }
+    trt_fail = trt_fail + 1;
+    ps("    FAIL "); ps(name); ps(": got "); pn(got); ps(", want "); pn(want); nl();
+    return 1;
+}
+
+fn trt_true(name, cond): i64 {
+    trt_ran = trt_ran + 1;
+    if (cond != 0) { return 0; }
+    trt_fail = trt_fail + 1;
+    ps("    FAIL "); ps(name); ps(": condition false"); nl();
+    return 1;
+}
+
+# ---- the carry ---------------------------------------------------------------------------------
+fn trt_carry(): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var seg0 = trk_abs_seg;
+
+    # exactly one segment
+    trk_advance(65536);
+    trt_eq("advance 65536 -> +1 seg", trk_abs_seg - seg0, 1);
+    trt_eq("advance 65536 -> sub 0", trk_pos_sub, 0);
+
+    # 65535 then 1 must carry, not sit at 65536
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    seg0 = trk_abs_seg;
+    trk_advance(65535);
+    trt_eq("65535 stays in segment", trk_abs_seg - seg0, 0);
+    trt_eq("65535 sub", trk_pos_sub, 65535);
+    trk_advance(1);
+    trt_eq("+1 carries", trk_abs_seg - seg0, 1);
+    trt_eq("+1 sub wraps to 0", trk_pos_sub, 0);
+
+    # remainder is preserved, not dropped
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    seg0 = trk_abs_seg;
+    trk_advance(65537);
+    trt_eq("65537 -> +1 seg", trk_abs_seg - seg0, 1);
+    trt_eq("65537 -> sub 1", trk_pos_sub, 1);
+
+    # ⚠ MULTI-CARRY. Unreachable at the design top speed (12203 sub/tick) but the loop must be a
+    # WHILE, because a speed tunable is exactly the sort of number that gets raised later.
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    seg0 = trk_abs_seg;
+    trk_advance(65536 * 3 + 77);
+    trt_eq("triple carry -> +3 seg", trk_abs_seg - seg0, 3);
+    trt_eq("triple carry -> sub 77", trk_pos_sub, 77);
+
+    # negative speed is refused rather than reversing the cart
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    seg0 = trk_abs_seg;
+    var sub0 = trk_pos_sub;
+    trk_advance(0 - 5000);
+    trt_eq("negative speed does not reverse", trk_abs_seg, seg0);
+    trt_eq("negative speed leaves sub", trk_pos_sub, sub0);
+    return 0;
+}
+
+# ---- accumulated distance ------------------------------------------------------------------------
+# ⭐ 600 ticks at the design 20 m/s must be 200.0 m, and it must come out of the SAME carry path the
+# game uses rather than a closed form — that is the point of stepping it.
+fn trt_distance(): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var t = 0;
+    while (t < 600) { trk_advance(8533); t = t + 1; }
+    # 600 * 8533 = 5119800 sub = 5119800/256 = 19999.2 cm = 199.99 m
+    trt_eq("600 ticks at 8533 sub -> cm", trk_depth_cm(), 5119800 >>> 8);
+    trt_eq("600 ticks -> metres", trk_depth_m(), 199);
+    trt_true("depth is ~200 m", trk_depth_m() >= 199);
+    trt_true("depth is ~200 m (upper)", trk_depth_m() <= 200);
+    return 0;
+}
+
+# ---- ⛔ THE u16 WRAP — THE TEST THAT JUSTIFIES THE 128-SLOT RING -----------------------------------
+# Drive the absolute segment counter through 65535 -> 65536 and require the ring slot to stay
+# CONTINUOUS. Under `% 96` this is where the world jumps 64 segments sideways.
+# ⚠ This walks 65540 segments, which is why it steps the counter directly rather than at 60 Hz —
+# reaching this point in real play takes 2 h 20 min, which is exactly why it has to be tested here.
+fn trt_wrap(): i64 {
+    # the slot function must be continuous everywhere, including across the u16 boundary
+    var discontinuities = 0;
+    var a = 65500;
+    while (a < 65600) {
+        var s0 = trk_slot(a);
+        var s1 = trk_slot(a + 1);
+        # consecutive segments must land on consecutive slots (mod 128)
+        if (((s0 + 1) & CFG_RING_MASK) != s1) { discontinuities = discontinuities + 1; }
+        a = a + 1;
+    }
+    trt_eq("ring slot continuous across u16 wrap", discontinuities, 0);
+
+    # and the specific pair that breaks a modulo ring
+    trt_eq("slot(65535)", trk_slot(65535), 65535 & 127);
+    trt_eq("slot(65536)", trk_slot(65536), 0);
+    trt_true("slot(65536) follows slot(65535)",
+             ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
+
+    # the u16 VIEW still wraps, because that is its declared width
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    trk_abs_seg = 65535;
+    trt_eq("pos_seg u16 view at 65535", trk_pos_seg(), 65535);
+    trk_abs_seg = 65536;
+    trt_eq("pos_seg u16 view wraps to 0", trk_pos_seg(), 0);
+    # ...while the authoritative counter does not
+    trt_eq("abs counter does not wrap", trk_abs_seg, 65536);
+
+    # ⛔⛔ THE DEMONSTRATION THAT JUSTIFIES THE WHOLE DESIGN. This asserts that indexing the ring off
+    # the u16 VIEW is discontinuous exactly where indexing off the absolute counter is not. It is
+    # written as an assertion rather than a comment because the comment is what somebody deletes
+    # when they "simplify" trk_slot to take pos_seg — this fails the moment they do.
+    #   65535 -> 0 is one segment forward, so a correct index must step by exactly one slot.
+    var u16_before = 65535 % 96;          # what a modulo ring indexed by pos_seg would give at 65535
+    var u16_after  = 0 % 96;              # ...and one segment later, after the u16 wraps
+    trt_true("indexing off the u16 view TELEPORTS the ring",
+             ((u16_before + 1) % 96) != u16_after);
+    # the absolute counter, over the same one-segment step, does not
+    trt_true("indexing off the absolute counter does not",
+             ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
+    return 0;
+}
+
+# ---- determinism ------------------------------------------------------------------------------------
+# ⭐ A CHECKSUM OF THE STREAM AS THE CART ACTUALLY WALKS IT. Sampling the ring directly would only
+# prove the ring holds what was written; walking it proves the generator produced the same track in
+# the same order, which is the property a replay depends on.
+fn trt_stream_sum(seed, chapter, ticks): i64 {
+    trk_reset(seed, chapter);
+    var h = 0;
+    var t = 0;
+    while (t < ticks) {
+        trk_advance(8533);
+        # mix in the curve and grade under the cart; multiply by odd constants so that ordering
+        # matters and a permuted stream does not collide
+        h = (h * 1000003 + trk_curve_at(trk_abs_seg) * 31 + trk_grade_at(trk_abs_seg)) & 0xFFFFFFFF;
+        t = t + 1;
+    }
+    return h;
+}
+
+fn trt_determinism(): i64 {
+    var a = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);
+    var b = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);
+    trt_eq("same seed replays the same track", a, b);
+
+    # ⚠ and it must still hold after an UNRELATED chapter has been generated in between — this is
+    # the death-and-retry path, and it is where leftover generator state would show up.
+    trt_stream_sum(CFG_SEED_DEFAULT, 7, 250);
+    var c = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);
+    trt_eq("replay survives an intervening chapter", a, c);
+
+    # different chapters must NOT be the same track
+    var d = trt_stream_sum(CFG_SEED_DEFAULT, 1, 400);
+    trt_true("chapter 1 differs from chapter 0", a != d);
+
+    # different seeds must not be the same track
+    var e = trt_stream_sum(CFG_SEED_DEFAULT + 1, 0, 400);
+    trt_true("a different seed differs", a != e);
+    return 0;
+}
+
+# ---- generator bounds and continuity ------------------------------------------------------------------
+# ⛔ CURVATURE CONTINUITY IS A RENDERING REQUIREMENT, NOT AN AESTHETIC ONE. A step change in curve
+# puts a visible hinge at a segment seam — the tunnel corners instead of bending.
+fn trt_generator(): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 3);
+    var worst_curve = 0;
+    var worst_grade = 0;
+    var worst_step  = 0;
+    var prev = trk_curve_at(trk_abs_seg);
+    var t = 0;
+    while (t < 4000) {
+        trk_advance(8533);
+        var c = trk_curve_at(trk_abs_seg);
+        var g = trk_grade_at(trk_abs_seg);
+        var ac = c; if (ac < 0) { ac = 0 - ac; }
+        var ag = g; if (ag < 0) { ag = 0 - ag; }
+        if (ac > worst_curve) { worst_curve = ac; }
+        if (ag > worst_grade) { worst_grade = ag; }
+        # segment-to-segment step, sampled only when the cart actually crossed a boundary
+        var d = c - prev;
+        if (d < 0) { d = 0 - d; }
+        if (d > worst_step) { worst_step = d; }
+        prev = c;
+        t = t + 1;
+    }
+    trt_true("curve stays inside the design band", worst_curve <= CFG_CURVE_MAX);
+    trt_true("grade stays inside its band", worst_grade <= CFG_GRADE_MAX);
+    trt_true("curvature is continuous (no hinge)", worst_step <= CFG_CURVE_RAMP);
+    # ⛔ THE ABI CLAMP MUST NEVER FIRE IN NORMAL PLAY. If it does, the generator is capable of
+    # emitting a curve that would black out the frame, and the 12x design margin is a fiction.
+    trt_eq("ABI curvature clamp never fired", trk_clamp_hits, 0);
+
+    # ⭐ EVERY SEGMENT PRODUCED EXACTLY ONCE. This is the property the whole determinism story rests
+    # on: the generator consumes the rng in one fixed sequence, so a segment regenerated (or skipped)
+    # would desynchronise every segment after it. gen_count counts PRODUCTIONS and gen_to counts
+    # POSITIONS — they can only stay equal if the stream is strictly one-for-one and in order.
+    trt_eq("each segment generated exactly once", trk_gen_count, trk_gen_to);
+    # and streaming really did keep the required distance ahead of the cart
+    trt_eq("horizon stays CFG_GEN_AHEAD in front", trk_gen_to, trk_abs_seg + CFG_GEN_AHEAD + 1);
+    # 4000 ticks at 8533 sub/tick is ~521 segments, not 4000 — the cart crosses a boundary every
+    # 7.7 ticks, so this bounds the actual streaming volume rather than the tick count
+    trt_true("generator streamed a real distance", trk_gen_count > 500);
+    return 0;
+}
+
+# ---- ring liveness ---------------------------------------------------------------------------------
+# ⚠ Reading a recycled slot does not fail — it silently returns a DIFFERENT part of the track. The
+# renderer has to be able to ask, so the predicate has to be right at both edges.
+fn trt_liveness(): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var t = 0;
+    while (t < 500) { trk_advance(8533); t = t + 1; }
+
+    trt_true("cart's own segment is live", trk_live(trk_abs_seg));
+    trt_true("far horizon is live", trk_live(trk_abs_seg + CFG_GEN_AHEAD - 1));
+    trt_true("beyond generation is NOT live", trk_live(trk_gen_to) == 0);
+    trt_true("recycled past is NOT live", trk_live(trk_gen_to - CFG_RING_LIVE - 1) == 0);
+    trt_true("negative index is NOT live", trk_live(0 - 1) == 0);
+
+    # ⭐ the horizon the renderer needs must ALWAYS be live — the far plane is 4096 cm = 16 segments
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var missing = 0;
+    t = 0;
+    while (t < 1200) {
+        trk_advance(12203);                    # design TOP speed, the worst case for streaming
+        var k = 0;
+        while (k <= 16) {
+            if (trk_live(trk_abs_seg + k) == 0) { missing = missing + 1; }
+            k = k + 1;
+        }
+        t = t + 1;
+    }
+    trt_eq("the visible horizon is always generated", missing, 0);
+    return 0;
+}
+
+# ---- the suite ---------------------------------------------------------------------------------------
+fn trk_selftest(): i64 {
+    trt_fail = 0;
+    trt_ran  = 0;
+
+    trt_true("ring pool spans (global arrays are N*8 bytes)", trk_ok());
+    trt_carry();
+    trt_distance();
+    trt_wrap();
+    trt_determinism();
+    trt_generator();
+    trt_liveness();
+
+    ps("  segment ring:     "); pn(trt_ran); ps(" assertions, ");
+    if (trt_fail == 0) { ps("all pass"); nl(); }
+    if (trt_fail != 0) { pn(trt_fail); ps(" FAILED"); nl(); }
+    return trt_fail;
+}

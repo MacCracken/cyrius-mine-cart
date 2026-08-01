@@ -1,7 +1,7 @@
-# cyrius-mine-cart
+# cyrius-mine-cart — DEEPVEIN
 
-A ride through a curving mine tunnel, textured and perspective-correct, rasterised by the AGNOS
-kernel's GPU.
+Shaft 9 runs under a drowned arcology. You take the core, ride the rails down, and outrun what
+follows. Textured, perspective-correct, rasterised by the AGNOS kernel's GPU.
 
 This is the **first application outside the kernel's own test tree to draw with the AGNOS 3D ops**.
 The kernel grew triangle rasterisation on real AMD gfx90c silicon over a long ladder of rungs —
@@ -22,10 +22,49 @@ cyrius build src/main.cyr build/mine-cart
 
 | Mode | What it does |
 |---|---|
-| *(default)* | Ride the tunnel. Needs AGNOS and a GPU. |
-| `--check` | The host gate — build frames and re-validate every record the kernel would see. Runs anywhere, needs no GPU. Exit 95 = pass. |
+| *(default)* | Ride. Needs AGNOS and a GPU. A/D or arrows lean, SHIFT brakes, ESC quits. |
+| `--check` | The host gate — 164 self-test assertions, then build frames and re-validate every record the kernel would see. Runs anywhere, needs no GPU. Exit 95 = pass. |
+| `--sim` | Run the simulation headless and print telemetry. The tuning instrument. |
+| `--pilot N` | With `--sim`: 0 = hands off the controls, 1 = crude autopilot. |
+| `--verify` | One frame, GPU vs CPU reference, byte-compared. |
 | `--frames N` | Bound the ride (0 = unbounded). |
 | `--trace` | Report every dropped triangle, for diagnosis. |
+
+## The world is the track
+
+There is no 3D scene. A flat ring of 256 cm segments, each carrying a curvature and a pitch, **is**
+the entire world — a few kilobytes of integers. The renderer walks it far-to-near and turns
+per-segment curvature into a centre line by exact running integral; the simulation walks it as a
+`pos_seg` + `pos_sub` position with a real carry. 96 segments live in a 128-slot ring, 48 generated
+ahead, discarded behind.
+
+The ring is 128 slots so the index is a **mask**, not a modulo. `pos_seg % 96` works perfectly for
+two hours and twenty minutes and then, at the u16 wrap, jumps the ring 64 entries sideways in a
+single tick. The authoritative position is an absolute monotonic counter; the u16 the design calls
+for is a *view* of it.
+
+## The loop
+
+The cart always moves forward. You control speed and lean, nothing else.
+
+Lateral force is **`curve × speed²`**. Squaring the speed is what makes the brake a decision rather
+than a penalty — at half speed a bend pushes a quarter as hard, so braking into a curve buys far
+more control than the time it costs. Braking in and releasing at the apex pays a speed bonus;
+sitting on the brake through the whole bend pays nothing, because otherwise the safest line is also
+the slowest and the game becomes a patience test.
+
+**96 km/h is the throttle ceiling. 103 km/h has to be earned.**
+
+Lean past the threshold for 30 consecutive ticks derails. There is no lean bar: lean *is* the
+camera's lateral offset, so drifting wide brings the wall closer. The margin is felt, not read.
+
+## Determinism
+
+Fixed 60 Hz simulation, integer RNG seeded once, **zero wall-clock reads inside the sim**. The
+simulation sees exactly one input word per tick — not a keyboard, not a scancode, not a device — so
+same seed plus same input log reproduces the run exactly. Rendering may drop frames; the simulation
+never does. On a target with no debugger that replay is the only regression test that exists, which
+is why the boundary is drawn this narrowly.
 
 On AGNOS it is staged as `/bin/mine-cart` by the kernel repo's `scripts/burn/stage-tools.sh`.
 
@@ -40,9 +79,17 @@ On AGNOS it is staged as `/bin/mine-cart` by the kernel repo's `scripts/burn/sta
   #39 blit           present
 ```
 
-640×400, two 128×128 procedural textures, eight tunnel segments, 66 triangles a frame. Segments are
-drawn far-to-near: op `0x0F` replaces the destination pixel rather than compositing, and a tunnel is
-convex from the inside, so painter's order *is* the depth test and no z-buffer is needed.
+640×400, one 128×128 procedural texture, sixteen slabs off an 8/16/32/64 render-unit ladder, **192
+triangles a frame** in a single record. Near slabs are short and far ones long: a uniform walk makes
+the nearest slab 280 px tall on a 400 px screen and the farthest 2 px, so a curve reads as a polygon
+rather than a bend.
+
+Slabs are drawn far-to-near: op `0x0F` replaces the destination pixel rather than compositing, and a
+tunnel is convex from the inside, so painter's order *is* the depth test and no z-buffer is needed.
+
+**There is no lighting.** The record carries no vertex colour and no modulation field, so distance
+fog and lamp falloff are not available at all. The palette stays dark and cold and the emissive cyan
+rails carry every bit of the contrast — they are what make a bend legible at 100 km/h.
 
 ## Why `--check` exists
 
@@ -103,8 +150,17 @@ to the back buffer, in the same dispatch. Colour never got the field depth has.
 
 ## Status
 
-`0.1.0` — the ride. The cart follows the rail with a lag rather than sitting on the centre line, so
-the tunnel sways past. Steering input is not wired yet; that is the next cut.
+`0.2.0` — **the loop, and deliberately nothing more.** The build order this game is being written
+against says to stop after speed/brake/lean/derail and re-tune if it is not fun with nothing else in
+it, because nothing added later will save it. So that is where this stops.
+
+Measured with `--sim` over 30 s: hands off the controls the cart derails about every 7 s and reaches
+203 m; a crude autopilot reaches 787 m with 7 clean apexes and no derails. That gap is the
+difficulty, and it is the number to argue with.
+
+Not yet built, in the order they come: duck/jump obstacles, forks and their 1.2 s telegraph, pickups
+and score, pursuers and combat, the flood finale, synthesised audio, and the input-log replay test.
+The input word boundary and the per-chapter seeding are already in place for that last one.
 
 ## License
 

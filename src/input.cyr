@@ -1,0 +1,154 @@
+# input.cyr — raw scancodes in, one deterministic input word out.
+#
+# ⭐⭐ THE ENTIRE POINT OF THIS FILE IS THE NARROW BOUNDARY AT THE BOTTOM OF IT. The simulation never
+# sees a keyboard, a scancode, a device or a platform — it sees ONE 64-bit word per tick. Everything
+# device-shaped is trapped on this side of that line. That is what makes "same seed + same input log
+# = byte-identical frame 10000" achievable: the log is just a list of those words, and replaying is
+# feeding them back instead of polling. Designing it this way now costs nothing; retrofitting it
+# later would mean touching every system that reads input.
+#
+# ⛔⛔ FOUR WAYS THE AGNOS KEYBOARD DRAIN GOES WRONG, ALL OF THEM SILENT, ALL OF THEM HANDLED HERE:
+#
+#   1. A MAKE AND BREAK OF THE SAME KEY INSIDE ONE DRAIN MUST STILL PRODUCE ONE EDGE. A fast tap
+#      delivers 0x39 0xB9 in a single 16 ms drain. Code that derives edges by comparing held-state
+#      between frames sees held==0 before and held==0 after and reports NOTHING — the jump never
+#      happens and the player swears the game dropped their input. cyrius-doom shipped this bug
+#      (its menu would not advance on a quick tap). ⇒ EDGE IS SET ON EVERY MAKE, UNCONDITIONALLY.
+#
+#   2. 0xE0 IS A STANDALONE EXTENDED PREFIX AND CAN BE THE LAST BYTE OF A DRAIN, with its scancode
+#      arriving in the NEXT one. A local `ext` flag is therefore wrong: it resets between frames and
+#      the following byte decodes as the wrong key entirely. ⇒ THE CARRY IS A MODULE GLOBAL.
+#
+#   3. 0xE1 BEGINS A SIX-BYTE PAUSE SEQUENCE whose embedded 0x1D/0x9D would otherwise decode as
+#      left-Ctrl. The swallow counter must persist across drains too, for the same reason as (2).
+#
+#   4. THE KERNEL RING IS 256 BYTES WITH NO OVERFLOW CHECK — a producer silently overwrites the
+#      oldest unread byte. A DROPPED BREAK CODE IS A PERMANENTLY STUCK KEY, which in this game means
+#      a brake that never releases. ⇒ DRAIN 256 EVERY FRAME, not the 64 that is conventional here.
+#      ⚠ The buffer is a LOCAL `var kb[256]`, and a local array is N BYTES (a global would be N*8).
+
+# ---- key state -------------------------------------------------------------------------------
+# Indexed by scancode 0..127 for plain keys and 128..255 for 0xE0-extended ones.
+var in_held[256];          # 1 while the key is down
+var in_edge[256];          # 1 if the key went down since the last in_flush()
+var in_guard = 0;
+
+# ⛔ THESE TWO MUST SURVIVE ACROSS FRAMES — see hazards (2) and (3) above.
+var in_ext_carry = 0;      # a 0xE0 arrived as the last byte of the previous drain
+var in_skip      = 0;      # bytes remaining to swallow from a 0xE1 Pause sequence
+
+# ---- Set-1 scancodes, confirmed against shipped AGNOS consumers ---------------------------------
+# ⚠ Anything not in this list must be read off cyim's _kb_map rather than guessed — the extended
+# set in particular does not follow an obvious pattern.
+var SC_A     = 30;         # 0x1E — lean left
+var SC_D     = 32;         # 0x20 — lean right
+var SC_W     = 17;         # 0x11 — jump
+var SC_S     = 31;         # 0x1F — duck
+var SC_SPACE = 57;         # 0x39 — whip
+var SC_LSHIFT = 42;        # 0x2A — brake
+var SC_ESC   = 1;          # 0x01 — quit
+var SC_LEFT  = 203;        # 0xE0 0x4B -> 128 + 0x4B
+var SC_RIGHT = 205;        # 0xE0 0x4D -> 128 + 0x4D
+var SC_UP    = 200;        # 0xE0 0x48
+var SC_DOWN  = 208;        # 0xE0 0x50
+
+fn in_ok(): i64 {
+    if ((&in_edge  - &in_held) < 256 * 8) { return 0; }
+    if ((&in_guard - &in_edge) < 256 * 8) { return 0; }
+    return 1;
+}
+
+fn in_reset(): i64 {
+    var i = 0;
+    while (i < 256) {
+        store64(&in_held + i * 8, 0);
+        store64(&in_edge + i * 8, 0);
+        i = i + 1;
+    }
+    in_ext_carry = 0;
+    in_skip = 0;
+    return 0;
+}
+
+# ⭐ EDGES ARE CONSUMED, NOT SAMPLED. Cleared once per tick AFTER the sim has read them, so a press
+# that lands between two ticks is never lost and never counted twice.
+fn in_flush_edges(): i64 {
+    var i = 0;
+    while (i < 256) { store64(&in_edge + i * 8, 0); i = i + 1; }
+    return 0;
+}
+
+fn in_held_at(sc): i64 { return load64(&in_held + (sc & 255) * 8); }
+fn in_edge_at(sc): i64 { return load64(&in_edge + (sc & 255) * 8); }
+
+# ---- decode one drained scancode ----------------------------------------------------------------
+# Split out from the drain loop so the host build can exercise it with synthetic byte streams — the
+# decode is where every one of the four hazards lives, and it is the part that must be testable
+# without a keyboard.
+fn in_feed(sc): i64 {
+    sc = sc & 255;
+
+    # (3) swallow the rest of a Pause sequence
+    if (in_skip > 0) { in_skip = in_skip - 1; return 0; }
+    if (sc == 225) { in_skip = 5; in_ext_carry = 0; return 0; }     # 0xE1
+
+    # (2) an extended prefix — remember it ACROSS the drain boundary
+    if (sc == 224) { in_ext_carry = 1; return 0; }                  # 0xE0
+
+    var base = 128 * in_ext_carry;
+    in_ext_carry = 0;
+
+    var rel = 0;
+    if (sc > 127) { rel = 1; sc = sc & 127; }                       # high bit = break
+    var idx = (base + sc) & 255;
+
+    if (rel == 1) {
+        store64(&in_held + idx * 8, 0);
+        return 0;
+    }
+    # (1) EDGE ON EVERY MAKE, UNCONDITIONALLY — this is what survives a press+release in one drain
+    store64(&in_held + idx * 8, 1);
+    store64(&in_edge + idx * 8, 1);
+    return 0;
+}
+
+# ---- the platform drain -------------------------------------------------------------------------
+# ⚠ WHOLE-FUNCTION #ifdef, never an inline branch. Syscall 42 on Linux is `rt_sigreturn`, which does
+# not return — an accidental host call would not be a portability nuisance, it would be a crash with
+# no diagnostic.
+#ifdef CYRIUS_TARGET_AGNOS
+fn in_poll(): i64 {
+    var kb[256];                       # ⚠ LOCAL array: 256 BYTES here (a global would be 2048)
+    var n = syscall(42, &kb, 256);
+    if (n <= 0) { return 0; }          # 0 = nothing buffered; -1 = bad user range
+    var i = 0;
+    while (i < n) { in_feed(load8(&kb + i)); i = i + 1; }
+    return n;
+}
+#else
+# The host build has no keyboard. Returning 0 rather than faking input keeps --check deterministic:
+# a gate that synthesised keystrokes would be testing the gate, not the game.
+fn in_poll(): i64 { return 0; }
+#endif
+
+# ---- THE BOUNDARY -------------------------------------------------------------------------------
+# ⭐ Everything above this line is device-shaped and platform-specific. Everything below sees one
+# integer. Held keys drive continuous controls (lean, brake); edges drive one-shot actions (jump,
+# duck, whip) so that holding a key does not re-trigger.
+# ⚠ Arrow keys are accepted alongside A/D because the design plate labels the lean control A/D but a
+# player reaching for a cart game reaches for arrows.
+fn in_word(): i64 {
+    var w = 0;
+    if (in_held_at(SC_A) == 1)      { w = w | IN_LEFT; }
+    if (in_held_at(SC_LEFT) == 1)   { w = w | IN_LEFT; }
+    if (in_held_at(SC_D) == 1)      { w = w | IN_RIGHT; }
+    if (in_held_at(SC_RIGHT) == 1)  { w = w | IN_RIGHT; }
+    if (in_held_at(SC_LSHIFT) == 1) { w = w | IN_BRAKE; }
+    if (in_edge_at(SC_W) == 1)      { w = w | IN_JUMP; }
+    if (in_edge_at(SC_UP) == 1)     { w = w | IN_JUMP; }
+    if (in_edge_at(SC_S) == 1)      { w = w | IN_DUCK; }
+    if (in_edge_at(SC_DOWN) == 1)   { w = w | IN_DUCK; }
+    if (in_edge_at(SC_SPACE) == 1)  { w = w | IN_WHIP; }
+    if (in_edge_at(SC_ESC) == 1)    { w = w | IN_QUIT; }
+    return w;
+}

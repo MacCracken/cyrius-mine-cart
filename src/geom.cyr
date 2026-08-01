@@ -1,12 +1,12 @@
-# geom.cyr — the track, the camera, and the GPU record emitter.
+# geom.cyr — the segment-ring walk, the projection, and the #92 op 0x0F record emitter.
 #
-# ⭐ THIS FILE IS THE GAME'S HALF OF THE #92 op 0x0F ABI. Everything the kernel's
-# gpo_validate_triperspec refuses is refused HERE first, because a single bad record does not
-# draw a bad triangle — it makes `syscall(92, ...)` reject THE WHOLE BATCH, and the frame comes
-# back as whatever was in the slot before. A black screen on iron is the most expensive way to
-# discover a coordinate with a fraction bit set.
+# ⭐ THIS FILE IS THE GAME'S HALF OF THE op 0x0F ABI. Everything the kernel's gpo_validate_triperspec
+# refuses is refused HERE first, because a single bad record does not draw a bad triangle — it makes
+# `syscall(92, ...)` reject THE WHOLE BATCH, and the frame comes back as whatever was in the slot
+# before. On iron that is a black screen, and a black screen is indistinguishable from "no GPU",
+# "shader wrote nothing" and "readback failed".
 #
-# The rules, all of them, and where each number comes from (agnos kernel/core/syscall.cyr):
+# The rules, all of them (agnos kernel/core/syscall.cyr):
 #   · coordinates are 16.16 with the fraction EXACTLY zero        GPO_E_SUBPIXEL
 #   · |coordinate| <= 2^28 (i.e. +-4096 px)                       GPO_E_COORD
 #   · per-vertex w in [256, 4096]                                 GPO_E_WRANGE
@@ -16,182 +16,82 @@
 #   · the per-triangle reserved dword is zero                     GPO_E_TRILIST
 #   · |D| <= 2^31-1 at the four DRAW RECT corners                 GPO_E_DRANGE
 #
-# ⛔⛔ THE D RULE IS THE ONE THAT BITES, and it is why this file's constants are what they are.
-# D = e0*W0 + e1*W1 + e2*W2 where W_i = 2^16 / w_i, and the edge functions e are evaluated at the
-# corners of the DRAW RECT — not of the triangle. So a small triangle in the middle of the screen
-# still gets its denominator measured a thousand pixels away, and the bound scales with the rect.
-# A near plane at w = 512 rather than the ABI floor of 256 halves every W and buys the margin.
-# mc_band_check() below computes the kernel's D exactly; check.cyr proves it stays in band across
-# a whole scripted run.
+# ⛔⛔ WHAT CHANGED, AND WHY THE OLD MODEL COULD NOT BE KEPT. This file used to project a fixed
+# 8-segment grid against a global sine wave — the track was a closed-form function of z, so there was
+# nothing to stream and nothing to author. The world is now a ring of 256 cm segments each carrying
+# its own curvature, and the centre line is the RUNNING INTEGRAL of that curvature along the ring.
+# The old MC_SEG of 60 render units could not survive the change for an arithmetic reason: 60 ru is
+# 480 cm, 480 mod 256 = 224, so a slab boundary could never land on a segment boundary and every
+# slab would straddle two segments' curvature by a different fraction. MC_SEG is 32 now (256 cm
+# exactly) and slabs land cleanly.
 
-# ---- the screen. Both axes MUST be multiples of GPU_TILE (8) or the record is GPO_E_ALIGN. ----
-var MC_W  = 640;
-var MC_H  = 400;
-var MC_CX = 320;
-var MC_CY = 200;
-
-# ---- the camera frustum ----------------------------------------------------------------------
-# w = MC_WSC * rz, so the near plane sits at w = 256 and the far plane at w = 4096.
-#
-# ⭐⭐ 16:1 IS NOT A PREFERENCE, IT IS THE CEILING THE ABI IMPOSES, and the geometry is built to use
-# all of it. w must lie in [256, 4096] and w is proportional to depth, so z_far/z_near can never
-# exceed 4096/256 = 16 no matter what scale is chosen — picking a bigger MC_WSC to pull the near
-# plane closer pulls the far plane in by the same factor. An earlier 8:1 setting (near plane at
-# z = 64) left half the available depth on the table, and the visible cost was specific: everything
-# nearer than the near plane is not drawn, which is exactly the geometry that should sweep out to
-# the sides and fill the screen when the cart passes close to a wall. Doubling the range fixed it.
-var MC_FOCAL = 320;
-var MC_ZN    = 32;         # near plane, world units.  w = 256, the ABI floor exactly
-var MC_ZF    = 512;        # far plane.                w = 4096, the ABI ceiling exactly
-var MC_WSC   = 8;
-var MC_SEG   = 60;         # one tunnel segment; (512-32)/60 = 8 segments exactly
-
-# ---- the tunnel cross-section, world units ----------------------------------------------------
-# At the near plane a wall lands at MC_TW*MC_FOCAL/MC_ZN = 640 px from centre — off the screen
-# edge, which is what being INSIDE a tunnel looks like as opposed to looking at a box from outside.
-var MC_TW      = 64;       # half-width
-var MC_FLOOR_Y = 56;       # +y is down
-var MC_CEIL_Y  = 56;       # emitted as -y
-
-# ---- the texture. Power of two on BOTH axes, unconditionally. ---------------------------------
-var MC_TEX      = 128;
-var MC_TEXFULL  = 8388608;    # 128 << 16 — one full wrap of the texture, in 16.16 texels
-
-# ---- caps ------------------------------------------------------------------------------------
-var MC_TRI_MAX  = 128;        # per record; the kernel's GPU_TPER_LIST_MAX is 256
-var MC_W_MIN    = 256;
-var MC_W_MAX    = 4096;
-var MC_COORD_MAX = 268435456; # 2^28
-var MC_D_MAX    = 2147483647; # 2^31-1
-var MC_AREA_MIN = 65536;
-var MC_AREA_MAX = 4398046511104;
-
-# the background quad, always the FIRST two triangles of list A. Named because check.cyr must skip
-# it to measure anything: it covers the whole rect by design, so counting it makes an empty-tunnel
-# frame look full.
-# ⛔ NO BACKGROUND QUAD ANY MORE. op 0x0F fills its whole rect with bg before any triangle lands,
-# so a full-screen quad to "clear" was always redundant — and with ONE record it is pure waste.
-var MC_BG_TRIS  = 0;
-
-# ---- the draw-rect ORIGIN on screen -----------------------------------------------------------
-# ⭐ The frame is now drawn STRAIGHT to its final position in the back buffer and presented with
-# #84 — no #90 readback, no #73 copy, no #39 blit. The old round-trip wrote the frame into the back
-# buffer at (0,0), read it out, then blitted it back at (80,100) OF THE SAME BUFFER (#39 targets
-# gpu_bb_a/b exactly as op 0x0F does), leaving the un-offset original visible as an L-shaped band
-# down the top and left. That was the "duplicated area" in the first iron frame.
-# ⚠ BOTH MUST BE MULTIPLES OF 8 or the record is GPO_E_ALIGN — (800-400)/2 = 100 is NOT, which is
-# why these are masked down rather than centred exactly.
-var MC_DX = 0;
-var MC_DY = 0;
-
-# ---- the two vertex lists. 64 B per triangle, exactly GPU_TPER_VTX_BYTES. ---------------------
-# ⚠ SIZED IN u64 SLOTS, and the game verifies that at runtime in mc_bufs_ok(). A module-global
-# `var X[N]` is N*8 bytes here, but that has been measured to differ by file in this language and
-# an 8x under-sized vertex buffer is exactly the overflow that cost the kernel's own instrument a
-# burn — it corrupted the triangle COUNT, which reads as "the GPU did nothing".
-var mc_vtx_a[1024];        # 8192 B = 128 triangles — floor, ceiling and the background
-var mc_vtx_b[1024];        # 8192 B = 128 triangles — the walls
+# ---- the two vertex lists ---------------------------------------------------------------------
+# 64 B per triangle, exactly GPU_TPER_VTX_BYTES.
+# ⛔ SIZED IN 8-BYTE SLOTS, AND VERIFIED AT RUNTIME. A global `var X[N]` is N*8 bytes while a LOCAL
+# `var X[N]` is N bytes — an 8x asymmetry with no diagnostic either way. An under-sized vertex buffer
+# is exactly the overflow that cost the kernel's own instrument a burn: it corrupted the triangle
+# COUNT, and the symptom read as "the GPU did nothing".
+# ⚠ [2048] = 16384 B = 256 triangles, and MC_TRI_MAX is 256. THESE TWO MUST MOVE TOGETHER — raising
+# the cap without growing the array writes past the end of mc_vtx_a and into mc_vtx_b.
+var mc_vtx_a[2048];
+var mc_vtx_b[2048];        # kept so mc_bufs_ok() can still MEASURE the span at runtime
+var mc_vtx_guard = 0;
 var mc_n_a = 0;
-var mc_n_b = 0;
+var mc_n_b = 0;            # ⛔ ALWAYS 0 — the frame is ONE record. See mc_build.
 
-# ---- rejection counters. A dropped triangle is a hole in the tunnel, so these must stay 0. ----
-var mc_drop_flat  = 0;   # exactly-degenerate: cross == 0, so it covers no pixel at all
-var mc_drop_huge  = 0;   # past the area ceiling — a REAL hole
+# ---- rejection counters -------------------------------------------------------------------------
+var mc_drop_flat  = 0;     # exactly-degenerate: cross == 0, so it covers no pixel at all
+var mc_drop_huge  = 0;     # past the area ceiling — a REAL hole
 var mc_drop_coord = 0;
 var mc_drop_band  = 0;
+var mc_drop_full  = 0;     # ⭐ NEW: over the per-record triangle budget. See mc_emit.
 var mc_peak_d     = 0;
 var mc_peak_n     = 0;
-var mc_trace      = 0;   # 1 = report every dropped triangle, for diagnosis
+var mc_trace      = 0;     # 1 = report every dropped triangle, for diagnosis
+
+# ---- the slab endpoints, filled by mc_walk() ------------------------------------------------------
+# Struct-of-arrays again: rz (render units of depth), and the centre line's x/y offset there.
+var mc_s_rz[24];
+var mc_s_cx[24];
+var mc_s_cy[24];
+var mc_s_v[24];            # texture v at this endpoint, 16.16 texels
+var mc_s_guard = 0;
+var mc_nslab = 0;          # number of ENDPOINTS written (slabs = mc_nslab - 1)
 
 fn mc_bufs_ok(): i64 {
-    # the allocation unit is not portable across files in this language, so MEASURE it rather
-    # than trust it: two adjacent lists must be at least MC_TRI_MAX*64 apart.
-    var span = &mc_vtx_b - &mc_vtx_a;
-    if (span < MC_TRI_MAX * 64) { return 0; }
+    # ⚠ Compared as a >= BYTE assertion and never divided to derive a capacity: a global with N >= 2
+    # can carry up to 8 bytes of alignment padding BEFORE it, so a span overstates and never
+    # understates.
+    if ((&mc_vtx_b     - &mc_vtx_a) < MC_TRI_MAX * 64) { return 0; }
+    if ((&mc_vtx_guard - &mc_vtx_b) < MC_TRI_MAX * 64) { return 0; }
+    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 4)      { return 0; }
     return 1;
 }
 
-# ---- a quarter sine table, 1.12 fixed point (4096 = 1.0) --------------------------------------
-var mc_sintab[17];
+# ⭐ Kept as a name because main.cyr and tools/refrender.cyr call it, and because "initialise the
+# trig tables" is a real step that now lives in fx.cyr. One definition, one home.
+fn mc_sin_init(): i64 { return fx_sin_init(); }
 
-fn mc_sin_init(): i64 {
-    store64(&mc_sintab +  0 * 8, 0);
-    store64(&mc_sintab +  1 * 8, 401);
-    store64(&mc_sintab +  2 * 8, 799);
-    store64(&mc_sintab +  3 * 8, 1189);
-    store64(&mc_sintab +  4 * 8, 1567);
-    store64(&mc_sintab +  5 * 8, 1931);
-    store64(&mc_sintab +  6 * 8, 2276);
-    store64(&mc_sintab +  7 * 8, 2598);
-    store64(&mc_sintab +  8 * 8, 2896);
-    store64(&mc_sintab +  9 * 8, 3166);
-    store64(&mc_sintab + 10 * 8, 3406);
-    store64(&mc_sintab + 11 * 8, 3612);
-    store64(&mc_sintab + 12 * 8, 3784);
-    store64(&mc_sintab + 13 * 8, 3920);
-    store64(&mc_sintab + 14 * 8, 4017);
-    store64(&mc_sintab + 15 * 8, 4076);
-    store64(&mc_sintab + 16 * 8, 4096);
-    return 0;
-}
-
-# sine at a phase measured in 64ths of a full turn, by quadrant mirroring
-fn mc_sin(p): i64 {
-    p = p & 63;
-    if (p < 17) { return load64(&mc_sintab + p * 8); }
-    if (p < 32) { return load64(&mc_sintab + (32 - p) * 8); }
-    if (p < 49) { return 0 - load64(&mc_sintab + (p - 32) * 8); }
-    return 0 - load64(&mc_sintab + (64 - p) * 8);
-}
-
-# sine at a phase in 1024ths of a turn, linearly interpolated between table entries.
-# ⚠ Without the interpolation the track kinks once every 32 world units, and the segments are 56
-# long, so every seam would visibly hinge.
-fn mc_sin_i(ph): i64 {
-    var idx  = (ph >>> 4) & 63;
-    var frac = ph & 15;
-    var a = mc_sin(idx);
-    var b = mc_sin(idx + 1);
-    return a + ((b - a) * frac) / 16;
-}
-
-# ---- the track: where the tunnel's centre line sits at a given world z ------------------------
-var MC_CURVE_AMP = 40;      # world units of lateral sway; MC_TW is 64, so the tunnel really moves
-var MC_CURVE_PER = 3072;    # world units per full turn
-
-fn mc_track_x(wz): i64 {
-    var ph = (wz * 1024) / MC_CURVE_PER;
-    return (MC_CURVE_AMP * mc_sin_i(ph)) >>> 12;
-}
-
-# ---- projection ------------------------------------------------------------------------------
-# rz is ALWAYS >= MC_ZN: the segment grid is anchored to the near plane so nothing is ever behind
-# the camera and no near-plane clipping is needed. That is a geometry choice made specifically to
-# avoid a clipper, because a clipper is where the fraction bits and the degenerate triangles come
-# from, and both of those are whole-batch rejections.
-# ⛔⛔ VERTICES ARE FRAMEBUFFER-ABSOLUTE, NOT RECT-LOCAL — AND THIS COST A BURN-BLOCKER CATCH.
-# gpu_tper_prep_build folds dstxy into every plane CONSTANT (`c += 2*dx*a + 2*dy*b`), so the shader
-# — which works draw-local — evaluates each edge at the SCREEN sample point 2*(dx+lx)+1. Emitting
-# rect-local coordinates while passing a non-zero dstxy therefore renders the window
-# [dx, dx+w) x [dy, dy+h) OF THE SCENE into the rect, panning the picture up-left by (dx,dy).
-# Modelled at dstxy (80,96): 251,227 of 256,000 px wrong. At (0,0): 0.
-# ⚠ #92 CARRIES TWO CONVENTIONS AND THAT IS WHY THIS WAS EASY TO GET WRONG: op 0x0A is rect-LOCAL
-# (its prep never sees dx/dy), while 0x0E and 0x0F are ABSOLUTE. The absolute side had never been
-# exercised — gputri passes dstxy=0 on both — so nothing in the tree pinned the convention.
+# ---- projection -----------------------------------------------------------------------------------
+# rz is ALWAYS >= MC_ZN: the slab ladder is anchored to the near plane so nothing is ever behind the
+# camera and no near-plane clipping is needed. That is a geometry choice made specifically to avoid a
+# clipper, because a clipper is where sub-pixel coordinates and degenerate triangles come from, and
+# both of those are whole-batch rejections.
+#
+# ⛔⛔ VERTICES ARE FRAMEBUFFER-ABSOLUTE, NOT RECT-LOCAL. gpu_tper_prep_build folds dstxy into every
+# plane CONSTANT, so the shader evaluates each edge at the SCREEN sample point 2*(dx+lx)+1. Emitting
+# rect-local coordinates with a non-zero dstxy renders the window [dx,dx+w) x [dy,dy+h) OF THE SCENE
+# into the rect, panning the picture up-left by (dx,dy).
+# ⚠ #92 carries TWO conventions and that is why this is easy to get wrong: op 0x0A is rect-LOCAL,
+# while 0x0E and 0x0F are ABSOLUTE. main.cyr's gate asserts it rather than trusting it.
 fn mc_px(rx, rz): i64 { return MC_DX + MC_CX + (rx * MC_FOCAL) / rz; }
 fn mc_py(ry, rz): i64 { return MC_DY + MC_CY + (ry * MC_FOCAL) / rz; }
 fn mc_wof(rz): i64    { return MC_WSC * rz; }
 
-# ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------
-# ⭐ This is not a paraphrase of the rule. It is the same expression, on the same doubled-integer
-# domain, at the same four draw-rect corners, so that "the game accepts it" and "the kernel
-# accepts it" cannot drift apart. Coordinates arrive in PIXELS, matching the kernel's
-# `gpo_i32(b) >>> 16`.
+# ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------------
+# ⭐ Not a paraphrase of the rule — the same expression, on the same doubled-integer domain, at the
+# same four draw-rect corners, so "the game accepts it" and "the kernel accepts it" cannot drift.
 fn mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
-    # ⚠ THE CORNERS ARE THE DRAW RECT'S, AND THE RECT NO LONGER STARTS AT THE ORIGIN. Drawing at
-    # dstxy pushes qx1/qy1 outward and grows |D| with them — at an 800x600 console (80,96) that is
-    # ~12%, and on a 2560x1440 console it is far more. Evaluating this at (0,0) while the kernel
-    # evaluates it at dstxy would understate the bound the gate exists to enforce.
     var qx0 = 2 * MC_DX + 1;
     var qx1 = 2 * (MC_DX + MC_W - 1) + 1;
     var qy0 = 2 * MC_DY + 1;
@@ -231,13 +131,15 @@ fn mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i6
     return 1;
 }
 
-# ---- emit one triangle into a list -----------------------------------------------------------
-# Returns 1 when the triangle was written, 0 when it was DROPPED. A drop is a visible hole, so
-# every drop is counted and the game reports the totals; a run that drops anything is a bug in
-# the geometry, not a tolerable loss.
+# ---- emit one triangle ------------------------------------------------------------------------------
+# Returns 1 when written, 0 when DROPPED. A drop is a visible hole, so every drop is counted.
 fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
     var n = load64(np);
-    if (n >= MC_TRI_MAX) { return 0; }
+    # ⭐ THIS DROP USED TO BE SILENT AND UNCOUNTED, AND THAT WAS THE ONE REJECTION PATH THE GATE
+    # COULD NOT SEE. A frame that quietly lost its last N triangles reported a perfectly clean drop
+    # tally — "0 dropped" over a tunnel with the far end missing. Budget the geometry analytically;
+    # never discover the cap at runtime.
+    if (n >= MC_TRI_MAX) { mc_drop_full = mc_drop_full + 1; return 0; }
 
     # coordinate window, +-4096 px
     if (x0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
@@ -267,12 +169,13 @@ fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2)
     var dcx = 2 * x2; var dcy = 2 * y2;
     var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
     if (cross < 0) { cross = 0 - cross; }
-    # ⭐ THE AREA-MIN RULE CAN ONLY FIRE AT cross == 0, and that is worth stating because it decides
-    # whether a drop is a hole. a2 is |cross| << 16 and MC_AREA_MIN is 1 << 16, so a2 < MC_AREA_MIN
-    # requires |cross| < 1, i.e. |cross| == 0 — the triangle is EXACTLY collinear and covers no pixel
-    # in any rasteriser. Far tunnel segments produce these routinely: two wall edges a fraction of a
-    # pixel apart round to the same integer column, and the ABI forbids sub-pixel coordinates. So
-    # these drops are provably invisible, unlike a w-band or coordinate drop, which loses real pixels.
+    # ⭐ THE AREA-MIN RULE CAN ONLY FIRE AT cross == 0, and that decides whether a drop is a hole.
+    # a2 is |cross| << 16 and MC_AREA_MIN is 1 << 16, so a2 < MC_AREA_MIN requires |cross| == 0 — the
+    # triangle is EXACTLY collinear and covers no pixel in any rasteriser. Far slabs produce these
+    # routinely once the track curves: two edges a fraction of a pixel apart round to the same
+    # integer column, and the ABI forbids sub-pixel coordinates.
+    # ⚠ SO THE GATE MUST NOT ASSERT "all drops are zero" — it must hold coord/band/huge/full at zero
+    # and report flat separately. A curving track legitimately produces ~1 flat drop per frame.
     var a2 = cross << 16;
     if (a2 < MC_AREA_MIN) {
         mc_drop_flat = mc_drop_flat + 1;
@@ -283,8 +186,6 @@ fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2)
         }
         return 0;
     }
-    # ⚠ NOT a flat drop — a triangle past the area ceiling is a LARGE one, and losing it loses real
-    # pixels. Counted apart so the gate can hold it to zero while tolerating the degenerate slivers.
     if (a2 > MC_AREA_MAX) { mc_drop_huge = mc_drop_huge + 1; return 0; }
 
     if (mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2) == 0) {
@@ -304,7 +205,7 @@ fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2)
     return 1;
 }
 
-# ---- emit a quad as two triangles, corners in order a-b-c-d ----------------------------------
+# emit a quad as two triangles, corners in order a-b-c-d
 fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd): i64 {
     var got = 0;
     got = got + mc_emit(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc);
@@ -312,106 +213,214 @@ fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc,
     return got;
 }
 
-# ---- build one frame -------------------------------------------------------------------------
-# Segments are walked FAR TO NEAR: op 0x0F REPLACES the destination pixel rather than compositing,
-# so painter's order is the depth test. The tunnel is convex from the inside and nothing
-# interpenetrates, which is what makes that sound here without op 0x0E's z buffer.
-fn mc_build(cam_x, cam_z): i64 {
+# ---- the slab ladder ---------------------------------------------------------------------------------
+# ⚠ Near slabs are SHORT and far slabs are LONG. A uniform walk makes the nearest slab 280 px tall on
+# a 400 px screen while the farthest is 2 px — the near geometry is then so coarse that a curve reads
+# as a polygon rather than a bend. This ladder costs the same triangles and drops the worst slab to
+# 112 px.
+fn mc_step_at(rz): i64 {
+    if (rz < 64)  { return MC_LOD0; }
+    if (rz < 128) { return MC_LOD1; }
+    if (rz < 256) { return MC_LOD2; }
+    return MC_LOD3;
+}
+
+# ---- the curve integral --------------------------------------------------------------------------------
+# Integrate a per-segment field over the render-unit interval [ru_a, ru_b), measured from the START of
+# the segment the camera is standing in. Returns BRADS.
+#
+# ⭐ AN EXACT INTEGRAL, NOT A POINT SAMPLE, AND THE DIFFERENCE IS VISIBLE. The far slabs are 64 ru
+# long and a segment is 32 ru, so each far slab spans TWO segments. Sampling the ring once per slab
+# reads only one of them and silently discards the other's curvature — a measured 4 of 15 segments'
+# curve values never read at all, which makes a bend appear and vanish as the cart advances. Walking
+# the fragments costs ~62 ring reads a frame and loses nothing.
+#
+# ⚠ `>>> 5` rather than `/ 32`: the field can be NEGATIVE, and those are different operations for
+# negative values (one floors, the other truncates toward zero). The engine uses the flooring
+# convention everywhere so that no call site has to know the sign of its input.
+fn mc_integ(ru_a, ru_b, want_grade): i64 {
+    var acc = 0;
+    var p = ru_a;
+    while (p < ru_b) {
+        var seg_i   = p >>> 5;                  # 32 render units per segment
+        var seg_end = (seg_i + 1) << 5;
+        var e = ru_b;
+        if (seg_end < e) { e = seg_end; }
+        var abs = trk_abs_seg + seg_i;
+        var c = 0;
+        # ⛔ A read outside the live window does not fail — it returns a RECYCLED slot, i.e. a
+        # different part of the track. Treat it as straight rather than as whatever is in the slot.
+        if (trk_live(abs) == 1) {
+            if (want_grade == 0) { c = trk_curve_at(abs); }
+            if (want_grade != 0) { c = trk_grade_at(abs); }
+        }
+        acc = acc + ((c * (e - p)) >>> 5);
+        p = e;
+    }
+    return acc;
+}
+
+# ---- the walk: turn per-segment curvature into a centre line ----------------------------------------------
+# ⭐ THE ACCUMULATOR IS ANCHORED AT ZERO AT THE NEAR PLANE, NOT AT THE CAMERA, and that is a
+# correctness choice rather than a convenience. The near slab carries the largest W (w = 256 is the
+# ABI floor) and is therefore where |D| is most sensitive; integrating from the camera and
+# subtracting would land rounding noise exactly there. Anchored at the near plane, the near slab's
+# coordinates and |D| are FIXED no matter how hard the track bends further out.
+#
+# psi/phi accumulate in BRADS; xq/yq accumulate in 16.16 RENDER UNITS.
+# `* MC_TAU_Q16 >>> 17` folds three things at once: brads -> radians (2*pi/65536), the 16.16 scale,
+# and the /2 of the midpoint rule. The midpoint rule is EXACT for a constant curve, so the choice of
+# ladder never changes WHERE the track goes — only how finely it is drawn.
+fn mc_walk(): i64 {
+    var cam_ru = trk_pos_sub >>> 11;            # 0..31 render units into the current segment
+    var psi = 0; var xq = 0;
+    var phi = 0; var yq = 0;
+
+    # texture v advances with depth so the tunnel scrolls past continuously. Anchored modulo one
+    # segment at the near plane so v never grows without bound (|N| is a shader register pair and
+    # the ABI bounds it at 2^62).
+    var v = ((cam_ru + MC_ZN) & 31) * (MC_TEXFULL / 32);
+
+    var rz = MC_ZN;
+    var n = 0;
+    store64(&mc_s_rz + 0, rz);
+    store64(&mc_s_cx + 0, 0);
+    store64(&mc_s_cy + 0, 0);
+    store64(&mc_s_v  + 0, v);
+    n = 1;
+
+    while (rz < MC_ZF) {
+        var step = mc_step_at(rz);
+        var dpsi = mc_integ(cam_ru + rz, cam_ru + rz + step, 0);
+        var dphi = mc_integ(cam_ru + rz, cam_ru + rz + step, 1);
+        xq = xq + ((step * (2 * psi + dpsi) * MC_TAU_Q16) >>> 17);
+        yq = yq + ((step * (2 * phi + dphi) * MC_TAU_Q16) >>> 17);
+        psi = psi + dpsi;
+        phi = phi + dphi;
+        rz = rz + step;
+        v  = v + step * (MC_TEXFULL / 32);
+        if (n < MC_SLAB_MAX) {
+            store64(&mc_s_rz + n * 8, rz);
+            store64(&mc_s_cx + n * 8, xq >>> 16);
+            store64(&mc_s_cy + n * 8, yq >>> 16);
+            store64(&mc_s_v  + n * 8, v);
+            n = n + 1;
+        }
+    }
+    mc_nslab = n;
+    return n;
+}
+
+# ---- build one frame -------------------------------------------------------------------------------------
+# ⛔⛔ ONE RECORD, ONE LIST. The frame used to be two op 0x0F records (floor+ceiling, then walls) and
+# that is UNSOUND for this op: it replaces its ENTIRE rect, writing bg wherever no triangle covered
+# the lane, so the second record painted opaque black over everything the first had drawn. The first
+# iron frame showed the walls and nothing else. RECORDS DO NOT LAYER, and nothing in the ABI says so.
+#
+# Slabs are walked FAR TO NEAR: op 0x0F REPLACES the destination pixel rather than compositing, so
+# painter's order IS the depth test. A tunnel is convex from the inside and nothing interpenetrates,
+# which is what makes that sound without op 0x0E's z buffer.
+#
+# cam_x is the cart's lateral offset from the centre line, in RENDER UNITS.
+fn mc_build(cam_x): i64 {
     mc_n_a = 0;
-    mc_n_b = 0;                 # ⛔ ALWAYS 0 NOW — see below. Kept so consumers still compile.
+    mc_n_b = 0;
     mc_drop_flat = 0;
     mc_drop_huge = 0;
     mc_drop_coord = 0;
     mc_drop_band = 0;
+    mc_drop_full = 0;
 
-    # ⛔⛔ ONE RECORD, ONE LIST. The frame used to be two op 0x0F records (floor+ceiling, then
-    # walls) and that is UNSOUND for this op: it replaces its ENTIRE rect, writing bg wherever no
-    # triangle covered the lane, so the second record painted opaque black over everything the first
-    # had drawn. The first iron frame showed the walls and nothing else. Records do not layer.
-    # ⇒ Everything goes in one list against one texture, materials banded along u:
-    #      floor + ceiling  u in [0, MC_TEX_HALF)      the left half — gravel, sleepers, rails
-    #      walls            u in [MC_TEX_HALF, T)      the right half — rock
-    # Painter's order still holds within the record: far to near, and op 0x0F REPLACES, so nearer
-    # geometry overwrites farther. A tunnel is convex from the inside, so that IS the depth test.
-    var k = 8;
-    while (k > 0) {
-        var rzf = MC_ZN + k * MC_SEG;
-        var rzn = MC_ZN + (k - 1) * MC_SEG;
-        var wzf = cam_z + rzf;
-        var wzn = cam_z + rzn;
+    mc_walk();
 
-        var wf = mc_wof(rzf);
+    var H = MC_TEX_HALF;      # floor material: u in [0, H)
+    var T = MC_TEXFULL;       # rock material:  u in [H, T)
+
+    # ---- ⭐ THE FAR CAP, AND WHY THE FRAME IS WRONG WITHOUT IT ---------------------------------
+    # ⛔ op 0x0F writes GPU_TRID_BG — opaque BLACK — into every lane no triangle covered, and the
+    # game cannot change that: the record has no background-colour field. So the mouth of the tunnel
+    # beyond the far plane came out as a hard-edged black octagon sitting in the middle of the
+    # screen. It does not read as "the shaft continues into the dark"; it reads as a HOLE IN THE
+    # WORLD, which is worse than a visual flaw because the player's eye goes straight to it.
+    # ⇒ One quad at the far plane, sampling the near-black texel (0,0) with a CONSTANT attribute at
+    #   every corner. Drawn FIRST so every slab overwrites it — painter's order does the rest.
+    # ⚠ It spans the full bore rather than the arch, so no sliver of bg survives at the corners.
+    var capz = load64(&mc_s_rz + (mc_nslab - 1) * 8);
+    var capx = load64(&mc_s_cx + (mc_nslab - 1) * 8) - cam_x;
+    var capy = load64(&mc_s_cy + (mc_nslab - 1) * 8);
+    var capw = mc_wof(capz);
+    var cl = mc_px(capx - MC_TW, capz);
+    var cr = mc_px(capx + MC_TW, capz);
+    var ct = mc_py(capy - MC_CEIL_Y, capz);
+    var cb = mc_py(capy + MC_FLOOR_Y, capz);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+            cl, ct, capw, 0, 0,   cr, ct, capw, 0, 0,
+            cr, cb, capw, 0, 0,   cl, cb, capw, 0, 0);
+
+    var k = mc_nslab - 2;
+    while (k >= 0) {
+        var rzn = load64(&mc_s_rz + k * 8);
+        var rzf = load64(&mc_s_rz + (k + 1) * 8);
+        var cn  = load64(&mc_s_cx + k * 8) - cam_x;
+        var cf  = load64(&mc_s_cx + (k + 1) * 8) - cam_x;
+        var gn  = load64(&mc_s_cy + k * 8);
+        var gf  = load64(&mc_s_cy + (k + 1) * 8);
+        var vn  = load64(&mc_s_v + k * 8);
+        var vf  = load64(&mc_s_v + (k + 1) * 8);
+
         var wn = mc_wof(rzn);
+        var wf = mc_wof(rzf);
 
-        var cf = mc_track_x(wzf) - cam_x;
-        var cn = mc_track_x(wzn) - cam_x;
+        # the bore's six horizontal stations, near and far
+        var ln  = mc_px(cn - MC_TW,      rzn);  var lf  = mc_px(cf - MC_TW,      rzf);
+        var rn  = mc_px(cn + MC_TW,      rzn);  var rf  = mc_px(cf + MC_TW,      rzf);
+        var cln = mc_px(cn - MC_CEIL_HW, rzn);  var clf = mc_px(cf - MC_CEIL_HW, rzf);
+        var crn = mc_px(cn + MC_CEIL_HW, rzn);  var crf = mc_px(cf + MC_CEIL_HW, rzf);
 
-        # v runs along z, one full wrap per segment, anchored to WORLD z so the tunnel scrolls
-        # continuously rather than swimming with the camera
-        var vn = ((wzn % MC_SEG) * MC_TEXFULL) / MC_SEG;
-        var vf = vn + MC_TEXFULL;
+        # ...and its four vertical ones. Grade shifts the whole section up or down.
+        var fln = mc_py(gn + MC_FLOOR_Y,      rzn); var flf = mc_py(gf + MC_FLOOR_Y,      rzf);
+        var arn = mc_py(gn - MC_ARCH_Y,       rzn); var arf = mc_py(gf - MC_ARCH_Y,       rzf);
+        var cen = mc_py(gn - MC_CEIL_Y,       rzn); var cef = mc_py(gf - MC_CEIL_Y,       rzf);
 
-        var lf = mc_px(cf - MC_TW, rzf);   var rf = mc_px(cf + MC_TW, rzf);
-        var ln = mc_px(cn - MC_TW, rzn);   var rn = mc_px(cn + MC_TW, rzn);
-        var flf = mc_py(MC_FLOOR_Y, rzf);  var fln = mc_py(MC_FLOOR_Y, rzn);
-        var cef = mc_py(0 - MC_CEIL_Y, rzf); var cen = mc_py(0 - MC_CEIL_Y, rzn);
-
-        var H = MC_TEX_HALF;      # floor material: u in [0, H)
-        var T = MC_TEXFULL;       # rock material:  u in [H, T)
-
-        # floor — far-left, far-right, near-right, near-left
+        # floor — far-left, far-right, near-right, near-left. u spans the floor band.
         mc_quad(&mc_vtx_a, &mc_n_a,
                 lf, flf, wf, 0, vf,   rf, flf, wf, H, vf,
                 rn, fln, wn, H, vn,   ln, fln, wn, 0, vn);
 
-        # ceiling
+        # left wall — u runs floor-to-springing so the rock does not smear
         mc_quad(&mc_vtx_a, &mc_n_a,
-                lf, cef, wf, 0, vf,   rf, cef, wf, H, vf,
-                rn, cen, wn, H, vn,   ln, cen, wn, 0, vn);
-
-        # left wall — u runs floor-to-ceiling so the rock does not smear
-        mc_quad(&mc_vtx_a, &mc_n_a,
-                lf, cef, wf, H, vf,   lf, flf, wf, T, vf,
-                ln, fln, wn, T, vn,   ln, cen, wn, H, vn);
+                lf, arf, wf, H, vf,   lf, flf, wf, T, vf,
+                ln, fln, wn, T, vn,   ln, arn, wn, H, vn);
 
         # right wall
         mc_quad(&mc_vtx_a, &mc_n_a,
-                rf, flf, wf, H, vf,   rf, cef, wf, T, vf,
-                rn, cen, wn, T, vn,   rn, fln, wn, H, vn);
+                rf, flf, wf, H, vf,   rf, arf, wf, T, vf,
+                rn, arn, wn, T, vn,   rn, fln, wn, H, vn);
+
+        # ⭐ THE CHAMFERS ARE WHAT MAKE IT AN ARCH. Without them this is a rectangular box, which
+        # reads as a corridor rather than a bored shaft. Two quads a slab is the cheapest section
+        # that still has a shoulder.
+        # left chamfer — springing line up to the ceiling edge
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                clf, cef, wf, H, vf,   lf,  arf, wf, T, vf,
+                ln,  arn, wn, T, vn,   cln, cen, wn, H, vn);
+
+        # right chamfer
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                rf,  arf, wf, H, vf,   crf, cef, wf, T, vf,
+                crn, cen, wn, T, vn,   rn,  arn, wn, H, vn);
+
+        # ceiling
+        mc_quad(&mc_vtx_a, &mc_n_a,
+                clf, cef, wf, H, vf,   crf, cef, wf, T, vf,
+                crn, cen, wn, T, vn,   cln, cen, wn, H, vn);
 
         k = k - 1;
     }
     return mc_n_a;
 }
 
-# ---- the cart ---------------------------------------------------------------------------------
-# ⚠ LIVES HERE, not in main.cyr, because the host reference renderer must drive the SAME physics to
-# reproduce the frame the GPU was asked to draw. Two copies of this stepping logic is two things to
-# keep in sync, and a reference that has silently drifted is worse than no reference at all.
-var mc_cart_x = 0;
-var mc_cart_z = 0;
-var mc_speed  = 3;
-var MC_LOOK   = 176;      # how far up the track the cart aims
-
-fn mc_cart_reset(): i64 { mc_cart_x = 0; mc_cart_z = 0; mc_speed = 3; return 0; }
-
-# It follows the rail with a lag rather than sitting exactly on the centre line, so the tunnel
-# sways past instead of sliding straight down the middle. That lag is the whole feel of the thing.
-fn mc_cart_step(): i64 {
-    mc_cart_z = mc_cart_z + mc_speed;
-    var tgt = mc_track_x(mc_cart_z + MC_LOOK);
-    mc_cart_x = mc_cart_x + (tgt - mc_cart_x) / 6;
-    # the ride accelerates, then holds — 3 to 9 world units a frame over about a minute
-    if ((mc_cart_z % 1024) == 0) {
-        if (mc_speed < 9) { mc_speed = mc_speed + 1; }
-    }
-    return 0;
-}
-
-# advance to frame N from a cold start — the reference and the ride must agree on what "frame N" is
-fn mc_cart_to(frame): i64 {
-    mc_cart_reset();
-    var f = 0;
-    while (f < frame) { mc_cart_step(); f = f + 1; }
-    return 0;
-}
+# ⭐ THE CART LIVES IN cart.cyr AND IS INCLUDED BEFORE THIS FILE. It is not in main.cyr because the
+# host reference renderer must drive the SAME physics to reproduce the frame the GPU was asked to
+# draw — two copies of the stepping logic is two things to keep in sync, and a reference that has
+# silently drifted is worse than no reference at all.

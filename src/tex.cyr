@@ -1,32 +1,38 @@
-# tex.cyr — the two procedural textures, 128x128 XRGB8888 each.
+# tex.cyr — the procedural texture, 128x128 XRGB8888. DEEPVEIN palette.
 #
-# Power-of-two on both axes is MANDATORY for #92 op 0x0F, unconditionally: tri_persp.s masks the
-# interpolated coordinate with w-1 and h-1 on every fetch, so a non-power-of-two texture does not
-# wrap — it reads the wrong texel and paints a plausible wrong picture. The kernel rejects it
-# (GPO_E_TEXDIM) rather than clamping, so 128 is not a preference, it is the contract.
+# ⛔ POWER-OF-TWO ON BOTH AXES IS MANDATORY AND UNCONDITIONAL. tri_persp.s masks the interpolated
+# coordinate with w-1 and h-1 on every fetch, so a non-power-of-two texture does not wrap — it reads
+# the wrong texel and paints a plausible WRONG picture. The kernel rejects it (GPO_E_TEXDIM) rather
+# than clamping, so 128 is the contract, not a preference.
+#
+# ⛔⛔ ONE TEXTURE, NOT TWO — AND THE OP FORCES THIS.
+# op 0x0F REPLACES ITS ENTIRE RECT: tri_persp.s selects bg for any lane no triangle covered and then
+# stores UNCONDITIONALLY. Two records over the same rect do NOT layer — the second paints opaque
+# black over everything the first drew. mine-cart 0.1.0 shipped as two records (floor+ceiling, then
+# walls) and its first iron frame showed exactly that: the walls survived, the floor and ceiling were
+# erased. So the whole frame is ONE record and can carry ONE texture.
+# ⇒ Two materials, banded along u: LEFT half (texels 0-63) is the floor, RIGHT half (64-127) is rock.
+#   Geometry keeps each surface inside its own band; v (along the track) wraps normally for both.
+# ⚠ MC_TEX / MC_TEXFULL / MC_TEX_HALF live in config.cyr — geom.cyr bands its u coordinates against
+#   them and is compiled BEFORE this file.
+#
+# ⛔ THERE IS NO LIGHTING. op 0x0F fetches a texel and stores it; the record carries no vertex colour
+# and no modulation field, so distance fog and lamp falloff are not available at all. Depth cueing
+# has to be baked into the texture or faked with geometry. What this file does instead is keep the
+# whole palette DARK and COLD and let the emissive rails carry the contrast — which is why the rails
+# are the brightest thing in the frame by a wide margin.
 
-# ⚠ 8192 u64 slots = 65536 B = 128*128*4. Checked at runtime by mc_tex_ok().
-# ⛔⛔ ONE TEXTURE, NOT TWO — AND THIS IS FORCED BY THE OP, NOT A PREFERENCE.
-# op 0x0F REPLACES ITS ENTIRE RECT: tri_persp.s selects bg for any lane no triangle covered and
-# then stores UNCONDITIONALLY. So two records over the same rect do NOT layer — the second one
-# paints opaque black over everything the first drew. mine-cart 0.1.0 shipped as two records
-# (floor+ceiling, then walls) and its first iron frame showed exactly that: the walls survived and
-# the floor and ceiling were erased.
-# ⇒ The whole frame must be ONE record, so it can carry only ONE texture. Two materials still fit,
-# banded along u: LEFT half (texels 0-63) is the floor, RIGHT half (64-127) is rock. Geometry keeps
-# each surface inside its own band, and v (along the track) wraps normally for both.
-var MC_TEX_HALF = 4194304;   # 64 << 16 — the u boundary between the two materials
-
-var mc_tex_a[8192];        # THE texture: left half floor (sleepers + rails), right half rock
-var mc_tex_b[8192];        # kept allocated so mc_tex_ok() can still MEASURE the span at runtime
+var mc_tex_a[8192];        # THE texture: left half floor, right half rock
+var mc_tex_b[8192];        # scratch for the rock pass; also lets mc_tex_ok() MEASURE the span
+var mc_tex_guard = 0;
 
 fn mc_tex_ok(): i64 {
-    var span = &mc_tex_b - &mc_tex_a;
-    if (span < MC_TEX * MC_TEX * 4) { return 0; }
+    if ((&mc_tex_b     - &mc_tex_a) < MC_TEX * MC_TEX * 4) { return 0; }
+    if ((&mc_tex_guard - &mc_tex_b) < MC_TEX * MC_TEX * 4) { return 0; }
     return 1;
 }
 
-# a cheap integer hash, for rock mottle — deterministic, so a frame is reproducible
+# a cheap integer hash, for mottle — deterministic, so a frame is reproducible
 fn mc_hash(x, y): i64 {
     var h = x * 374761393 + y * 668265263;
     h = (h ^ (h >>> 13)) * 1274126177;
@@ -45,30 +51,45 @@ fn mc_rgb(r, g, b): i64 {
     return 0xFF000000 + (r * 65536) + (g * 256) + b;
 }
 
-# ---- the floor: dark gravel, wooden sleepers across, two steel rails along --------------------
-# ⛔ Texel (0,0) MUST stay dark and solid: geom.cyr's background quad samples it with a CONSTANT
-# attribute at all three vertices, which is what paints the tunnel's far darkness and, not
-# incidentally, guarantees every pixel of the draw rect is written before anything else lands.
+# ---- the floor: wet ballast, dark sleepers, and two EMISSIVE rails ------------------------------
+# ⭐ THE RAILS ARE THE ONLY BRIGHT THING IN THE MINE, AND THAT IS THE WHOLE ART DIRECTION. With no
+# lighting available, the frame needs one high-contrast element that tells the player where the
+# track goes and how it bends — everything else can be texture. Cyan #4fe3ff against a near-black
+# blue ballast does that, and it is what makes a curve legible at 100 km/h.
+# ⛔ TEXEL (0,0) MUST STAY NEAR-BLACK AND SOLID: the far cap quad samples it with a CONSTANT
+# attribute at all three vertices to paint the darkness the tunnel recedes into. If it ever becomes
+# a rail texel, the far end of the shaft turns into a glowing block.
 fn mc_tex_floor(): i64 {
     var y = 0;
     while (y < MC_TEX) {
         var x = 0;
         while (x < MC_TEX) {
-            var n = mc_hash(x, y) % 24;
-            var r = 44 + n; var g = 38 + n; var b = 32 + n;
+            # ballast — #0a1720 with grit
+            var n = mc_hash(x, y) % 18;
+            var r = 10 + n; var g = 23 + n; var b = 32 + n;
 
-            # sleepers: a band of timber every 32 texels down the run
+            # sleepers: a band of dark timber every 32 texels down the run
             if ((y & 31) < 11) {
-                var m = mc_hash(x * 3, y) % 20;
-                r = 96 + m; g = 68 + m; b = 40 + m;
+                var m = mc_hash(x * 3, y) % 12;
+                r = 26 + m; g = 30 + m; b = 34 + m;
             }
-            # rails: two bright steel strips running along the track
-            # ⚠ both rails inside u 0..63 — the right half is rock now
-            if (x > 13) { if (x < 20) { r = 150; g = 152; b = 158; } }
-            if (x > 44) { if (x < 51) { r = 150; g = 152; b = 158; } }
 
-            # the far-darkness texel the background quad samples
-            if (x == 0) { if (y == 0) { r = 12; g = 10; b = 14; } }
+            # ⚠ BOTH RAILS INSIDE u 0..63 — the right half is rock. The rail centres sit at about a
+            # third of the bore width either side of centre, matching the design plate.
+            # Emissive core with a one-texel bloom shoulder, so the rail reads as lit rather than
+            # painted even when it is only two pixels wide at distance.
+            if (x >= 19) { if (x <= 23) { r = 79;  g = 227; b = 255; } }
+            if (x >= 41) { if (x <= 45) { r = 79;  g = 227; b = 255; } }
+            if (x == 18) { r = 34; g = 96;  b = 116; }
+            if (x == 24) { r = 34; g = 96;  b = 116; }
+            if (x == 40) { r = 34; g = 96;  b = 116; }
+            if (x == 46) { r = 34; g = 96;  b = 116; }
+            # a brighter running crown along the rail head
+            if (x == 21) { r = 168; g = 236; b = 255; }
+            if (x == 43) { r = 168; g = 236; b = 255; }
+
+            # the far-darkness texel the cap quad samples
+            if (x == 0) { if (y == 0) { r = 10; g = 23; b = 32; } }
 
             store32(&mc_tex_a + (y * MC_TEX + x) * 4, mc_rgb(r, g, b));
             x = x + 1;
@@ -78,23 +99,27 @@ fn mc_tex_floor(): i64 {
     return 0;
 }
 
-# ---- the walls: rough hewn rock with a few darker seams --------------------------------------
+# ---- the walls: cold wet rock, blocky courses, a scatter of ore -----------------------------------
 fn mc_tex_rock(): i64 {
     var y = 0;
     while (y < MC_TEX) {
         var x = 0;
         while (x < MC_TEX) {
-            var n = mc_hash(x + 7, y + 11) % 38;
-            var r = 72 + n; var g = 66 + n; var b = 60 + n;
+            # #123642 drifting toward #0a1720
+            var n = mc_hash(x + 7, y + 11) % 26;
+            var r = 14 + n / 2; var g = 40 + n; var b = 50 + n;
 
             # blocky courses, so the perspective has something rectilinear to shear
-            if ((y & 15) == 0) { r = r - 26; g = g - 24; b = b - 22; }
+            if ((y & 15) == 0) { r = r - 8; g = r - 6; b = b - 18; }
             var off = 0;
             if ((y & 31) < 16) { off = 8; }
-            if (((x + off) & 31) == 0) { r = r - 26; g = g - 24; b = b - 22; }
+            if (((x + off) & 31) == 0) { r = r - 8; g = g - 14; b = b - 18; }
 
-            # a scatter of ore glints, so a still frame is not uniform noise
-            if ((mc_hash(x, y * 5) % 211) == 0) { r = 168; g = 148; b = 84; }
+            # ⭐ ore glints in amber — the ONLY warm colour in the mine, and rare enough that a still
+            # frame is not uniform noise while a moving one sparkles.
+            if ((mc_hash(x, y * 5) % 701) == 0) { r = 176; g = 128; b = 58; }
+            # rarer magenta seams: the thing the Trust actually wants
+            if ((mc_hash(x * 11, y) % 2237) == 0) { r = 150; g = 52; b = 128; }
 
             store32(&mc_tex_b + (y * MC_TEX + x) * 4, mc_rgb(r, g, b));
             x = x + 1;
@@ -107,7 +132,7 @@ fn mc_tex_rock(): i64 {
 # build the combined texture: floor material in u 0..63, rock in u 64..127
 fn mc_tex_init(): i64 {
     mc_tex_floor();                       # fills the whole 128x128 with the floor material
-    mc_tex_rock();                        # ... then overwrites the right half with rock
+    mc_tex_rock();                        # ... then the right half is overwritten with rock
     var y = 0;
     while (y < MC_TEX) {
         var x = 64;

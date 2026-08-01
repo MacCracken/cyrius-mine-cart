@@ -1,0 +1,258 @@
+# config.cyr — THE tunables. One block, every constant named, every unit stated.
+#
+# ⭐ WHY THESE ARE ALL IN ONE FILE. A magic number buried in a function is a number nobody can retune
+# without reading the function, and this game's whole design premise is that the feel comes out of
+# the numbers — brake ramp, lean threshold, curve force, derail patience. Tuning has to be a diff of
+# this file and nothing else. If you find yourself typing a literal into track.cyr or cart.cyr,
+# it belongs here instead.
+#
+# ⚠ The texture's own constants (MC_TEX, MC_TEX_HALF, MC_TEXFULL) stay in tex.cyr, next to the code
+# that paints with them. Everything that shapes the world or the projection is here.
+# ⛔ ONE DECLARATION EACH. A second `var MC_W = ...` anywhere would not be an error — Cyrius lets the
+# last one win, silently, across the WHOLE program including code compiled before it.
+#
+# ⛔ UNITS ARE NOT DECORATION. Three different scales coexist and mixing them is the easiest way to
+# produce a game that is subtly wrong everywhere:
+#     SIM CENTIMETRES  — the world. 1 unit = 1 cm. Track length, speed, depth.
+#     SUB-UNITS        — position inside a segment. 65536 per segment, so a u16 covers it exactly.
+#     RENDER UNITS     — what the projector eats. 1 ru = 8 cm  (see MC_CM2RU_SH in geom.cyr).
+#     BRADS            — angle. 65536 = one full turn. Never degrees, never radians.
+#     Q16.16           — fixed-point reals. 65536 = 1.0.
+
+# ---- the tick ---------------------------------------------------------------------------------
+# The simulation is a fixed 60 Hz step and reads no clock. Rendering may drop frames; the sim never
+# does. This is what makes "same seed + same input log = the same frame 10000" true.
+var CFG_TICK_HZ = 60;                # simulation steps per second
+
+# ---- segments --------------------------------------------------------------------------------
+var CFG_SEG_CM      = 256;           # cm of track per segment (2.56 m)
+var CFG_SUB_PER_SEG = 65536;         # position sub-units inside one segment (u16 covers it exactly)
+var CFG_SUB_PER_CM  = 256;           # 65536 / 256 — sim cm = pos_sub >>> 8
+
+# ⭐ THE RING IS 128 ENTRIES BUT ONLY 96 ARE LIVE, AND THE GAP IS THE WHOLE POINT.
+# ⛔ The design called for a 96-entry ring. 96 is not a power of two, so the index has to be `% 96`
+# — and `%` on a u16 segment counter BREAKS AT THE WRAP: 65535 % 96 = 63 but the next segment, 0,
+# gives 0, teleporting the ring 64 entries sideways in a single tick after ~2 h 20 min of play.
+# `& 95` is not a fix; it is a different wrong answer (65535 & 95 = 95).
+# ⇒ The allocation is 128 so the index is a MASK (`& 127`) that cannot ever be wrong, and the live
+#   window stays at the 96 the design asked for. 32 entries of slack is 6 KB and buys an entire
+#   class of bug going away.
+var CFG_RING_SLOTS = 128;            # ring allocation — MUST be a power of two (mask index)
+var CFG_RING_MASK  = 127;            # CFG_RING_SLOTS - 1
+var CFG_RING_LIVE  = 96;             # segments kept live = 24576 cm = 245.76 m of track
+var CFG_GEN_AHEAD  = 48;             # segments generated beyond the cart = 12288 cm = 122.88 m
+                                     # ⚠ 3x the 4096 cm far plane, so the horizon is never unwritten
+
+# ---- curvature -------------------------------------------------------------------------------
+# Brads of heading change per segment. Positive curves right.
+#
+# ⛔ CFG_CURVE_ABI_MAX IS A CLIFF, NOT A GUIDELINE. Past it the accumulated centre-line pushes a
+# vertex outside the |coordinate| <= 4096 px window, which does not clip that triangle — it makes
+# the kernel refuse THE WHOLE BATCH, and the frame comes back as whatever was in the slot before.
+# On iron that is a black screen. Bisected at 12875 for the worst-case draw-rect offset (960,520);
+# 12800 is the round number below it.
+# ⭐ The DESIGN band is 128..1024, two orders of magnitude below the cliff:
+#      128 brads/seg = 208 m radius = 0.19 g at 20 m/s   (a long sweep)
+#     1024 brads/seg =  26 m radius = 1.56 g at 20 m/s   (a hard bend)
+#    12800 brads/seg =   2 m radius                       (physically absurd; the clamp, not a target)
+# That 12x margin between the hardest curve the generator will ever emit and the ABI limit is
+# deliberate headroom, because the limit is a black screen rather than a graphical artefact.
+var CFG_CURVE_ABI_MAX = 12800;       # brads/segment — HARD clamp, never exceed
+var CFG_CURVE_MAX     = 1024;        # brads/segment — hardest curve the generator will emit
+var CFG_CURVE_RAMP    = 128;         # brads/segment of change per segment — curvature continuity
+                                     # ⚠ a STEP change in curve is a visible kink in the rail
+
+# ---- grade -----------------------------------------------------------------------------------
+# Brads of pitch per segment. POSITIVE IS DOWN (+y is down in the projector, and DEEPVEIN descends).
+var CFG_GRADE_MAX     = 512;         # brads/segment — steepest pitch
+var CFG_GRADE_RAMP    = 48;          # brads/segment of change per segment
+var CFG_GRADE_BIAS    = 96;          # brads/segment the generator leans downhill on average
+                                     # ⭐ the shaft goes DOWN; depth in metres is the score axis
+
+# ---- generator phrasing ------------------------------------------------------------------------
+# The track is generated as PHRASES — a run of segments holding one curve target, then a transition.
+# ⚠ Pure per-segment randomness reads as noise, not as a mine. A driver can only learn a track that
+# has shape, and a phrase length in this band is roughly 1-4 seconds at speed.
+var CFG_PHRASE_MIN    = 9;           # segments in one curve phrase (23.0 m)
+var CFG_PHRASE_MAX    = 26;          # segments (66.6 m)
+var CFG_STRAIGHT_PCT  = 34;          # percent of phrases that are dead straight — the rest breathe
+
+# ---- segment kinds ----------------------------------------------------------------------------
+# ⚠ Values are frozen: they are written into the ring and read by the renderer and (later) the
+# collision walk. Renumbering them silently changes what an already-generated chapter means.
+var KIND_PLAIN   = 0;
+var KIND_BEAM    = 1;                # duck   — low beam / chute / hanging chain
+var KIND_GAP     = 2;                # jump   — gap / broken rail / wrecked cart
+var KIND_FORK    = 3;                # branch point
+var KIND_PICKUP  = 4;                # treasure / idol
+var KIND_GATE    = 5;                # chapter gate — the respawn anchor
+
+# ---- segment flags (bitfield) -------------------------------------------------------------------
+var FLAG_NONE    = 0;
+var FLAG_LIT     = 1;                # telegraphed branch (an unlit third branch is the shortcut)
+var FLAG_SHORTCUT = 2;
+var FLAG_HAZARD  = 4;
+
+# ---- the screen ---------------------------------------------------------------------------------
+# ⛔ BOTH AXES MUST BE MULTIPLES OF GPU_TILE (8) or the record is refused GPO_E_ALIGN — which rejects
+# the WHOLE BATCH, not one triangle, and leaves the frame as whatever the slot held before.
+var MC_W  = 640;                     # px
+var MC_H  = 400;                     # px
+var MC_CX = 320;                     # px — horizon centre x
+var MC_CY = 200;                     # px — horizon centre y
+
+# ---- the frustum ----------------------------------------------------------------------------------
+# ⭐⭐ 16:1 IS THE CEILING THE ABI IMPOSES, NOT A PREFERENCE, AND THE GEOMETRY USES ALL OF IT.
+# w must lie in [256, 4096] and w is proportional to depth, so z_far/z_near can NEVER exceed 16 for
+# any choice of MC_WSC — a bigger scale pulls the near plane closer AND the far plane in by the same
+# factor. Everything nearer than the near plane is simply not drawn.
+var MC_FOCAL = 320;                  # px — projection focal length
+var MC_ZN    = 32;                   # RENDER units = 256 cm = 2.56 m.  w = 8*32  = 256, ABI floor
+var MC_ZF    = 512;                  # RENDER units = 4096 cm = 40.96 m. w = 8*512 = 4096, ABI ceiling
+var MC_WSC   = 8;                    # w = MC_WSC * rz
+
+# ⭐ THE SIM-CM -> RENDER-UNIT DIVISOR, AND WHY IT IS 8.
+# The sim thinks in centimetres; the projector's usable depth is fixed at [32, 512] render units by
+# the 16:1 w band above. At 1 ru = 1 cm that is a 0.32 m to 5.12 m view — five metres of visible
+# tunnel, which is not a game. At 1 ru = 8 cm it becomes 2.56 m to 40.96 m: a 38.4 m view, which is
+# what "riding a mine cart" needs to look like. A power of two so the conversion is a shift.
+var MC_CM2RU_SH = 3;                 # rz = sim_cm >>> 3   (1 render unit = 8 cm)
+var MC_SEG      = 32;                # RENDER units per 256 cm segment (256 >>> 3)
+                                     # ⚠ 32, not the old 60: 60 ru = 480 cm and 480 mod 256 = 224,
+                                     #   so a slab boundary could never land on a segment boundary
+var MC_SUB_PER_RU = 2048;            # 65536 / 32 — cam_ru = pos_sub >>> 11, giving 0..31
+
+# ---- the tunnel bore, in render units (+y is DOWN) ------------------------------------------------
+# ⚠ An arched section, not a box: flat floor, walls, chamfers, then a narrower ceiling. The chamfers
+# are what read as an arch at speed and cost 2 quads a slab.
+var MC_TW       = 64;                # half-width          = 512 cm (10.24 m bore)
+var MC_FLOOR_Y  = 56;                # floor below the eye = 448 cm
+var MC_CEIL_Y   = 56;                # ceiling above the eye
+var MC_ARCH_Y   = 28;                # springing line — where the wall stops and the chamfer starts
+var MC_CEIL_HW  = 32;                # ceiling half-width; the chamfer closes MC_TW -> MC_CEIL_HW
+
+# ---- the slab ladder ------------------------------------------------------------------------------
+# ⭐ NEAR SLABS MUST BE SHORTER THAN FAR ONES. A uniform 32 ru walk makes the first slab 280 px tall
+# on a 400 px screen and the last one 2 px — the near geometry is so coarse that a curve reads as a
+# polygon. The 8/16/32/64 ladder drops the worst slab to 112 px for the same triangle budget.
+# ⚠ 64 ru is the MAXIMUM far-slab length: at the design curve ceiling a single unsubdivided chord
+# that long departs from the true arc by 5 px, and at 128 ru by 25 px.
+var MC_LOD0 = 8;                     # render units per slab for rz in [32, 64)
+var MC_LOD1 = 16;                    #                            rz in [64, 128)
+var MC_LOD2 = 32;                    #                            rz in [128, 256)
+var MC_LOD3 = 64;                    #                            rz in [256, 512)
+var MC_SLAB_MAX = 24;                # endpoint array capacity; the ladder produces 17
+
+# ---- the curve integral ----------------------------------------------------------------------------
+# round(2*pi * 65536). Converts brads (65536 = one turn) into 16.16 radians.
+var MC_TAU_Q16 = 411775;
+
+# ---- the texture ---------------------------------------------------------------------------------------
+# ⛔ POWER OF TWO ON BOTH AXES IS MANDATORY AND UNCONDITIONAL. tri_persp.s masks the interpolated
+# coordinate with w-1 and h-1 on every fetch, so a non-power-of-two texture does not wrap — it reads
+# the wrong texel and paints a plausible WRONG picture. The kernel rejects it (GPO_E_TEXDIM) rather
+# than clamping, so 128 is the contract, not a preference.
+# ⚠ These live here rather than in tex.cyr because geom.cyr bands its u coordinates against them and
+# Cyrius is single-pass — geom is compiled before tex.
+var MC_TEX      = 128;               # texels on each axis
+var MC_TEXFULL  = 8388608;           # 128 << 16 — one full wrap, in 16.16 texels
+# ⭐ ONE TEXTURE, TWO MATERIALS, BANDED ALONG u — AND THE OP FORCES THIS, IT IS NOT A CHOICE.
+# op 0x0F REPLACES its entire rect, so two records over one rect do not layer: the second paints
+# opaque black over everything the first drew. The whole frame must therefore be ONE record, and one
+# record carries ONE texture. Left half is the floor (ballast, sleepers, rails), right half is rock.
+var MC_TEX_HALF = 4194304;           # 64 << 16 — the u boundary between the two materials
+
+# ---- the draw rect's origin on screen ---------------------------------------------------------------------
+# ⚠ BOTH MUST BE MULTIPLES OF 8 or the record is GPO_E_ALIGN. On an 800x600 console the exact centre
+# is (80,100) and 100 is NOT a multiple of 8, which is why gpu.cyr masks these down rather than
+# centring exactly. Set at runtime by mc_fbinfo().
+var MC_DX = 0;
+var MC_DY = 0;
+
+# ⛔ NO BACKGROUND QUAD. op 0x0F fills its whole rect with bg before any triangle lands, so a
+# full-screen quad to "clear" was always redundant. Named because the gate must skip it when
+# measuring coverage — counting a full-screen quad would make an empty-tunnel frame look full.
+var MC_BG_TRIS = 0;
+
+# ---- ABI limits, reproduced so the game refuses what the kernel would ---------------------------------
+# ⛔ A single bad record does not draw one bad triangle — it makes syscall(92) reject THE WHOLE BATCH.
+var MC_TRI_MAX   = 256;              # per record; the kernel's GPU_TPER_LIST_MAX is 256
+                                     # ⚠ RAISED FROM 128. The arched section emits 12 triangles a
+                                     #   slab * 16 slabs = 192, which does not fit in 128.
+                                     #   mc_vtx_a/b MUST be [2048] to match — see mc_bufs_ok().
+var MC_W_MIN     = 256;
+var MC_W_MAX     = 4096;
+var MC_COORD_MAX = 268435456;        # 2^28 (i.e. +-4096 px in 16.16)
+var MC_D_MAX     = 2147483647;       # 2^31-1
+var MC_AREA_MIN  = 65536;
+var MC_AREA_MAX  = 4398046511104;
+
+# ---- speed ----------------------------------------------------------------------------------------
+# ⭐ THE CART ALWAYS MOVES FORWARD. The player controls speed, lateral lean and their hands — never
+# whether the descent continues. CFG_SPEED_MIN is what the brake bottoms out at, not a stop.
+# Sub-units per tick at 60 Hz. 256 sub = 1 cm, so sub/tick * 60 / 256 = cm/s.
+#   12208 sub/tick = 47.7 cm/tick = 28.6 m/s = 103 km/h   (the design plate's top speed)
+#   11378 sub/tick =                26.7 m/s =  96 km/h   (the plate's REDLINE)
+#    2844 sub/tick =                 6.7 m/s =  24 km/h   (brake floor)
+# ⭐ 103 km/h IS EARNED, NOT GIVEN — and this is the cleanest reading of the design plate. The bar
+# redlines at 96 and the run-summary reports a top speed of 103, so the last 7 km/h should be
+# something the player DID rather than something the throttle hands them. The base cap is the
+# redline; only a clean apex release pushes past it, and only while the bonus lasts.
+var CFG_SPEED_MAX     = 12208;       # sub/tick — 103 km/h, the absolute ceiling (bonus included)
+var CFG_SPEED_BASE    = 11378;       # sub/tick —  96 km/h, the cap WITHOUT an apex bonus
+var CFG_SPEED_REDLINE = 11378;       # sub/tick —  96 km/h, where the HUD bar turns amber
+var CFG_SPEED_MIN     = 2844;        # sub/tick —  24 km/h, the brake floor
+var CFG_SPEED_START   = 5688;        # sub/tick —  48 km/h, speed at the chapter gate
+
+# ⚠ Ramps are Q16.16 sub-units per tick, PER TICK. Released, the cart reaches top speed from the
+# brake floor in about 4 s; braking bottoms out in about 1.5 s. The asymmetry is the point — braking
+# is cheap and rebuilding speed is not, which is what makes an unnecessary brake cost real time.
+var CFG_ACCEL = 2555904;             # Q16.16: 39.0 sub/tick per tick  (~4.0 s floor -> max)
+var CFG_BRAKE = 6815744;             # Q16.16: 104.0 sub/tick per tick (~1.5 s max -> floor)
+
+# ---- lean -------------------------------------------------------------------------------------------
+# Lateral offset from the centre line, in Q16.16 RENDER UNITS (1 ru = 8 cm). The bore half-width is
+# MC_TW = 64 ru, so the wall is 512 cm away.
+# ⭐ THE MARGIN MUST BE FELT, NOT READ. There is no lean bar in the frame; what the player sees is the
+# wall getting closer, because lean IS the camera's lateral offset. The warning levels below exist so
+# sparks and wheel-lift can be hung off them later, not so a number can be displayed.
+var CFG_LEAN_THRESH  = 2228224;      # Q16.16 = 34 ru = 272 cm — past here, the derail clock runs
+var CFG_LEAN_MAX     = 3670016;      # Q16.16 = 56 ru = 448 cm — hard clamp, keeps the cart in the bore
+var CFG_DERAIL_TICKS = 30;           # consecutive ticks past the threshold before the cart is lost
+
+# ⚠ THE CENTRIFUGAL TERM IS THE WHOLE DIFFICULTY CURVE: force = curve * speed^2. Squaring speed is
+# what makes the brake a real decision rather than a penalty — at half speed a curve pushes a QUARTER
+# as hard, so braking into a bend buys far more control than the time it costs.
+# Calibrated so that at the design curve ceiling (1024 brads/seg) and full speed, a player doing
+# NOTHING drifts from centre to the derail threshold in about 2 seconds.
+var CFG_LEAN_FORCE  = 3840;          # Q16.16 ru/tick^2 at curve 1024 and full speed
+var CFG_LEAN_INPUT  = 7200;          # Q16.16 ru/tick^2 of counter-lean authority (~1.9x the force)
+var CFG_LEAN_DAMP   = 60293;         # Q16.16 = 0.92 — velocity retained per tick
+var CFG_LEAN_SPRING = 24;            # Q16.16 ru/tick^2 per ru — the rail's gentle self-centring
+
+# ---- the apex bonus -----------------------------------------------------------------------------------
+# ⭐ THE OPTIMAL LINE MUST BE RHYTHMIC, NOT HELD-BRAKE. Braking into a bend and releasing at the apex
+# pays a speed bonus; sitting on the brake through the whole curve does not. Without this the safest
+# play is also the slowest, and the game becomes a test of patience.
+var CFG_APEX_MIN_CURVE = 192;        # brads/seg below which a bend is too gentle to score
+var CFG_APEX_BONUS     = 1200;       # sub/tick granted on a clean apex release
+var CFG_APEX_DECAY     = 24;         # sub/tick the bonus sheds each tick
+
+# ---- input bits -----------------------------------------------------------------------------------------
+# ⭐ THE SIM SEES ONLY THIS WORD. Not the keyboard, not scancodes, not a device — one bitfield per
+# tick. That is the determinism boundary: record the words and the whole run replays exactly, and it
+# is why the replay test in step 11 is cheap rather than a rewrite.
+var IN_LEFT  = 1;
+var IN_RIGHT = 2;
+var IN_BRAKE = 4;
+var IN_JUMP  = 8;
+var IN_DUCK  = 16;
+var IN_WHIP  = 32;
+var IN_QUIT  = 64;
+
+# ---- the chapter --------------------------------------------------------------------------------
+# ⭐ ONE SEED PER CHAPTER, AND DEATH REPLAYS IT EXACTLY. The player is meant to learn a specific
+# stretch of track, so a death must return them to the same track — not to a fresh sample from the
+# same distribution. The seed is mixed with the chapter index rather than re-derived, so chapter 3
+# of seed 7714 is always the same 245 m of mine.
+var CFG_SEED_DEFAULT = 7714;         # "SEED 7714-KV" on the title card
