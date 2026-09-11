@@ -134,9 +134,23 @@ gate holds those to zero.
 
 ## Why it is fullscreen and not a window
 
-Not because there is no desktop — there is. aethersafha runs on AGNOS, grants windows, and already
-composites client surfaces on the GPU; setu even asks the kernel for a client's buffer as a `#86`
-carveout slot, so the client→compositor transport is already GPU-visible memory.
+Not because there is no desktop — there is. aethersafha runs on AGNOS and composites its own surface
+on the GPU; setu asks the kernel for a client's buffer as a `#86` carveout slot, so a client buffer
+is already GPU-visible memory.
+
+> ⛔ **Corrected 2026-08-03.** This paragraph used to add that aethersafha "grants windows" and that
+> "the client→compositor **transport** is already GPU-visible memory," implying a settled client path
+> on agnos. It isn't settled: **the client↔compositor transport on agnos is being replaced.** setu's
+> control channel rode TCP on loopback:7700, retired 2026-08-03 as the **wrong primitive** for a local
+> display protocol — nothing to route, nothing to checksum, no business owning a port — in favour of
+> the agnos socket (`anu`), agnos `planning/ipc.md` §9–§10. It is *not* retired for being broken:
+> before agnos 1.56.34 / `net_src_for` it could not complete a handshake on an ordinary boot (every
+> outbound segment claimed `net_ip` as its source), but afterwards it **did** connect un-rigged —
+> `aethersafha-clients-test.py` reached "connected: 2, presented: 2" on 2026-08-02, QEMU `-smp 1`
+> only, never on iron, and `-smp 4` fault-kills. The greens that came from the
+> `AETHERSAFHA_SETU_SELFTEST` kernel hook assigning `net_ip = 0x7F000001` remain **false greens**;
+> hook and smokes are deleted. The `#86` carveout and the GPU reasoning below are unaffected either
+> way — they are about *memory*, not transport.
 
 The boundary is that **no GPU op that writes colour lets the caller name where the colour goes.**
 `gpu_tri_persp` derives its destination from two kernel module globals (`gpu_bb_a_mc`/`gpu_bb_b_mc`),

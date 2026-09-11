@@ -8,7 +8,10 @@
 #   #92 gpu_shader_op  TWO records: floor+ceiling+background, then walls. ONE dispatch.
 #   #90 gpu_readback   copy the drawn rect OUT of the blit back buffer into the readback slot
 #   #73 shm_read       carry it into the game's own buffer
-#   #39 blit / setu    present
+#   #39 blit / setu    present  (⛔ the setu leg is NOT available on agnos — its TCP-on-loopback
+#                                transport is retired as the wrong primitive for a local display
+#                                protocol, pending the agnos socket (`anu`); #39 fullscreen is
+#                                the only present path today. See vendor/setu.cyr.)
 #
 # ⛔ op 0x0F DRAWS INTO THE KERNEL'S BLIT BACK BUFFER (gpu_bb_a_mc / gpu_bb_b_mc), not into a
 # buffer this program owns and not into a render-target handle. That is why #90 exists and why the

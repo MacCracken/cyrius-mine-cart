@@ -14,11 +14,24 @@
 #   --frames N  bound the ride (0 = until the track runs out of patience)
 #   --trace     report every dropped triangle, for diagnosis
 #
-# ⛔ WHY THERE IS NO WINDOWED MODE, precisely — the loose answer ("no desktop yet") is FALSE and
-# would rot: aethersafha runs on agnos, grants windows, and already composites client surfaces on
-# the GPU. Software clients get windows because they rasterise into their own buffer, and setu asks
-# the kernel for that buffer as a #86 carveout slot, so the client→compositor transport is already
-# GPU-visible memory. The transport is not the problem.
+# ⛔ WHY THERE IS NO WINDOWED MODE, precisely. aethersafha runs on agnos and composites its own
+# surface on the GPU, and setu asks the kernel for a client's pixel buffer as a #86 carveout slot,
+# so a client's PIXELS are GPU-visible memory.
+#
+# ⛔ CORRECTED 2026-08-03 — this comment used to add that aethersafha "grants windows" and that "the
+# client→compositor transport is already GPU-visible memory ... the transport is not the problem."
+# That was FALSE, but so is the blunter correction that first replaced it. The accurate statement:
+# **the client↔compositor transport on agnos is being REPLACED.** setu's control channel rode TCP on
+# loopback:7700, retired 2026-08-03 as the WRONG PRIMITIVE for a local display protocol — nothing to
+# route, nothing to checksum, no business owning a port — with the agnos socket (`anu`) as the
+# replacement (agnos `docs/development/planning/ipc.md` §9/§10). It is NOT retired for being broken:
+# before agnos 1.56.34 / `net_src_for` it could not complete a handshake on an ordinary boot (every
+# outbound segment claimed `net_ip` as its source), but after `net_src_for` it DID connect un-rigged
+# — `aethersafha-clients-test.py` reached "connected: 2, presented: 2" on 2026-08-02 (QEMU `-smp 1`
+# only; never iron, `-smp 4` fault-kills). The greens that came from the `AETHERSAFHA_SETU_SELFTEST`
+# kernel hook assigning `net_ip = 0x7F000001` remain FALSE GREENS; hook and smokes are DELETED.
+# So the transport is in flux, and that is a second, independent reason there is no windowed mode
+# yet. The GPU-addressing reason below is the durable one and stands entirely on its own.
 #
 # The problem is that **no GPU op that writes colour lets the caller name where the colour goes.**
 # gpu_tri_persp derives its destination from two kernel module globals (gpu_bb_a_mc / gpu_bb_b_mc,
