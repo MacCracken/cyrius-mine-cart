@@ -623,9 +623,9 @@ fn ctt_placement(): i64 {
 
     # ⚠ a stacked pair must be spaced wider than the longest commitment, or the chain is impossible
     ctt_true("pair spacing exceeds the crouch",
-             CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_CROUCH_TICKS);
+      CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_CROUCH_TICKS);
     ctt_true("pair spacing exceeds the jump",
-             CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_JUMP_TICKS);
+      CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_JUMP_TICKS);
     return 0;
 }
 

@@ -8,7 +8,7 @@ language = "cyrius"
 # Pinned to the toolchain agnos itself builds with, so the game and the kernel whose ABI it
 # consumes are compiled by the same compiler. Do not chase the cyrius tip here — the pin that
 # matters is the one the ABI was proven under.
-cyrius = "6.4.78"
+cyrius = "6.6.2"
 
 [build]
 src = "src/main.cyr"

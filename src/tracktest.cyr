@@ -111,7 +111,7 @@ fn trt_wrap(): i64 {
     trt_eq("slot(65535)", trk_slot(65535), 65535 & 127);
     trt_eq("slot(65536)", trk_slot(65536), 0);
     trt_true("slot(65536) follows slot(65535)",
-             ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
+      ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
 
     # the u16 VIEW still wraps, because that is its declared width
     trk_reset(CFG_SEED_DEFAULT, 0);
@@ -130,10 +130,10 @@ fn trt_wrap(): i64 {
     var u16_before = 65535 % 96;          # what a modulo ring indexed by pos_seg would give at 65535
     var u16_after  = 0 % 96;              # ...and one segment later, after the u16 wraps
     trt_true("indexing off the u16 view TELEPORTS the ring",
-             ((u16_before + 1) % 96) != u16_after);
+      ((u16_before + 1) % 96) != u16_after);
     # the absolute counter, over the same one-segment step, does not
     trt_true("indexing off the absolute counter does not",
-             ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
+      ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
     return 0;
 }
 

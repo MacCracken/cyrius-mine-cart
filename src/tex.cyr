@@ -168,7 +168,7 @@ fn mc_tex_init(): i64 {
         var x = 64;
         while (x < MC_TEX) {
             store32(&mc_tex_a + (y * MC_TEX + x) * 4,
-                    load32(&mc_tex_b + (y * MC_TEX + x) * 4) & 0xFFFFFFFF);
+              load32(&mc_tex_b + (y * MC_TEX + x) * 4) & 0xFFFFFFFF);
             x = x + 1;
         }
         y = y + 1;

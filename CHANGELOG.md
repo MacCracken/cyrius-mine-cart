@@ -117,3 +117,12 @@ to use the 3D ops at all.
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
 [0.1.0]: https://github.com/MacCracken/cyrius-mine-cart/releases/tag/0.1.0
+
+## [Unreleased]
+
+## [0.2.1] - 2026-09-11
+
+### Changed
+
+- **Toolchain `6.4.78` → `6.6.2`.** No source change; the value form needed none.
+  Build, tests and every bench/fuzz/distlib target re-verified at the new pin.

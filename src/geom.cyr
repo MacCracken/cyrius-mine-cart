@@ -376,8 +376,8 @@ fn mc_build(cam_x): i64 {
     var ct = mc_py(capy - MC_CEIL_Y, capz);
     var cb = mc_py(capy + MC_FLOOR_Y, capz);
     mc_quad(&mc_vtx_a, &mc_n_a,
-            cl, ct, capw, MC_TEX_CAPDARK, 0,   cr, ct, capw, MC_TEX_CAPDARK, 0,
-            cr, cb, capw, MC_TEX_CAPDARK, 0,   cl, cb, capw, MC_TEX_CAPDARK, 0);
+      cl, ct, capw, MC_TEX_CAPDARK, 0,   cr, ct, capw, MC_TEX_CAPDARK, 0,
+      cr, cb, capw, MC_TEX_CAPDARK, 0,   cl, cb, capw, MC_TEX_CAPDARK, 0);
 
     var k = mc_nslab - 2;
     while (k >= 0) {
@@ -417,8 +417,8 @@ fn mc_build(cam_x): i64 {
         if (kind != KIND_GAP) {
             # floor — far-left, far-right, near-right, near-left. u spans the floor band.
             mc_quad(&mc_vtx_a, &mc_n_a,
-                    lf, flf, wf, 0, vf,   rf, flf, wf, F, vf,
-                    rn, fln, wn, F, vn,   ln, fln, wn, 0, vn);
+              lf, flf, wf, 0, vf,   rf, flf, wf, F, vf,
+              rn, fln, wn, F, vn,   ln, fln, wn, 0, vn);
 
             # ---- ⭐⭐ EVERY TRACK IS A STRIP, INCLUDING THE MAIN ONE ----------------------------
             # ⛔ The rails used to be painted into the floor texture, which spans the whole bore — so
@@ -429,8 +429,8 @@ fn mc_build(cam_x): i64 {
             var m0lf = mc_px(cf - GW, rzf);  var m0rf = mc_px(cf + GW, rzf);
             var m0ln = mc_px(cn - GW, rzn);  var m0rn = mc_px(cn + GW, rzn);
             mc_quad(&mc_vtx_a, &mc_n_a,
-                    m0lf, flf, wf, MC_TEX_RAILPAIR, vf,   m0rf, flf, wf, H, vf,
-                    m0rn, fln, wn, H, vn,                 m0ln, fln, wn, MC_TEX_RAILPAIR, vn);
+              m0lf, flf, wf, MC_TEX_RAILPAIR, vf,   m0rf, flf, wf, H, vf,
+              m0rn, fln, wn, H, vn,                 m0ln, fln, wn, MC_TEX_RAILPAIR, vn);
 
             # ---- ⭐⭐ SIDE TRACKS: what makes a multi-rail section READ as one -------------------
             # ⛔ WIDENING THE BORE FOR THREE RAILS AND DRAWING ONE TRACK LOOKS EXACTLY LIKE THE OLD
@@ -442,21 +442,21 @@ fn mc_build(cam_x): i64 {
             # spare; this costs 2, and only on the near half where a rail is more than a pixel.
             if (trk_multi_at(kseg) == 1) {
                 if (rzn < CFG_SIDE_RZ) { if (mc_room(4) == 1) {
-                    var R = CFG_RAIL_SEP;
-                    var sw = CFG_TRACK_HW;
-                    # left side track
-                    var slf = mc_px(cf - R - sw, rzf);  var srf = mc_px(cf - R + sw, rzf);
-                    var sln = mc_px(cn - R - sw, rzn);  var srn = mc_px(cn - R + sw, rzn);
-                    mc_quad(&mc_vtx_a, &mc_n_a,
-                            slf, flf, wf, MC_TEX_RAILPAIR, vf,   srf, flf, wf, H, vf,
-                            srn, fln, wn, H, vn,                 sln, fln, wn, MC_TEX_RAILPAIR, vn);
-                    # right side track
-                    var tlf = mc_px(cf + R - sw, rzf);  var trf = mc_px(cf + R + sw, rzf);
-                    var tln = mc_px(cn + R - sw, rzn);  var trn = mc_px(cn + R + sw, rzn);
-                    mc_quad(&mc_vtx_a, &mc_n_a,
-                            tlf, flf, wf, MC_TEX_RAILPAIR, vf,   trf, flf, wf, H, vf,
-                            trn, fln, wn, H, vn,                 tln, fln, wn, MC_TEX_RAILPAIR, vn);
-                } }
+                        var R = CFG_RAIL_SEP;
+                        var sw = CFG_TRACK_HW;
+                        # left side track
+                        var slf = mc_px(cf - R - sw, rzf);  var srf = mc_px(cf - R + sw, rzf);
+                        var sln = mc_px(cn - R - sw, rzn);  var srn = mc_px(cn - R + sw, rzn);
+                        mc_quad(&mc_vtx_a, &mc_n_a,
+                          slf, flf, wf, MC_TEX_RAILPAIR, vf,   srf, flf, wf, H, vf,
+                          srn, fln, wn, H, vn,                 sln, fln, wn, MC_TEX_RAILPAIR, vn);
+                        # right side track
+                        var tlf = mc_px(cf + R - sw, rzf);  var trf = mc_px(cf + R + sw, rzf);
+                        var tln = mc_px(cn + R - sw, rzn);  var trn = mc_px(cn + R + sw, rzn);
+                        mc_quad(&mc_vtx_a, &mc_n_a,
+                          tlf, flf, wf, MC_TEX_RAILPAIR, vf,   trf, flf, wf, H, vf,
+                          trn, fln, wn, H, vn,                 tln, fln, wn, MC_TEX_RAILPAIR, vn);
+                    } }
             }
         }
 
@@ -465,14 +465,14 @@ fn mc_build(cam_x): i64 {
         # 40 m away is two pixels and just adds noise to the horizon.
         if (kind == KIND_BEAM) {
             if (rzn < CFG_BEAM_RZ) { if (mc_room(2) == 1) {
-                var bt_n = mc_py(gn - MC_ARCH_Y, rzn);
-                var bb_n = mc_py(gn - MC_ARCH_Y + 14, rzn);
-                var bt_f = mc_py(gf - MC_ARCH_Y, rzf);
-                var bb_f = mc_py(gf - MC_ARCH_Y + 14, rzf);
-                mc_quad(&mc_vtx_a, &mc_n_a,
-                        lf, bt_f, wf, H, vf,   rf, bt_f, wf, T, vf,
-                        rn, bb_n, wn, T, vn,   ln, bb_n, wn, H, vn);
-            } }
+                    var bt_n = mc_py(gn - MC_ARCH_Y, rzn);
+                    var bb_n = mc_py(gn - MC_ARCH_Y + 14, rzn);
+                    var bt_f = mc_py(gf - MC_ARCH_Y, rzf);
+                    var bb_f = mc_py(gf - MC_ARCH_Y + 14, rzf);
+                    mc_quad(&mc_vtx_a, &mc_n_a,
+                      lf, bt_f, wf, H, vf,   rf, bt_f, wf, T, vf,
+                      rn, bb_n, wn, T, vn,   ln, bb_n, wn, H, vn);
+                } }
         }
 
         # ⚠ TREASURE sits in its lane, just above the sleepers. Small, bright, and only drawn near —
@@ -480,48 +480,48 @@ fn mc_build(cam_x): i64 {
         # costing triangles buys nothing.
         if (kind == KIND_PICKUP) {
             if (rzn < CFG_PICKUP_RZ) { if (mc_room(2) == 1) {
-                var px = trk_lane_x(trk_lane_at(kseg)) - cam_x + cn;
-                var p_l = mc_px(px - 5, rzn);
-                var p_r = mc_px(px + 5, rzn);
-                var p_b = mc_py(gn + MC_FLOOR_Y - 2, rzn);
-                var p_t = mc_py(gn + MC_FLOOR_Y - 16, rzn);
-                # ⛔ A CONSTANT ATTRIBUTE AT ALL FOUR CORNERS. Spanning the floor band made every
-                # treasure a fragment of whatever floor texels it happened to cross — on screen they
-                # read as random slivers of rail. One texel, one solid colour, one readable object.
-                mc_quad(&mc_vtx_a, &mc_n_a,
-                        p_l, p_t, wn, MC_TEX_ORE, 0,   p_r, p_t, wn, MC_TEX_ORE, 0,
-                        p_r, p_b, wn, MC_TEX_ORE, 0,   p_l, p_b, wn, MC_TEX_ORE, 0);
-            } }
+                    var px = trk_lane_x(trk_lane_at(kseg)) - cam_x + cn;
+                    var p_l = mc_px(px - 5, rzn);
+                    var p_r = mc_px(px + 5, rzn);
+                    var p_b = mc_py(gn + MC_FLOOR_Y - 2, rzn);
+                    var p_t = mc_py(gn + MC_FLOOR_Y - 16, rzn);
+                    # ⛔ A CONSTANT ATTRIBUTE AT ALL FOUR CORNERS. Spanning the floor band made every
+                    # treasure a fragment of whatever floor texels it happened to cross — on screen they
+                    # read as random slivers of rail. One texel, one solid colour, one readable object.
+                    mc_quad(&mc_vtx_a, &mc_n_a,
+                      p_l, p_t, wn, MC_TEX_ORE, 0,   p_r, p_t, wn, MC_TEX_ORE, 0,
+                      p_r, p_b, wn, MC_TEX_ORE, 0,   p_l, p_b, wn, MC_TEX_ORE, 0);
+                } }
         }
 
         # left wall — u runs floor-to-springing so the rock does not smear
         mc_quad(&mc_vtx_a, &mc_n_a,
-                lf, arf, wf, H, vf,   lf, flf, wf, T, vf,
-                ln, fln, wn, T, vn,   ln, arn, wn, H, vn);
+          lf, arf, wf, H, vf,   lf, flf, wf, T, vf,
+          ln, fln, wn, T, vn,   ln, arn, wn, H, vn);
 
         # right wall
         mc_quad(&mc_vtx_a, &mc_n_a,
-                rf, flf, wf, H, vf,   rf, arf, wf, T, vf,
-                rn, arn, wn, T, vn,   rn, fln, wn, H, vn);
+          rf, flf, wf, H, vf,   rf, arf, wf, T, vf,
+          rn, arn, wn, T, vn,   rn, fln, wn, H, vn);
 
         # ⭐ THE CHAMFERS ARE WHAT MAKE IT AN ARCH. Without them this is a rectangular box, which
         # reads as a corridor rather than a bored shaft. Two quads a slab is the cheapest section
         # that still has a shoulder.
         # left chamfer — springing line up to the ceiling edge
         mc_quad(&mc_vtx_a, &mc_n_a,
-                clf, cef, wf, H, vf,   lf,  arf, wf, T, vf,
-                ln,  arn, wn, T, vn,   cln, cen, wn, H, vn);
+          clf, cef, wf, H, vf,   lf,  arf, wf, T, vf,
+          ln,  arn, wn, T, vn,   cln, cen, wn, H, vn);
 
         # right chamfer
         mc_quad(&mc_vtx_a, &mc_n_a,
-                rf,  arf, wf, H, vf,   crf, cef, wf, T, vf,
-                crn, cen, wn, T, vn,   rn,  arn, wn, H, vn);
+          rf,  arf, wf, H, vf,   crf, cef, wf, T, vf,
+          crn, cen, wn, T, vn,   rn,  arn, wn, H, vn);
 
         # ceiling — only where the chamfers drew a separate shoulder for it to sit between
         if (rzn < CFG_CHAMFER_RZ) {
             mc_quad(&mc_vtx_a, &mc_n_a,
-                    clf, cef, wf, H, vf,   crf, cef, wf, T, vf,
-                    crn, cen, wn, T, vn,   cln, cen, wn, H, vn);
+              clf, cef, wf, H, vf,   crf, cef, wf, T, vf,
+              crn, cen, wn, T, vn,   cln, cen, wn, H, vn);
         }
 
         k = k - 1;
@@ -561,8 +561,8 @@ fn mc_build(cam_x): i64 {
     var kb  = mc_py(ccy + MC_FLOOR_Y, cz);
     var kt  = mc_py(ccy + MC_FLOOR_Y - CFG_CART_H, cz);
     mc_quad(&mc_vtx_a, &mc_n_a,
-            kl, kt, cw, MC_TEX_CART, 0,   kr, kt, cw, MC_TEX_CART, 0,
-            kr, kb, cw, MC_TEX_CART, 0,   kl, kb, cw, MC_TEX_CART, 0);
+      kl, kt, cw, MC_TEX_CART, 0,   kr, kt, cw, MC_TEX_CART, 0,
+      kr, kb, cw, MC_TEX_CART, 0,   kl, kb, cw, MC_TEX_CART, 0);
 
     return mc_n_a;
 }

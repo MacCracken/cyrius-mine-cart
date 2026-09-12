@@ -41,7 +41,7 @@ var CFG_RING_SLOTS = 128;            # ring allocation — MUST be a power of tw
 var CFG_RING_MASK  = 127;            # CFG_RING_SLOTS - 1
 var CFG_RING_LIVE  = 96;             # segments kept live = 24576 cm = 245.76 m of track
 var CFG_GEN_AHEAD  = 48;             # segments generated beyond the cart = 12288 cm = 122.88 m
-                                     # ⚠ 3x the 4096 cm far plane, so the horizon is never unwritten
+# ⚠ 3x the 4096 cm far plane, so the horizon is never unwritten
 
 # ---- curvature -------------------------------------------------------------------------------
 # Brads of heading change per segment. Positive curves right.
@@ -60,14 +60,14 @@ var CFG_GEN_AHEAD  = 48;             # segments generated beyond the cart = 1228
 var CFG_CURVE_ABI_MAX = 12800;       # brads/segment — HARD clamp, never exceed
 var CFG_CURVE_MAX     = 1024;        # brads/segment — hardest curve the generator will emit
 var CFG_CURVE_RAMP    = 128;         # brads/segment of change per segment — curvature continuity
-                                     # ⚠ a STEP change in curve is a visible kink in the rail
+# ⚠ a STEP change in curve is a visible kink in the rail
 
 # ---- grade -----------------------------------------------------------------------------------
 # Brads of pitch per segment. POSITIVE IS DOWN (+y is down in the projector, and DEEPVEIN descends).
 var CFG_GRADE_MAX     = 512;         # brads/segment — steepest pitch
 var CFG_GRADE_RAMP    = 48;          # brads/segment of change per segment
 var CFG_GRADE_BIAS    = 96;          # brads/segment the generator leans downhill on average
-                                     # ⭐ the shaft goes DOWN; depth in metres is the score axis
+# ⭐ the shaft goes DOWN; depth in metres is the score axis
 
 # ---- generator phrasing ------------------------------------------------------------------------
 # The track is generated as PHRASES — a run of segments holding one curve target, then a transition.
@@ -129,8 +129,8 @@ var MC_WSC   = 8;                    # w = MC_WSC * rz
 # what "riding a mine cart" needs to look like. A power of two so the conversion is a shift.
 var MC_CM2RU_SH = 3;                 # rz = sim_cm >>> 3   (1 render unit = 8 cm)
 var MC_SEG      = 32;                # RENDER units per 256 cm segment (256 >>> 3)
-                                     # ⚠ 32, not the old 60: 60 ru = 480 cm and 480 mod 256 = 224,
-                                     #   so a slab boundary could never land on a segment boundary
+# ⚠ 32, not the old 60: 60 ru = 480 cm and 480 mod 256 = 224,
+#   so a slab boundary could never land on a segment boundary
 var MC_SUB_PER_RU = 2048;            # 65536 / 32 — cam_ru = pos_sub >>> 11, giving 0..31
 
 # ---- the tunnel bore, in render units (+y is DOWN) ------------------------------------------------
@@ -220,9 +220,9 @@ var MC_BG_TRIS = 0;
 # ---- ABI limits, reproduced so the game refuses what the kernel would ---------------------------------
 # ⛔ A single bad record does not draw one bad triangle — it makes syscall(92) reject THE WHOLE BATCH.
 var MC_TRI_MAX   = 256;              # per record; the kernel's GPU_TPER_LIST_MAX is 256
-                                     # ⚠ RAISED FROM 128. The arched section emits 12 triangles a
-                                     #   slab * 16 slabs = 192, which does not fit in 128.
-                                     #   mc_vtx_a/b MUST be [2048] to match — see mc_bufs_ok().
+# ⚠ RAISED FROM 128. The arched section emits 12 triangles a
+#   slab * 16 slabs = 192, which does not fit in 128.
+#   mc_vtx_a/b MUST be [2048] to match — see mc_bufs_ok().
 var MC_W_MIN     = 256;
 var MC_W_MAX     = 4096;
 var MC_COORD_MAX = 268435456;        # 2^28 (i.e. +-4096 px in 16.16)
@@ -267,8 +267,8 @@ var CFG_BRAKE = 6815744;             # Q16.16: 104.0 sub/tick per tick (~1.5 s m
 var CFG_LEAN_THRESH  = 4718592;      # Q16.16 = 72 ru = 576 cm — past here, the derail clock runs
 var CFG_LEAN_MAX     = 5242880;      # Q16.16 = 80 ru = 640 cm — hard clamp, just inside the bore
 var CFG_DERAIL_TICKS = 24;           # consecutive ticks past the threshold before the cart is lost
-                                     # ⚠ 24 ticks = 0.4 s. Long enough to be a warning, short enough
-                                     #   that losing the rail at speed is not survivable by waiting.
+# ⚠ 24 ticks = 0.4 s. Long enough to be a warning, short enough
+#   that losing the rail at speed is not survivable by waiting.
 
 # ⚠⚠ THESE SCALE WITH CFG_LEAN_THRESH AND MUST BE RE-DERIVED WHENEVER THE BORE CHANGES.
 # Widening the bore for three rails moved the threshold 34 -> 48 ru: the distance to failure grew by
@@ -377,8 +377,8 @@ var CFG_PICKUP_PCT   = 22;           # percent of non-hazard segments carrying t
 var CFG_PICKUP_REACH = 20;           # render units either side that counts as a grab (160 cm)
 var CFG_PICKUP_LANES = 3;            # left / centre / right
 var CFG_PICKUP_LANE_RU = 44;         # lateral offset of the outer lanes, render units
-                                     # ⚠ EQUAL TO CFG_RAIL_SEP on purpose: a pickup lane IS a rail on
-                                     #   a multi-rail section, so the two must not drift apart.
+# ⚠ EQUAL TO CFG_RAIL_SEP on purpose: a pickup lane IS a rail on
+#   a multi-rail section, so the two must not drift apart.
 
 # ---- rails ------------------------------------------------------------------------------------------
 # ⭐ THREE RAILS SIDE BY SIDE, hopped between with jump + a direction. The outer centres sit at 45% of
@@ -413,8 +413,8 @@ var CFG_CART_H     = 22;             # cart body height above the rail head
 var CFG_CART_RZ    = 124;            # render units ahead of the camera the cart is drawn at
 var CFG_RAIL_CLEAR = 8;              # clearance between adjacent carts, render units (64 cm)
 var CFG_RAIL_SEP   = 44;             # = 2*CFG_CART_HW + CFG_RAIL_CLEAR. 3.52 m centre-to-centre.
-                                     # ⚠ 3 tracks then span +-62 of the +-84 bore, leaving 22 ru of
-                                     #   ballast each side — a chamber with room, not a corridor.
+# ⚠ 3 tracks then span +-62 of the +-84 bore, leaving 22 ru of
+#   ballast each side — a chamber with room, not a corridor.
 var CFG_RAILS_MAX  = 3;              # -1 = left, 0 = centre, +1 = right
 # ⚠ Half the gauge, in render units. 8 ru = 128 cm between the rails — a real mine gauge, and narrow
 # enough that three tracks at 22 ru spacing leave a visible 6 ru of ballast between them.
