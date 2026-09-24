@@ -12,9 +12,14 @@
 
 include "lib/io.cyr"
 include "src/say.cyr"
-include "src/geom.cyr"
+# ⛔ config.cyr, NOT geom.cyr. This used to include geom.cyr for the texture constants, which stopped
+# compiling the day those constants moved to config.cyr and geom grew a dependency on the track and
+# the fixed-point core — ten undefined names, and a tool nobody could rebuild sitting in build/ as a
+# fossil. The texture needs the constants and nothing else.
+include "src/config.cyr"
 include "src/tex.cyr"
 
+# print min / max / mean per channel of one 128x128 texture, and three probe texels
 fn dt_stats(name, base): i64 {
     var minr = 999; var maxr = 0 - 1; var sumr = 0;
     var ming = 999; var maxg = 0 - 1; var sumg = 0;
@@ -45,14 +50,15 @@ fn dt_stats(name, base): i64 {
     return 0;
 }
 
+# build the texture, print its statistics, and write both passes out as raw BGRA
 fn main(): i64 {
     mc_tex_init();
     var bytes = MC_TEX * MC_TEX * 4;
     ps("dumptex: "); pn(MC_TEX); ps("x"); pn(MC_TEX); ps(", "); pn(bytes);
     ps(" bytes each"); nl(); nl();
-    dt_stats("tex_a (floor: gravel, sleepers, rails)", &mc_tex_a);
+    dt_stats("tex_a (THE texture: floor band u 0-63, rock u 64-127)", &mc_tex_a);
     nl();
-    dt_stats("tex_b (walls: rock)", &mc_tex_b);
+    dt_stats("tex_b (scratch: the rock pass before it is merged)", &mc_tex_b);
     file_write_all("/tmp/mc_tex_a.raw", &mc_tex_a, bytes);
     file_write_all("/tmp/mc_tex_b.raw", &mc_tex_b, bytes);
     nl();

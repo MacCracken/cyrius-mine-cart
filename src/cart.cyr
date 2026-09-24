@@ -30,8 +30,12 @@ var cart_seed     = 0;
 # apex-detector state
 var cart_prev_curve = 0;   # |curve| under the cart last tick
 var cart_apex_armed = 0;   # braking while the bend was tightening
-var cart_apex_hits  = 0;   # clean apexes this run — the thing the score multiplier hangs off
-var cart_derails    = 0;
+# ⚠ SESSION TOTALS, NOT PER-LIFE: cart_reset() deliberately leaves these two alone, so the ride's
+# closing line can report every apex and every derail across all the chapter restarts. Anything that
+# wants a per-life count must take the difference itself — and nothing the simulation DECIDES reads
+# them, which is why the replay's state hash leaves them out.
+var cart_apex_hits  = 0;   # clean apexes this session
+var cart_derails    = 0;   # derails this session
 var cart_slip       = 0;   # 1 while the flange has let go — drives sparks, screech and the shake
 var cart_slip_ticks = 0;   # total ticks spent slipping this run
 
@@ -86,6 +90,7 @@ fn cart_speed_frac(): i64 {
     return fx_div(s, CFG_SPEED_MAX);
 }
 
+# speed in whole sub-units per tick (the Q16.16 speed with its fraction dropped)
 fn cart_speed_sub(): i64 { return cart_speed >>> 16; }
 
 # km/h, for the HUD. sub/tick * 60 ticks/s / 256 sub-per-cm = cm/s; * 36 / 1000 = km/h.
@@ -132,9 +137,12 @@ fn cart_can_act(): i64 {
     return 1;
 }
 
+# 1 while a jump is in the air
 fn cart_airborne(): i64 { if (cart_air > 0) { return 1; } return 0; }
+# 1 while a committed crouch is running
 fn cart_crouching(): i64 { if (cart_crouch > 0) { return 1; } return 0; }
 
+# take n blocks of integrity; at zero the cart is destroyed (death 3)
 fn cart_damage(n): i64 {
     cart_integrity = cart_integrity - n;
     if (cart_integrity <= 0) {
@@ -329,6 +337,7 @@ fn cart_tick(word): i64 {
                 if (d < 0) { d = 0 - d; }
                 if (d <= CFG_PICKUP_REACH) {
                     cart_treasure = cart_treasure + 1;
+                    trk_take(cart_last_seg);
                     # ⭐ SPEED IS THE SCORE MULTIPLIER, so a treasure taken at the redline is worth
                     # far more than the same treasure crawled past. Collecting and going fast are the
                     # same skill, which is what stops the safe line from also being the rich one.
@@ -342,6 +351,14 @@ fn cart_tick(word): i64 {
 
 # the lateral offset the renderer wants, in whole render units
 fn cart_cam_x(): i64 { return cart_lean >>> 16; }
+
+# ⭐ WHAT KILLED THE CART, in words — shared by the ride, --sim and the film tool, which used to say
+# "DERAILED" alike for a fall into a gap and for a cart beaten to pieces by beams.
+fn mc_death_name(): i64 {
+    if (cart_death == 2) { return "FELL INTO A GAP"; }
+    if (cart_death == 3) { return "CART DESTROYED (integrity gone)"; }
+    return "DERAILED";
+}
 
 # ---- the reference pilot ----------------------------------------------------------------------------
 # ⭐ ONE AUTOPILOT, SHARED BY --sim, --wav AND THE FILM TOOL. Three copies of "how a competent player
@@ -360,6 +377,7 @@ fn cart_ticks_to(abs_seg): i64 {
     return sub / sp;
 }
 
+# the reference pilot's input word for this tick: counter-lean, brake, jump, duck
 fn cart_autopilot(): i64 {
     var word = 0;
 
@@ -419,8 +437,10 @@ fn cart_autopilot(): i64 {
 # One definition, here, driven by the real cart_tick with NO input — deterministic from a cold start.
 fn mc_cart_reset(): i64 { return cart_reset(CFG_SEED_DEFAULT, 0); }
 
+# one tick of "frame N": the cart with no input at all
 fn mc_cart_step(): i64 { return cart_tick(0); }
 
+# the shared definition of frame N — reset, then N input-less ticks
 fn mc_cart_to(frame): i64 {
     mc_cart_reset();
     var f = 0;

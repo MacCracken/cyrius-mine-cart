@@ -23,12 +23,14 @@ fn wav_u32(p, v): i64 {
     return 0;
 }
 
+# store a little-endian u16
 fn wav_u16(p, v): i64 {
     store8(p + 0, v & 0xFF);
     store8(p + 1, (v >>> 8) & 0xFF);
     return 0;
 }
 
+# store a four-character chunk tag
 fn wav_str4(p, a, b, c, d): i64 {
     store8(p + 0, a); store8(p + 1, b); store8(p + 2, c); store8(p + 3, d);
     return 0;
@@ -55,15 +57,18 @@ fn wav_header(hdr, frames): i64 {
 }
 
 # ---- the capture buffer ---------------------------------------------------------------------------
-# ⚠ GLOBAL and sized in 8-byte slots. 30 s at 48 kHz stereo is 48000*30*4 = 5,760,000 bytes =
-# 720,000 slots. Declared with headroom and asserted before use, because an overrun here would land
-# in whatever global follows and this repo has already paid for one of those.
-var wav_buf[800000];
-var wav_buf_guard = 0;
-var wav_cap_frames = 1440000;      # 30 s at 48 kHz — (800000*8) / 4 = 1,600,000 available
+# ⛔⛔ HEAP, NOT A STATIC ARRAY — AND THIS ONE BUFFER WAS THREE QUARTERS OF THE BINARY. It used to be
+# `var wav_buf[800000]`: 6.4 MB of zeros written into /bin/mine-cart on every target, including the
+# agnos image, for a mode (--wav) the ride never enters. The whole executable was 8.8 MB because of
+# it. It is allocated here, on the one path that needs it, at exactly the size that path asks for.
+# 30 s at 48 kHz stereo S16 is 48000*30*4 = 5,760,000 bytes, plus the 44-byte header in front.
+var wav_buf = 0;
+var wav_cap_frames = 1440000;      # 30 s at 48 kHz
 
+# the capture buffer, allocated on first use: 1 if it exists
 fn wav_ok(): i64 {
-    if ((&wav_buf_guard - &wav_buf) < WAV_HDR + wav_cap_frames * AUD_BPF) { return 0; }
+    if (wav_buf == 0) { wav_buf = alloc(WAV_HDR + wav_cap_frames * AUD_BPF); }
+    if (wav_buf == 0) { return 0; }
     return 1;
 }
 
@@ -98,7 +103,7 @@ fn wav_capture(seconds, pilot): i64 {
         # in ONE write. Reserving WAV_HDR bytes at the front is cheaper than a second buffer.
         var i = 0;
         while (i < AUD_FR_TICK * AUD_BPF) {
-            store8(&wav_buf + WAV_HDR + out * AUD_BPF + i, load8(&aud_pcm + i));
+            store8(wav_buf + WAV_HDR + out * AUD_BPF + i, load8(&aud_pcm + i));
             i = i + 1;
         }
         out = out + AUD_FR_TICK;
@@ -107,22 +112,23 @@ fn wav_capture(seconds, pilot): i64 {
     return out;
 }
 
+# render `seconds` of the ride's mix and write it as a 48 kHz S16 stereo .wav
 fn wav_write(path, seconds, pilot): i64 {
-    if (wav_ok() == 0) { ps("wav: capture buffer UNDER-SIZED"); nl(); return 0; }
+    if (wav_ok() == 0) { ps("wav: cannot allocate the capture buffer"); nl(); return 0; }
 
     var frames = wav_capture(seconds, pilot);
     ps("  captured "); pn(frames); ps(" frames ("); pn(frames / AUD_RATE); ps(" s), ");
     pn(cart_apex_hits); ps(" apexes, "); pn(cart_derails); ps(" derails"); nl();
 
     # the header goes at the FRONT of the same buffer, so header + samples are one write
-    wav_header(&wav_buf, frames);
+    wav_header(wav_buf, frames);
 
     # measure what was actually produced, because "wrote a file" is not "wrote audio"
     var peak = 0;
     var nonzero = 0;
     var i = 0;
     while (i < frames) {
-        var v = load16(&wav_buf + WAV_HDR + i * AUD_BPF) & 0xFFFF;
+        var v = load16(wav_buf + WAV_HDR + i * AUD_BPF) & 0xFFFF;
         if (v >= 32768) { v = v - 65536; }
         if (v != 0) { nonzero = nonzero + 1; }
         if (v < 0) { v = 0 - v; }
@@ -132,7 +138,7 @@ fn wav_write(path, seconds, pilot): i64 {
     ps("  peak "); pn(peak); ps(" of 32767, "); pn((nonzero * 100) / frames);
     ps("% of frames non-silent"); nl();
 
-    file_write_all(path, &wav_buf, WAV_HDR + frames * AUD_BPF);
+    file_write_all(path, wav_buf, WAV_HDR + frames * AUD_BPF);
     ps("  wrote "); ps(path); nl();
     return frames;
 }

@@ -9,6 +9,7 @@
 var ctt_fail = 0;
 var ctt_ran  = 0;
 
+# assert got == want, report the pair on failure
 fn ctt_eq(name, got, want): i64 {
     ctt_ran = ctt_ran + 1;
     if (got == want) { return 0; }
@@ -17,6 +18,7 @@ fn ctt_eq(name, got, want): i64 {
     return 1;
 }
 
+# assert a condition, report it by name on failure
 fn ctt_true(name, cond): i64 {
     ctt_ran = ctt_ran + 1;
     if (cond != 0) { return 0; }
@@ -371,7 +373,12 @@ fn ctt_grip(): i64 {
     cart_speed = CFG_SPEED_MAX << 16;
     var st = 0;
     var slipped = 0;
-    while (st < 120) { cart_tick(0); cart_speed = CFG_SPEED_MAX << 16; if (cart_slip == 1) { slipped = 1; } st = st + 1; }
+    while (st < 120) {
+        cart_tick(0);
+        cart_speed = CFG_SPEED_MAX << 16;
+        if (cart_slip == 1) { slipped = 1; }
+        st = st + 1;
+    }
     ctt_eq("a straight never slips, at any speed", slipped, 0);
 
     # ⭐ AND THE PAYOFF: entering a hard bend at the redline and doing nothing must KILL. This is the
@@ -432,6 +439,7 @@ fn ctt_run_to(seg, word_jump_at, word): i64 {
     return 1;
 }
 
+# jump and duck: clears, falls short, commitments that cannot be cancelled
 fn ctt_verbs(): i64 {
     # ---- ⛔ THE JUMP'S SPEED THRESHOLD. The brief calls this the central tension with the brake and
     # says explicitly not to soften it. These two assertions ARE that instruction.
@@ -524,6 +532,7 @@ fn ctt_pickup_at(lane): i64 {
     return 0;
 }
 
+# treasure: collected in reach, missed out of it, worth more at speed
 fn ctt_pickups(): i64 {
     # centre lane, cart on the centre line: collected
     ctt_pickup_at(1);
@@ -702,6 +711,7 @@ fn ctt_run_sum(seed, ticks): i64 {
     return h;
 }
 
+# the same seed and input log replay identically; a different seed diverges
 fn ctt_determinism(): i64 {
     var a = ctt_run_sum(CFG_SEED_DEFAULT, 900);
     var b = ctt_run_sum(CFG_SEED_DEFAULT, 900);

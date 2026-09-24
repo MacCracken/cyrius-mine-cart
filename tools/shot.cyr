@@ -1,0 +1,166 @@
+# shot.cyr — screenshots of the ride, as PPM files, on the host, with no GPU.
+#
+# ⭐⭐ WHY THIS EXISTS. Every other instrument in this repo answers a yes/no question — is the record
+# legal, is the frame non-empty, does the replay match. None of them answers "does it LOOK right",
+# and 0.2.1 shipped three visual defects that every one of them passed: a black hole where the far
+# ceiling should be, side tracks that were only drawn below the bottom edge of the screen, and
+# treasure that never rose more than 17 rows above it. The coverage gate said 82.6% and PASS. A
+# person looking at one frame would have seen all three in a second.
+# ⇒ So the frame is the deliverable, and this is the cheapest way to put one in front of a person:
+#   refcore draws exactly what op 0x0F is asked to draw, and a PPM opens in anything.
+#
+# ⚠ THE SAME RIDE AS film AND --sim. Same seed, same reference autopilot, and frame N here is frame N
+# of /tmp/mc_film.raw — so a defect seen in the video can be pulled out as a still by its number.
+#
+# Usage:  cyrius build tools/shot.cyr build/shot && ./build/shot [--pilot 0|1] OUTDIR FRAME [FRAME ...]
+#         writes OUTDIR/deepvein-NNNNN.ppm (640x400, binary P6) for each frame, in any order.
+#         --pilot 0 rides hands-off (it takes beams, falls in gaps and dies); the default is the
+#         reference autopilot.
+
+include "lib/io.cyr"
+include "src/say.cyr"
+include "src/fx.cyr"
+include "src/config.cyr"
+include "src/track.cyr"
+include "src/input.cyr"
+include "src/cart.cyr"
+include "src/emit.cyr"
+include "src/hud.cyr"
+include "src/geom.cyr"
+include "src/tex.cyr"
+include "src/refcore.cyr"
+
+var shot_ppm  = 0;          # 15-byte header + 640*400*3
+var shot_path = 0;          # the output path, built per frame
+var shot_hdr  = 15;         # "P6\n640 400\n255\n"
+
+# ---- put a string / a padded number into the path buffer ------------------------------------------
+fn shot_put_str(at, s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) { store8(shot_path + at + i, load8(s + i)); i = i + 1; }
+    return at + i;
+}
+
+# write v into the path buffer as exactly five digits, zero-padded
+fn shot_put_num5(at, v): i64 {
+    var d = 4;
+    while (d >= 0) {
+        store8(shot_path + at + d, 48 + (v % 10));
+        v = v / 10;
+        d = d - 1;
+    }
+    return at + 5;
+}
+
+# ---- what is in view, as one caption line ---------------------------------------------------------
+# ⚠ Lists what the SIMULATION has placed ahead, whether or not the renderer drew it. A caption that
+# says "BEAM" over a frame with no beam in it is itself the finding.
+fn shot_caption(frame): i64 {
+    ps("  frame "); pn(frame); ps("  "); pn(trk_depth_m()); ps(" m  "); pn(cart_kmh()); ps(" km/h");
+    ps("  lean "); pn(cart_cam_x()); ps("  tris "); pn(mc_n_a);
+    if (cart_slip == 1) { ps("  SLIPPING"); }
+    if (cart_air > 0) { ps("  AIR "); pn(cart_air); }
+    if (cart_crouch > 0) { ps("  DUCK "); pn(cart_crouch); }
+    if (trk_multi_at(trk_abs_seg) == 1) { ps("  [3-TRACK]"); }
+    var s = 1;
+    while (s <= 16) {
+        var a = trk_abs_seg + s;
+        if (trk_live(a) == 1) {
+            var k = trk_kind_at(a);
+            if (k == KIND_BEAM)   { ps("  beam@"); pn(s); }
+            if (k == KIND_GAP)    { ps("  gap@"); pn(s); }
+            if (k == KIND_PICKUP) { ps("  gem@"); pn(s); }
+        }
+        s = s + 1;
+    }
+    nl();
+    return 0;
+}
+
+# ---- one PPM --------------------------------------------------------------------------------------
+fn shot_write(dir, frame): i64 {
+    # header, once per file (the buffer is reused)
+    var h = "P6\n640 400\n255\n";
+    var i = 0;
+    while (i < shot_hdr) { store8(shot_ppm + i, load8(h + i)); i = i + 1; }
+    # XRGB8888 little-endian is B,G,R,X in memory; a P6 wants R,G,B
+    var p = 0;
+    while (p < MC_W * MC_H) {
+        var px = load32(rr_fb + p * 4) & 0xFFFFFFFF;
+        store8(shot_ppm + shot_hdr + p * 3 + 0, (px >> 16) & 255);
+        store8(shot_ppm + shot_hdr + p * 3 + 1, (px >> 8) & 255);
+        store8(shot_ppm + shot_hdr + p * 3 + 2, px & 255);
+        p = p + 1;
+    }
+    var at = shot_put_str(0, dir);
+    at = shot_put_str(at, "/deepvein-");
+    at = shot_put_num5(at, frame);
+    at = shot_put_str(at, ".ppm");
+    store8(shot_path + at, 0);
+    if (file_write_all(shot_path, shot_ppm, shot_hdr + MC_W * MC_H * 3) < 0) {
+        ps("shot: cannot write "); ps(shot_path); nl();
+        return 0;
+    }
+    ps("  wrote "); ps(shot_path); nl();
+    return 1;
+}
+
+# ride to each requested frame and write it as a PPM
+fn main(): i64 {
+    args_init();
+    var first = 1;
+    var pilot = 1;
+    if (argc() > 2) {
+        var a1 = argv(1);
+        if (mc_slen(a1) == 7) {
+            if (load8(a1 + 2) == 112) {                       # "--pilot"
+                pilot = mc_atoi(argv(2));
+                first = 3;
+            }
+        }
+    }
+    if (pilot < 0) { ps("shot: --pilot takes 0 or 1"); nl(); return 2; }
+    if (pilot > 1) { ps("shot: --pilot takes 0 or 1"); nl(); return 2; }
+    if (argc() < first + 2) {
+        ps("usage: shot [--pilot 0|1] OUTDIR FRAME [FRAME ...]   (frames of the ride, as in film)"); nl();
+        return 2;
+    }
+    var dir = argv(first);
+    if (mc_slen(dir) > 3900) { ps("shot: OUTDIR is too long"); nl(); return 2; }
+    shot_ppm  = alloc(shot_hdr + MC_W * MC_H * 3);
+    shot_path = alloc(4096);
+    if (shot_ppm == 0) { ps("shot: out of memory"); nl(); return 1; }
+    if (shot_path == 0) { ps("shot: out of memory"); nl(); return 1; }
+    if (rr_fb_ok() == 0) { ps("shot: out of memory"); nl(); return 1; }
+
+    fx_sin_init();
+    mc_tex_init();
+
+    var done = 0;
+    var ai = first + 1;
+    while (ai < argc()) {
+        var want = mc_atoi(argv(ai));
+        if (want < 0) { ps("shot: '"); ps(argv(ai)); ps("' is not a frame number"); nl(); return 2; }
+        # ⭐ FRAME N IS film's FRAME N: film ticks once, then draws, starting from a fresh chapter.
+        # Frames may be asked for in any order, so the ride restarts from the gate every time — it
+        # is deterministic, so a restart reproduces the same ground exactly.
+        cart_reset(CFG_SEED_DEFAULT, 0);
+        var f = 0;
+        while (f <= want) {
+            var word = 0;
+            if (pilot == 1) { word = cart_autopilot(); }
+            if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
+            f = f + 1;
+        }
+        mc_build(cart_cam_x());
+        rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+        shot_caption(want);
+        done = done + shot_write(dir, want);
+        ai = ai + 1;
+    }
+    if (done != argc() - first - 1) { return 1; }
+    return 0;
+}
+
+fn _entry(): i64 { var r = main(); syscall(SYS_EXIT, r); return 0; }
+_entry();

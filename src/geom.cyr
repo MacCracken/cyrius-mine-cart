@@ -1,20 +1,9 @@
-# geom.cyr — the segment-ring walk, the projection, and the #92 op 0x0F record emitter.
+# geom.cyr — the world: the segment-ring walk, the camera, and one frame's worth of geometry.
 #
-# ⭐ THIS FILE IS THE GAME'S HALF OF THE op 0x0F ABI. Everything the kernel's gpo_validate_triperspec
-# refuses is refused HERE first, because a single bad record does not draw a bad triangle — it makes
-# `syscall(92, ...)` reject THE WHOLE BATCH, and the frame comes back as whatever was in the slot
-# before. On iron that is a black screen, and a black screen is indistinguishable from "no GPU",
-# "shader wrote nothing" and "readback failed".
-#
-# The rules, all of them (agnos kernel/core/syscall.cyr):
-#   · coordinates are 16.16 with the fraction EXACTLY zero        GPO_E_SUBPIXEL
-#   · |coordinate| <= 2^28 (i.e. +-4096 px)                       GPO_E_COORD
-#   · per-vertex w in [256, 4096]                                 GPO_E_WRANGE
-#   · frame area in [2^16, 2^42] — no degenerate triangles        GPO_E_AREA
-#   · texture dims are POWERS OF TWO, unconditionally             GPO_E_TEXDIM
-#   · <= 256 triangles per record                                 GPO_E_TRILIST
-#   · the per-triangle reserved dword is zero                     GPO_E_TRILIST
-#   · |D| <= 2^31-1 at the four DRAW RECT corners                 GPO_E_DRANGE
+# ⭐ WHAT IS HERE AND WHAT IS NOT. emit.cyr owns the op 0x0F ABI — the vertex lists, the projection and
+# every rule the kernel would refuse a batch for. This file decides WHAT is drawn: it walks the track
+# ring into slabs, places the camera behind the cart, and emits the bore, the floor, the tracks, the
+# things standing on them, the cart and the HUD, far to near, into ONE record.
 #
 # ⛔⛔ WHAT CHANGED, AND WHY THE OLD MODEL COULD NOT BE KEPT. This file used to project a fixed
 # 8-segment grid against a global sine wave — the track was a closed-form function of z, so there was
@@ -25,204 +14,29 @@
 # slab would straddle two segments' curvature by a different fraction. MC_SEG is 32 now (256 cm
 # exactly) and slabs land cleanly.
 
-# ---- the two vertex lists ---------------------------------------------------------------------
-# 64 B per triangle, exactly GPU_TPER_VTX_BYTES.
-# ⛔ SIZED IN 8-BYTE SLOTS, AND VERIFIED AT RUNTIME. A global `var X[N]` is N*8 bytes while a LOCAL
-# `var X[N]` is N bytes — an 8x asymmetry with no diagnostic either way. An under-sized vertex buffer
-# is exactly the overflow that cost the kernel's own instrument a burn: it corrupted the triangle
-# COUNT, and the symptom read as "the GPU did nothing".
-# ⚠ [2048] = 16384 B = 256 triangles, and MC_TRI_MAX is 256. THESE TWO MUST MOVE TOGETHER — raising
-# the cap without growing the array writes past the end of mc_vtx_a and into mc_vtx_b.
-var mc_vtx_a[2048];
-var mc_vtx_b[2048];        # kept so mc_bufs_ok() can still MEASURE the span at runtime
-var mc_vtx_guard = 0;
-var mc_n_a = 0;
-var mc_n_b = 0;            # ⛔ ALWAYS 0 — the frame is ONE record. See mc_build.
-
-# ---- rejection counters -------------------------------------------------------------------------
-var mc_drop_flat  = 0;     # exactly-degenerate: cross == 0, so it covers no pixel at all
-var mc_drop_huge  = 0;     # past the area ceiling — a REAL hole
-var mc_drop_coord = 0;
-var mc_drop_band  = 0;
-var mc_drop_full  = 0;     # ⭐ NEW: over the per-record triangle budget. See mc_emit.
-var mc_peak_d     = 0;
-var mc_peak_n     = 0;
-var mc_trace      = 0;     # 1 = report every dropped triangle, for diagnosis
-
 # ---- the slab endpoints, filled by mc_walk() ------------------------------------------------------
 # Struct-of-arrays again: rz (render units of depth), and the centre line's x/y offset there.
 var mc_s_rz[24];
 var mc_s_cx[24];
 var mc_s_cy[24];
 var mc_s_v[24];            # texture v at this endpoint, 16.16 texels
-var mc_s_seg[24];          # the ring segment this endpoint sits on — what is ON the track there
 var mc_s_guard = 0;
 var mc_nslab = 0;          # number of ENDPOINTS written (slabs = mc_nslab - 1)
 
+# the vertex lists and slab arrays measured: 1 if every span is at least its declared size
 fn mc_bufs_ok(): i64 {
     # ⚠ Compared as a >= BYTE assertion and never divided to derive a capacity: a global with N >= 2
     # can carry up to 8 bytes of alignment padding BEFORE it, so a span overstates and never
     # understates.
     if ((&mc_vtx_b     - &mc_vtx_a) < MC_TRI_MAX * 64) { return 0; }
     if ((&mc_vtx_guard - &mc_vtx_b) < MC_TRI_MAX * 64) { return 0; }
-    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 5)      { return 0; }
+    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 4)      { return 0; }
     return 1;
 }
 
 # ⭐ Kept as a name because main.cyr and tools/refrender.cyr call it, and because "initialise the
 # trig tables" is a real step that now lives in fx.cyr. One definition, one home.
 fn mc_sin_init(): i64 { return fx_sin_init(); }
-
-# ---- projection -----------------------------------------------------------------------------------
-# rz is ALWAYS >= MC_ZN: the slab ladder is anchored to the near plane so nothing is ever behind the
-# camera and no near-plane clipping is needed. That is a geometry choice made specifically to avoid a
-# clipper, because a clipper is where sub-pixel coordinates and degenerate triangles come from, and
-# both of those are whole-batch rejections.
-#
-# ⛔⛔ VERTICES ARE FRAMEBUFFER-ABSOLUTE, NOT RECT-LOCAL. gpu_tper_prep_build folds dstxy into every
-# plane CONSTANT, so the shader evaluates each edge at the SCREEN sample point 2*(dx+lx)+1. Emitting
-# rect-local coordinates with a non-zero dstxy renders the window [dx,dx+w) x [dy,dy+h) OF THE SCENE
-# into the rect, panning the picture up-left by (dx,dy).
-# ⚠ #92 carries TWO conventions and that is why this is easy to get wrong: op 0x0A is rect-LOCAL,
-# while 0x0E and 0x0F are ABSOLUTE. main.cyr's gate asserts it rather than trusting it.
-fn mc_px(rx, rz): i64 { return MC_DX + MC_CX + (rx * MC_FOCAL) / rz; }
-fn mc_py(ry, rz): i64 { return MC_DY + MC_CY + (ry * MC_FOCAL) / rz; }
-fn mc_wof(rz): i64    { return MC_WSC * rz; }
-
-# ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------------
-# ⭐ Not a paraphrase of the rule — the same expression, on the same doubled-integer domain, at the
-# same four draw-rect corners, so "the game accepts it" and "the kernel accepts it" cannot drift.
-fn mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
-    var qx0 = 2 * MC_DX + 1;
-    var qx1 = 2 * (MC_DX + MC_W - 1) + 1;
-    var qy0 = 2 * MC_DY + 1;
-    var qy1 = 2 * (MC_DY + MC_H - 1) + 1;
-
-    var dax = 2 * x0; var day = 2 * y0;
-    var dbx = 2 * x1; var dby = 2 * y1;
-    var dcx = 2 * x2; var dcy = 2 * y2;
-
-    var W0 = 65536 / w0;
-    var W1 = 65536 / w1;
-    var W2 = 65536 / w2;
-
-    var k = 0;
-    while (k < 4) {
-        var qx = qx0; var qy = qy0;
-        if (k == 1) { qx = qx1; qy = qy0; }
-        if (k == 2) { qx = qx0; qy = qy1; }
-        if (k == 3) { qx = qx1; qy = qy1; }
-        var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
-        var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
-        var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
-
-        var D = e0 * W0 + e1 * W1 + e2 * W2;
-        if (D < 0) { D = 0 - D; }
-        if (D > mc_peak_d) { mc_peak_d = D; }
-        if (D > MC_D_MAX) { return 0; }
-
-        var Nu = e0 * (W0 * u0) + e1 * (W1 * u1) + e2 * (W2 * u2);
-        var Nv = e0 * (W0 * v0) + e1 * (W1 * v1) + e2 * (W2 * v2);
-        if (Nu < 0) { Nu = 0 - Nu; }
-        if (Nv < 0) { Nv = 0 - Nv; }
-        if (Nu > mc_peak_n) { mc_peak_n = Nu; }
-        if (Nv > mc_peak_n) { mc_peak_n = Nv; }
-        k = k + 1;
-    }
-    return 1;
-}
-
-# ---- emit one triangle ------------------------------------------------------------------------------
-# Returns 1 when written, 0 when DROPPED. A drop is a visible hole, so every drop is counted.
-fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
-    var n = load64(np);
-    # ⭐ THIS DROP USED TO BE SILENT AND UNCOUNTED, AND THAT WAS THE ONE REJECTION PATH THE GATE
-    # COULD NOT SEE. A frame that quietly lost its last N triangles reported a perfectly clean drop
-    # tally — "0 dropped" over a tunnel with the far end missing. Budget the geometry analytically;
-    # never discover the cap at runtime.
-    if (n >= MC_TRI_MAX) { mc_drop_full = mc_drop_full + 1; return 0; }
-
-    # coordinate window, +-4096 px
-    if (x0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (x1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (x2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (x0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (x1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (x2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-    if (y2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
-
-    # w band — the kernel refuses, never rescales
-    if (w0 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
-    if (w1 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
-    if (w2 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
-    if (w0 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
-    if (w1 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
-    if (w2 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
-
-    # frame area, in the kernel's doubled-integer domain
-    var dax = 2 * x0; var day = 2 * y0;
-    var dbx = 2 * x1; var dby = 2 * y1;
-    var dcx = 2 * x2; var dcy = 2 * y2;
-    var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
-    if (cross < 0) { cross = 0 - cross; }
-    # ⭐ THE AREA-MIN RULE CAN ONLY FIRE AT cross == 0, and that decides whether a drop is a hole.
-    # a2 is |cross| << 16 and MC_AREA_MIN is 1 << 16, so a2 < MC_AREA_MIN requires |cross| == 0 — the
-    # triangle is EXACTLY collinear and covers no pixel in any rasteriser. Far slabs produce these
-    # routinely once the track curves: two edges a fraction of a pixel apart round to the same
-    # integer column, and the ABI forbids sub-pixel coordinates.
-    # ⚠ SO THE GATE MUST NOT ASSERT "all drops are zero" — it must hold coord/band/huge/full at zero
-    # and report flat separately. A curving track legitimately produces ~1 flat drop per frame.
-    var a2 = cross << 16;
-    if (a2 < MC_AREA_MIN) {
-        mc_drop_flat = mc_drop_flat + 1;
-        if (mc_trace == 1) {
-            ps("    degenerate: ("); pn(x0); ps(","); pn(y0); ps(") (");
-            pn(x1); ps(","); pn(y1); ps(") ("); pn(x2); ps(","); pn(y2);
-            ps(")  w "); pn(w0); ps("/"); pn(w1); ps("/"); pn(w2); nl();
-        }
-        return 0;
-    }
-    if (a2 > MC_AREA_MAX) { mc_drop_huge = mc_drop_huge + 1; return 0; }
-
-    if (mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2) == 0) {
-        mc_drop_band = mc_drop_band + 1;
-        return 0;
-    }
-
-    var b = list + n * 64;
-    store32(b +  0, x0 << 16); store32(b +  4, y0 << 16); store32(b +  8, w0);
-    store32(b + 12, u0);       store32(b + 16, v0);
-    store32(b + 20, x1 << 16); store32(b + 24, y1 << 16); store32(b + 28, w1);
-    store32(b + 32, u1);       store32(b + 36, v1);
-    store32(b + 40, x2 << 16); store32(b + 44, y2 << 16); store32(b + 48, w2);
-    store32(b + 52, u2);       store32(b + 56, v2);
-    store32(b + 60, 0);                       # the reserved dword — non-zero is GPO_E_TRILIST
-    store64(np, n + 1);
-    return 1;
-}
-
-# emit a quad as two triangles, corners in order a-b-c-d
-fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd): i64 {
-    var got = 0;
-    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc);
-    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd);
-    return got;
-}
-
-# ---- the budget reserve --------------------------------------------------------------------------
-# ⛔ OPTIONAL DETAIL ASKS PERMISSION. The per-record cap is 256 and mc_emit's over-budget path drops
-# silently — so whatever is emitted LAST is whatever gets lost, and the cart is drawn last because
-# painter's order demands it. Gating optional geometry on remaining room inverts that: the things
-# that can be spared are the things that go.
-fn mc_room(n): i64 {
-    if (mc_n_a + n <= MC_TRI_MAX - CFG_TRI_RESERVE) { return 1; }
-    return 0;
-}
 
 # ---- the slab ladder ---------------------------------------------------------------------------------
 # ⚠ Near slabs are SHORT and far slabs are LONG. A uniform walk makes the nearest slab 280 px tall on
@@ -234,6 +48,34 @@ fn mc_step_at(rz): i64 {
     if (rz < 128) { return MC_LOD1; }
     if (rz < 256) { return MC_LOD2; }
     return MC_LOD3;
+}
+
+# ---- ⭐⭐ WHERE THE CAMERA IS: CFG_CART_RZ BEHIND THE CART, NOT AT IT ------------------------------
+# ⛔⛔ THE SIMULATION'S POSITION IS THE CART'S, AND THE CAMERA USED TO SIT ON IT. The cart is drawn
+# CFG_CART_RZ (124 ru, 9.9 m) in front of the camera — the chase-drone view — but the camera was
+# placed AT (trk_abs_seg, trk_pos_sub), which is where cart_tick resolves every beam, gap and
+# treasure. So the cart on screen ran 9.9 m AHEAD of the cart the rules were applied to: it reached a
+# beam 0.37 s before the hit landed, and it had cleared the whole far lip of a 3-segment gap (96 ru)
+# before the simulation decided it was falling in. A player who jumped when the cart they could see
+# reached the edge came down inside the gap. Every assertion passed; the screenshot caption for frame
+# 200 ("beam@1", with the beam drawn BEHIND the cart) is what showed it.
+# ⇒ The camera now trails the simulation position by exactly CFG_CART_RZ, so the drawn cart IS the
+#   simulated cart: it meets every hazard on the frame the rules meet it. Nothing in the simulation
+#   moved — this is a renderer fix, and --sim, the replay and the audio are bit-identical across it.
+# ⚠ 124 ru is 3.9 segments, and the ring keeps ~47 live segments behind the cart, so the camera's
+#   own segment is always live after the first four; before that (the chapter gate) it reads as
+#   straight, plain track — which is what the gate's forced-straight opening segments are anyway.
+var mc_cam_seg = 0;        # absolute segment the CAMERA is in
+var mc_cam_ru  = 0;        # render units into that segment, 0..31
+
+# put the camera CFG_CART_RZ behind the cart: sets mc_cam_seg and mc_cam_ru
+fn mc_cam_place(): i64 {
+    var p = trk_pos_sub - CFG_CART_RZ * MC_SUB_PER_RU;
+    var s = trk_abs_seg;
+    while (p < 0) { p = p + CFG_SUB_PER_SEG; s = s - 1; }
+    mc_cam_seg = s;
+    mc_cam_ru  = p >>> 11;                      # 0..31 — the same quantisation the cart position has
+    return 0;
 }
 
 # ---- the curve integral --------------------------------------------------------------------------------
@@ -257,7 +99,7 @@ fn mc_integ(ru_a, ru_b, want_grade): i64 {
         var seg_end = (seg_i + 1) << 5;
         var e = ru_b;
         if (seg_end < e) { e = seg_end; }
-        var abs = trk_abs_seg + seg_i;
+        var abs = mc_cam_seg + seg_i;
         var c = 0;
         # ⛔ A read outside the live window does not fail — it returns a RECYCLED slot, i.e. a
         # different part of the track. Treat it as straight rather than as whatever is in the slot.
@@ -283,7 +125,8 @@ fn mc_integ(ru_a, ru_b, want_grade): i64 {
 # and the /2 of the midpoint rule. The midpoint rule is EXACT for a constant curve, so the choice of
 # ladder never changes WHERE the track goes — only how finely it is drawn.
 fn mc_walk(): i64 {
-    var cam_ru = trk_pos_sub >>> 11;            # 0..31 render units into the current segment
+    mc_cam_place();
+    var cam_ru = mc_cam_ru;                     # 0..31 render units into the camera's segment
     var psi = 0; var xq = 0;
     var phi = 0; var yq = 0;
 
@@ -298,7 +141,6 @@ fn mc_walk(): i64 {
     store64(&mc_s_cx + 0, 0);
     store64(&mc_s_cy + 0, 0);
     store64(&mc_s_v  + 0, v);
-    store64(&mc_s_seg + 0, trk_abs_seg + ((cam_ru + MC_ZN) >>> 5));
     n = 1;
 
     while (rz < MC_ZF) {
@@ -316,17 +158,324 @@ fn mc_walk(): i64 {
             store64(&mc_s_cx + n * 8, xq >>> 16);
             store64(&mc_s_cy + n * 8, yq >>> 16);
             store64(&mc_s_v  + n * 8, v);
-            # ⭐ WRITTEN WITH THE OTHER ENDPOINT FIELDS, AFTER rz ADVANCED. Slabs are camera-relative
-            # and segments are world-relative, so the mapping changes every tick and a far slab spans
-            # two segments — the lookup cannot be assumed, it has to be recorded. Writing it BEFORE
-            # the advance put mc_s_seg one slab out of step with mc_s_rz, so every hazard and every
-            # side track was attributed to the slab in front of the one it belonged to.
-            store64(&mc_s_seg + n * 8, trk_abs_seg + ((cam_ru + rz) >>> 5));
             n = n + 1;
         }
     }
     mc_nslab = n;
     return n;
+}
+
+# ---- the centre line at an arbitrary depth ----------------------------------------------------------------
+# ⭐ LINEAR BETWEEN THE SLAB'S ENDPOINTS, ON PURPOSE. A slab is drawn as flat quads between its two
+# endpoints, so the floor the player SEES is exactly this interpolation — an object placed by the true
+# curve integral instead would float a pixel off the rail it is sitting on. Consistent beats exact.
+var mc_clx = 0;
+var mc_cly = 0;
+
+# the centre line at depth rz inside slab k, interpolated: sets mc_clx and mc_cly
+fn mc_cl_at(k, rz): i64 {
+    var rzn = load64(&mc_s_rz + k * 8);
+    var rzf = load64(&mc_s_rz + (k + 1) * 8);
+    var xn  = load64(&mc_s_cx + k * 8);
+    var xf  = load64(&mc_s_cx + (k + 1) * 8);
+    var yn  = load64(&mc_s_cy + k * 8);
+    var yf  = load64(&mc_s_cy + (k + 1) * 8);
+    var den = rzf - rzn;
+    mc_clx = xn + ((xf - xn) * (rz - rzn)) / den;
+    mc_cly = yn + ((yf - yn) * (rz - rzn)) / den;
+    return 0;
+}
+
+# ---- ⭐ A BEAM: a low bar across the bore, at the exact depth the simulation resolves it -----------------
+# ⛔⛔ IT USED TO HANG AT THE SPRINGING LINE — 36 ru ABOVE THE EYE, 86 ru (6.9 m) above the top of the
+# cart it was supposed to take the rider's head off — and it was cut from the same rock texture as the
+# walls it spanned, and it was only drawn within 128 ru (0.37 s at speed). Camouflaged, out of reach,
+# and too late: the one hazard the brief's DUCK verb exists for could not be seen doing anything.
+# ⇒ It hangs at rider height now (CFG_BEAM_TOP..CFG_BEAM_BOT, just above the cart's rim, so a crouch
+#   clears it and a standing rider does not), it is hazard-striped from the atlas, and it is drawn
+#   at every depth the frustum reaches — 1.5 s of warning at the redline.
+# ⚠ Front face plus top face: the camera rides above the beam, so the top is what gives it depth.
+fn mc_beam(k, rz, cam_x): i64 {
+    if (mc_room(4) == 0) { return 0; }
+    mc_cl_at(k, rz);
+    var cx = mc_clx - cam_x;
+    var cy = mc_cly;
+    var w  = mc_wof(rz);
+    var l  = mc_px(cx - MC_TW, rz);
+    var r  = mc_px(cx + MC_TW, rz);
+    var t  = mc_py(cy + CFG_BEAM_TOP, rz);
+    var b  = mc_py(cy + CFG_BEAM_BOT, rz);
+    # the top face runs back from the front edge; drawn first, it is the farther surface
+    # ⛔ CLAMPED TO THE FAR PLANE. A beam within CFG_BEAM_DEPTH of it would put the top face's back
+    #   edge at w > 4096 — GPO_E_WRANGE, which on iron refuses the WHOLE BATCH. The gate caught this
+    #   the first time it ran: four w-band drops, each one a frame that would have gone black.
+    var rzb = rz + CFG_BEAM_DEPTH;
+    if (rzb > MC_ZF) { rzb = MC_ZF; }
+    var wb  = mc_wof(rzb);
+    var lb  = mc_px(cx - MC_TW, rzb);
+    var rb  = mc_px(cx + MC_TW, rzb);
+    var tb  = mc_py(cy + CFG_BEAM_TOP, rzb);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      lb, tb, wb, ATL_BEAMTOP_U, ATL_BEAMTOP_V,   rb, tb, wb, ATL_BEAMTOP_U, ATL_BEAMTOP_V,
+      r,  t,  w,  ATL_BEAMTOP_U, ATL_BEAMTOP_V,   l,  t,  w,  ATL_BEAMTOP_U, ATL_BEAMTOP_V);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      l, t, w, ATL_BEAM_U0, ATL_BEAM_V0,   r, t, w, ATL_BEAM_U1, ATL_BEAM_V0,
+      r, b, w, ATL_BEAM_U1, ATL_BEAM_V1,   l, b, w, ATL_BEAM_U0, ATL_BEAM_V1);
+    return 0;
+}
+
+# ---- ⭐ TREASURE: a faceted gem standing in its lane, at the depth it is collected ----------------------
+# ⛔ IT USED TO BE DRAWN ONLY NEARER THAN 112 ru — where the floor it stands on is still BELOW THE
+# BOTTOM EDGE OF THE SCREEN (the floor does not enter the frame until ~115). Measured over a 30 s ride:
+# treasure reached the picture in 15% of frames and never rose above row 383 of 400. The lateral test
+# that collects it ran fine; the player simply could not see what they were steering for.
+# ⇒ Drawn at every depth, as a diamond (two triangles) sampled from the atlas's facet tile, and NOT
+#   drawn once taken — the simulation marks the segment FLAG_TAKEN on collection.
+fn mc_gem(k, rz, a, cam_x): i64 {
+    if (mc_room(2) == 0) { return 0; }
+    mc_cl_at(k, rz);
+    var gx = mc_clx - cam_x + trk_lane_x(trk_lane_at(a));
+    var gy = mc_cly + MC_FLOOR_Y - CFG_GEM_LIFT;       # the gem's lowest point
+    var w  = mc_wof(rz);
+    var xl = mc_px(gx - CFG_GEM_HW, rz);
+    var xc = mc_px(gx, rz);
+    var xr = mc_px(gx + CFG_GEM_HW, rz);
+    var yb = mc_py(gy, rz);
+    var ym = mc_py(gy - CFG_GEM_HH, rz);
+    var yt = mc_py(gy - 2 * CFG_GEM_HH, rz);
+    # ⚠ the tile is mapped ROTATED 45 degrees onto the diamond — its four corners land on the four
+    # points — so the tile's quadrants become the diamond's four facets.
+    mc_emit(&mc_vtx_a, &mc_n_a,
+      xc, yt, w, ATL_GEM_U0, ATL_GEM_V0,   xr, ym, w, ATL_GEM_U1, ATL_GEM_V0,
+      xc, yb, w, ATL_GEM_U1, ATL_GEM_V1);
+    mc_emit(&mc_vtx_a, &mc_n_a,
+      xc, yt, w, ATL_GEM_U0, ATL_GEM_V0,   xc, yb, w, ATL_GEM_U1, ATL_GEM_V1,
+      xl, ym, w, ATL_GEM_U0, ATL_GEM_V1);
+    return 0;
+}
+
+# ---- what stands on the track inside slab k, drawn FAR TO NEAR ------------------------------------------
+# ⭐ OBJECTS ARE PLACED BY SEGMENT, NOT BY SLAB. A far slab spans two segments, and the old code read
+# only the segment at a slab's NEAR endpoint — so an object on the far half of a 64 ru slab was never
+# drawn at all, and a near one snapped to the slab boundary instead of standing where it is. Each
+# segment's START is the exact point cart_tick resolves it (the crossing), so that is where it stands.
+# ⚠ After the slab's own surfaces, never before: the bore is convex from the inside, so a surface of
+#   the same slab is always BEHIND an object in it, and drawing it second would paint over the object.
+# ⚠ Takes a depth range [lo, hi) inside the slab, not just the slab: drawing the cart's own slab in
+#   two halves around the cart was tried (see mc_build's note on why the cart is drawn last instead).
+fn mc_objects(k, lo, hi, cam_x): i64 {
+    var rzn = load64(&mc_s_rz + k * 8);
+    var rzf = load64(&mc_s_rz + (k + 1) * 8);
+    if (lo < rzn) { lo = rzn; }
+    if (hi > rzf) { hi = rzf; }
+    if (hi <= lo) { return 0; }
+    # the last segment that STARTS inside [lo, hi), then walk toward the camera
+    var last = (mc_cam_ru + hi - 1) >>> 5;
+    var rza  = last * 32 - mc_cam_ru;
+    var a    = mc_cam_seg + last;
+    while (rza >= lo) {
+        if (trk_live(a) == 1) {
+            var kind = trk_kind_at(a);
+            if (kind == KIND_BEAM) { mc_beam(k, rza, cam_x); }
+            if (kind == KIND_PICKUP) {
+                if ((trk_flags_at(a) & FLAG_TAKEN) == 0) { mc_gem(k, rza, a, cam_x); }
+            }
+        }
+        rza = rza - 32;
+        a = a - 1;
+    }
+    return 0;
+}
+
+# ---- one run of floor, [a, b) inside slab k, and the tracks on it ------------------------------------
+# ⭐ Interpolated from the slab's own endpoints (mc_cl_at), so a run that covers the whole slab is the
+# old quad to the pixel, and a cut lands exactly on the plane the uncut quad would have drawn.
+# v is linear in depth by construction (4 texels per ru), so it is interpolated exactly too.
+fn mc_floor_run(k, a, b, multi, cam_x): i64 {
+    var rzs = load64(&mc_s_rz + k * 8);
+    var vs  = load64(&mc_s_v + k * 8);
+    var vn  = vs + (a - rzs) * (MC_TEXFULL / 32);
+    var vf  = vs + (b - rzs) * (MC_TEXFULL / 32);
+    mc_cl_at(k, a);
+    var cn = mc_clx - cam_x;
+    var gn = mc_cly;
+    mc_cl_at(k, b);
+    var cf = mc_clx - cam_x;
+    var gf = mc_cly;
+    var wn = mc_wof(a);
+    var wf = mc_wof(b);
+    var fln = mc_py(gn + MC_FLOOR_Y, a);
+    var flf = mc_py(gf + MC_FLOOR_Y, b);
+
+    # floor — far-left, far-right, near-right, near-left. u spans the floor band.
+    var ln = mc_px(cn - MC_TW, a);  var lf = mc_px(cf - MC_TW, b);
+    var rn = mc_px(cn + MC_TW, a);  var rf = mc_px(cf + MC_TW, b);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      lf, flf, wf, 0, vf,              rf, flf, wf, MC_TEX_FLOOR, vf,
+      rn, fln, wn, MC_TEX_FLOOR, vn,   ln, fln, wn, 0, vn);
+
+    # ---- ⭐⭐ EVERY TRACK IS A STRIP, INCLUDING THE MAIN ONE ---------------------------------------
+    # ⛔ The rails used to be painted into the floor texture, which spans the whole bore — so the track
+    # was as wide as the tunnel and nothing could sit beside it. Drawing each track as its own quad
+    # makes a track an OBJECT with a position and a gauge, which is what lets three of them exist at
+    # once and what makes a hop between them meaningful.
+    var GW = CFG_TRACK_HW;
+    var m0lf = mc_px(cf - GW, b);  var m0rf = mc_px(cf + GW, b);
+    var m0ln = mc_px(cn - GW, a);  var m0rn = mc_px(cn + GW, a);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      m0lf, flf, wf, MC_TEX_RAILPAIR, vf,   m0rf, flf, wf, MC_TEX_RAILEND, vf,
+      m0rn, fln, wn, MC_TEX_RAILEND, vn,    m0ln, fln, wn, MC_TEX_RAILPAIR, vn);
+
+    # ---- ⭐⭐ SIDE TRACKS: what makes a multi-rail section READ as one ------------------------------
+    # ⛔ THEY WERE ONLY EVER DRAWN WHERE THE FLOOR IS BELOW THE SCREEN. The gate was rzn < 112 and the
+    # floor does not enter the frame until ~115, so a 3-track section — 10% of every run — was never
+    # once visible. Every quad it emitted was legal, counted, and off-screen.
+    # ⇒ Drawn at every depth now, room permitting; culling pays for it by no longer spending the
+    #   budget on the off-screen slabs that were crowding it out.
+    # ⚠ ONE QUAD PER SIDE TRACK, carrying BOTH its rails from the strip at u 50..62.
+    if (multi == 1) {
+        if (mc_room(4) == 1) {
+            var R = CFG_RAIL_SEP;
+            var slf = mc_px(cf - R - GW, b);  var srf = mc_px(cf - R + GW, b);
+            var sln = mc_px(cn - R - GW, a);  var srn = mc_px(cn - R + GW, a);
+            mc_quad(&mc_vtx_a, &mc_n_a,
+              slf, flf, wf, MC_TEX_RAILPAIR, vf,   srf, flf, wf, MC_TEX_RAILEND, vf,
+              srn, fln, wn, MC_TEX_RAILEND, vn,    sln, fln, wn, MC_TEX_RAILPAIR, vn);
+            var tlf = mc_px(cf + R - GW, b);  var trf = mc_px(cf + R + GW, b);
+            var tln = mc_px(cn + R - GW, a);  var trn = mc_px(cn + R + GW, a);
+            mc_quad(&mc_vtx_a, &mc_n_a,
+              tlf, flf, wf, MC_TEX_RAILPAIR, vf,   trf, flf, wf, MC_TEX_RAILEND, vf,
+              trn, fln, wn, MC_TEX_RAILEND, vn,    tln, fln, wn, MC_TEX_RAILPAIR, vn);
+        }
+    }
+    return 0;
+}
+
+# ---- ⭐⭐ THE CART, DRAWN LAST AND NEAREST -----------------------------------------------------------
+# ⛔ THE CART IS WHY THE SCALE WAS UNREADABLE. Every dimension in this game — gauge, track separation,
+# bore, lean threshold — is measured in render units against nothing the player can see, so "wider"
+# and "narrower" were judgements with no reference. Drawing the vehicle gives the eye the one
+# measuring stick it needs, and it is the thing all those numbers are derived FROM (CFG_CART_HW).
+# ⚠ The camera trails the cart and shares its lateral offset, so the cart sits at screen centre
+# regardless of lean — the world moves past it. ⛔ DRAWN AFTER THE SLAB WALK, NOT BEFORE: op 0x0F
+# REPLACES rather than composites and the walk runs FAR TO NEAR, so the last thing written wins.
+#
+# ⭐⭐ AND IT SHOWS WHAT THE SIMULATION IS DOING, because nothing else on screen can. It used to be one
+# flat grey plate — the same plate crouched, airborne, gripping or losing the rail. Now:
+#     airborne   the whole cart rises through the jump's arc (CFG_JUMP_LIFT at the top)
+#     crouched   the rider drops below the rim, which is what clears a beam
+#     warn >= 2  the inside wheel lifts and sparks spray off the outside one — the brief's "wheel
+#                lifting, sparks", hung off cart_warn() exactly where config.cyr said it would be
+# ⚠ Every one of these reads sim state and none of them writes it. The picture can lag or skip a
+#   frame; the simulation cannot tell.
+# the slab whose [rzn, rzf) holds the cart's depth — the last endpoint at or before CFG_CART_RZ
+fn mc_cart_slab(): i64 {
+    var ci = 0;
+    var cj = 0;
+    while (cj < mc_nslab - 1) {
+        if (load64(&mc_s_rz + cj * 8) <= CFG_CART_RZ) { ci = cj; }
+        cj = cj + 1;
+    }
+    return ci;
+}
+
+# the cart: rear plate, crate, rider, jump lift, wheel tip and sparks
+fn mc_cart_draw(cam_x): i64 {
+    var cz = CFG_CART_RZ;
+    var cw = mc_wof(cz);
+    # ⚠ the centre line at the cart's depth, not at the near plane — on a bend the cart sits where the
+    # TRACK is, and reading endpoint 0 would leave it hanging off the rail through every curve.
+    mc_cl_at(mc_cart_slab(), cz);
+    var ccx = mc_clx - cam_x;
+    var base = mc_cly + MC_FLOOR_Y;                    # the rail head under the wheels
+
+    # -- the jump: a parabola over the fixed hang time, peaking at CFG_JUMP_LIFT --------------------
+    if (cart_air > 0) {
+        var e = CFG_JUMP_TICKS - cart_air;
+        base = base - (4 * CFG_JUMP_LIFT * e * (CFG_JUMP_TICKS - e)) / (CFG_JUMP_TICKS * CFG_JUMP_TICKS);
+    }
+
+    # -- which way the rail is throwing it: outward is AGAINST the bend -----------------------------
+    var outward = 0;
+    if (trk_live(trk_abs_seg) == 1) {
+        var cv = trk_curve_at(trk_abs_seg);
+        if (cv > 0) { outward = 0 - 1; }
+        if (cv < 0) { outward = 1; }
+    }
+    var warn = cart_warn();
+    var tip = 0;
+    if (warn >= 2) { tip = CFG_TIP_RU; }
+    if (warn >= 3) { tip = 2 * CFG_TIP_RU; }
+    if (outward == 0) { tip = 0; }
+    # the INSIDE wheel is the one that lifts
+    var lift_l = 0;
+    var lift_r = 0;
+    if (outward > 0) { lift_l = tip; }
+    if (outward < 0) { lift_r = tip; }
+
+    var kl  = mc_px(ccx - CFG_CART_HW, cz);
+    var kr  = mc_px(ccx + CFG_CART_HW, cz);
+    var kbl = mc_py(base - lift_l, cz);
+    var kbr = mc_py(base - lift_r, cz);
+    var ktl = mc_py(base - lift_l - CFG_CART_H, cz);
+    var ktr = mc_py(base - lift_r - CFG_CART_H, cz);
+    var rim = base - CFG_CART_H - (lift_l + lift_r) / 2;
+
+    # -- sparks off the OUTSIDE wheel, behind the body so the cart stays in front of them ----------
+    # ⚠ The flicker is a hash of the tick, never fx_rand: the simulation's generator advances with
+    #   the simulation ONLY, or a dropped frame would desynchronise the replay.
+    if (tip > 0) {
+        if (mc_room(4) == 1) {
+            var sx = ccx + outward * CFG_CART_HW;
+            var fl = (cart_ticks * 2654435761) >>> 7;
+            var reach = 8 + (fl & 7);
+            var rise  = 4 + ((fl >>> 3) & 3);
+            var sp0x = mc_px(sx, cz);
+            var sp0y = mc_py(base, cz);
+            var sp1x = mc_px(sx + outward * reach, cz);
+            var sp1y = mc_py(base - rise, cz);
+            var sp2x = mc_px(sx + outward * (reach - 3), cz);
+            var sp2y = mc_py(base - 1, cz);
+            var sp3x = mc_px(sx + outward * (reach + 2), cz);
+            var sp3y = mc_py(base - rise - 3, cz);
+            mc_emit(&mc_vtx_a, &mc_n_a,
+              sp0x, sp0y, cw, ATL_SPARK_U, ATL_SPARK_V,   sp1x, sp1y, cw, ATL_SPARK_U, ATL_SPARK_V,
+              sp2x, sp2y, cw, ATL_SPARK_U, ATL_SPARK_V);
+            mc_emit(&mc_vtx_a, &mc_n_a,
+              sp0x, sp0y - 1, cw, ATL_SPARK_U, ATL_SPARK_V,   sp3x, sp3y, cw, ATL_SPARK_U, ATL_SPARK_V,
+              sp1x, sp1y, cw, ATL_SPARK_U, ATL_SPARK_V);
+        }
+    }
+
+    # -- the body: the rear plate from the atlas ----------------------------------------------------
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      kl, ktl, cw, ATL_CART_U0, ATL_CART_V0,   kr, ktr, cw, ATL_CART_U1, ATL_CART_V0,
+      kr, kbr, cw, ATL_CART_U1, ATL_CART_V1,   kl, kbl, cw, ATL_CART_U0, ATL_CART_V1);
+
+    # -- the core crate, strapped on the right of the load bed ---------------------------------------
+    var xl = mc_px(ccx + CFG_CRATE_X0, cz);
+    var xr = mc_px(ccx + CFG_CRATE_X1, cz);
+    var yb = mc_py(rim, cz);
+    var yt = mc_py(rim - CFG_CRATE_H, cz);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      xl, yt, cw, ATL_CRATE_U0, ATL_CRATE_V0,   xr, yt, cw, ATL_CRATE_U1, ATL_CRATE_V0,
+      xr, yb, cw, ATL_CRATE_U1, ATL_CRATE_V1,   xl, yb, cw, ATL_CRATE_U0, ATL_CRATE_V1);
+
+    # -- the rider, braced on the left: a trapezoid silhouette with a helmet lamp -------------------
+    # ⭐ DUCKING IS VISIBLE: crouched, only the helmet clears the rim. That is the whole read of the
+    #   verb — the beam passes over what is left.
+    var rh = CFG_RIDER_H;
+    if (cart_crouch > 0) { rh = CFG_RIDER_DUCK_H; }
+    var bl = mc_px(ccx + CFG_RIDER_X - CFG_RIDER_HW, cz);
+    var br = mc_px(ccx + CFG_RIDER_X + CFG_RIDER_HW, cz);
+    var hl = mc_px(ccx + CFG_RIDER_X - CFG_RIDER_HEAD_HW, cz);
+    var hr = mc_px(ccx + CFG_RIDER_X + CFG_RIDER_HEAD_HW, cz);
+    var ry0 = mc_py(rim, cz);
+    var ry1 = mc_py(rim - rh, cz);
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      hl, ry1, cw, ATL_RIDER_U0, ATL_RIDER_V0,   hr, ry1, cw, ATL_RIDER_U1, ATL_RIDER_V0,
+      br, ry0, cw, ATL_RIDER_U1, ATL_RIDER_V1,   bl, ry0, cw, ATL_RIDER_U0, ATL_RIDER_V1);
+    return 0;
 }
 
 # ---- build one frame -------------------------------------------------------------------------------------
@@ -348,13 +497,29 @@ fn mc_build(cam_x): i64 {
     mc_drop_coord = 0;
     mc_drop_band = 0;
     mc_drop_full = 0;
+    mc_cull = 0;
+    mc_refused = 0;
+
+    # ---- ⭐ THE DERAIL CLOCK IS FELT AS A SHAKE --------------------------------------------------
+    # cart_derail counts consecutive ticks past the lean threshold; at CFG_DERAIL_TICKS the cart is
+    # lost. The frame shakes in proportion — the brief's "escalating shake", and the one warning that
+    # says HOW LONG is left rather than merely that something is wrong. Hashed from the tick, never
+    # drawn from fx_rand, so it cannot perturb the simulation's generator.
+    mc_shx = 0;
+    mc_shy = 0;
+    if (cart_derail > 0) {
+        var amp = 1 + (cart_derail * CFG_SHAKE_PX) / CFG_DERAIL_TICKS;
+        var hs = (cart_ticks * 2246822519) >>> 9;
+        mc_shx = (hs % (2 * amp + 1)) - amp;
+        mc_shy = ((hs >>> 8) % (2 * amp + 1)) - amp;
+    }
 
     mc_walk();
 
-    # ⚠ THE FLOOR BAND ENDS AT MC_TEX_FLOOR (u 48), not at MC_TEX_HALF (u 64). Texels 48..63 are
-    # reserved swatches and the side-track rail strip; a floor quad spanning to 64 would drag them
-    # into the main track, which is precisely how treasure came to be drawn as bits of rail.
-    var F = MC_TEX_FLOOR;     # floor material:  u in [0, F)
+    # ⚠ THE FLOOR BAND ENDS AT MC_TEX_FLOOR (see mc_floor_run), not at MC_TEX_HALF (u 64). Everything
+    # between the two is reserved — the sprite atlas, two swatches and the rail strip — and a floor
+    # quad spanning to 64 would drag them into the ballast, which is how treasure once came to be drawn
+    # as bits of rail. The rock is the other half:
     var H = MC_TEX_HALF;      # rock starts here
     var T = MC_TEXFULL;       # rock material:   u in [H, T)
 
@@ -364,7 +529,7 @@ fn mc_build(cam_x): i64 {
     # beyond the far plane came out as a hard-edged black octagon sitting in the middle of the
     # screen. It does not read as "the shaft continues into the dark"; it reads as a HOLE IN THE
     # WORLD, which is worse than a visual flaw because the player's eye goes straight to it.
-    # ⇒ One quad at the far plane, sampling the near-black texel (0,0) with a CONSTANT attribute at
+    # ⇒ One quad at the far plane, sampling the near-black cap swatch with a CONSTANT attribute at
     #   every corner. Drawn FIRST so every slab overwrites it — painter's order does the rest.
     # ⚠ It spans the full bore rather than the arch, so no sliver of bg survives at the corners.
     var capz = load64(&mc_s_rz + (mc_nslab - 1) * 8);
@@ -404,95 +569,40 @@ fn mc_build(cam_x): i64 {
         var arn = mc_py(gn - MC_ARCH_Y,       rzn); var arf = mc_py(gf - MC_ARCH_Y,       rzf);
         var cen = mc_py(gn - MC_CEIL_Y,       rzn); var cef = mc_py(gf - MC_CEIL_Y,       rzf);
 
-        # ---- ⭐ WHAT IS ON THE TRACK -------------------------------------------------------------
-        # ⛔ A HAZARD YOU CANNOT SEE IS NOT A HAZARD, IT IS A COIN FLIP. The simulation had gaps and
-        # beams working — and tested — for a while before any of this existed, which made the game
-        # unplayable by a person while passing every assertion. Drawing them is not polish.
-        var kseg = load64(&mc_s_seg + k * 8);
-        var kind = KIND_PLAIN;
-        if (trk_live(kseg) == 1) { kind = trk_kind_at(kseg); }
-
-        # ⭐ A GAP IS DRAWN BY NOT DRAWING. Omitting the floor quad leaves op 0x0F's background
-        # showing through — an actual hole in the world, at zero triangle cost, and unmistakable.
-        if (kind != KIND_GAP) {
-            # floor — far-left, far-right, near-right, near-left. u spans the floor band.
-            mc_quad(&mc_vtx_a, &mc_n_a,
-              lf, flf, wf, 0, vf,   rf, flf, wf, F, vf,
-              rn, fln, wn, F, vn,   ln, fln, wn, 0, vn);
-
-            # ---- ⭐⭐ EVERY TRACK IS A STRIP, INCLUDING THE MAIN ONE ----------------------------
-            # ⛔ The rails used to be painted into the floor texture, which spans the whole bore — so
-            # the track was as wide as the tunnel and nothing could sit beside it. Drawing each track
-            # as its own quad makes a track an OBJECT with a position and a gauge, which is what lets
-            # three of them exist at once and what makes a hop between them meaningful.
-            var GW = CFG_TRACK_HW;
-            var m0lf = mc_px(cf - GW, rzf);  var m0rf = mc_px(cf + GW, rzf);
-            var m0ln = mc_px(cn - GW, rzn);  var m0rn = mc_px(cn + GW, rzn);
-            mc_quad(&mc_vtx_a, &mc_n_a,
-              m0lf, flf, wf, MC_TEX_RAILPAIR, vf,   m0rf, flf, wf, H, vf,
-              m0rn, fln, wn, H, vn,                 m0ln, fln, wn, MC_TEX_RAILPAIR, vn);
-
-            # ---- ⭐⭐ SIDE TRACKS: what makes a multi-rail section READ as one -------------------
-            # ⛔ WIDENING THE BORE FOR THREE RAILS AND DRAWING ONE TRACK LOOKS EXACTLY LIKE THE OLD
-            # GAME. Everything scales together — walls, floor, and the texture's rails all move
-            # outward in proportion — so a wider tunnel with nothing new in it is visually identical.
-            # The widening only becomes visible when something FILLS it.
-            # ⚠ ONE QUAD PER SIDE TRACK, carrying BOTH its rails from the strip at u 50..63. Two
-            # quads per track would cost 4 triangles a slab (128 across the frustum) against ~48
-            # spare; this costs 2, and only on the near half where a rail is more than a pixel.
-            if (trk_multi_at(kseg) == 1) {
-                if (rzn < CFG_SIDE_RZ) { if (mc_room(4) == 1) {
-                        var R = CFG_RAIL_SEP;
-                        var sw = CFG_TRACK_HW;
-                        # left side track
-                        var slf = mc_px(cf - R - sw, rzf);  var srf = mc_px(cf - R + sw, rzf);
-                        var sln = mc_px(cn - R - sw, rzn);  var srn = mc_px(cn - R + sw, rzn);
-                        mc_quad(&mc_vtx_a, &mc_n_a,
-                          slf, flf, wf, MC_TEX_RAILPAIR, vf,   srf, flf, wf, H, vf,
-                          srn, fln, wn, H, vn,                 sln, fln, wn, MC_TEX_RAILPAIR, vn);
-                        # right side track
-                        var tlf = mc_px(cf + R - sw, rzf);  var trf = mc_px(cf + R + sw, rzf);
-                        var tln = mc_px(cn + R - sw, rzn);  var trn = mc_px(cn + R + sw, rzn);
-                        mc_quad(&mc_vtx_a, &mc_n_a,
-                          tlf, flf, wf, MC_TEX_RAILPAIR, vf,   trf, flf, wf, H, vf,
-                          trn, fln, wn, H, vn,                 tln, fln, wn, MC_TEX_RAILPAIR, vn);
-                    } }
+        # ---- ⭐⭐ THE FLOOR, SEGMENT BY SEGMENT -----------------------------------------------------
+        # ⛔ A GAP USED TO BE WHOLE SLABS. The floor was dropped for a slab when the segment at its NEAR
+        # endpoint was a gap — so a 3-segment gap (96 ru) out at the 64 ru slabs showed as one missing
+        # slab or two depending on alignment, popping between 64 and 128 ru as it approached; its lip
+        # snapped from boundary to boundary; and near the cart it could sit up to half a segment away
+        # from where cart_tick puts it. With the cart now drawn exactly where the rules apply, the
+        # hole it falls into has to be exactly where the rules say it is.
+        # ⇒ Each slab's floor is cut at the segment boundaries inside it and drawn as RUNS of equal
+        #   state — gap (nothing), one track, or three. A slab with one state is still one quad; the
+        #   extra quads appear only where a gap or a 3-track section begins or ends.
+        # ⭐ A GAP IS DRAWN BY NOT DRAWING. Omitting the floor leaves op 0x0F's background showing
+        # through — an actual hole in the world, at zero triangle cost, and unmistakable.
+        var sfirst = (mc_cam_ru + rzn) >>> 5;
+        var slast  = (mc_cam_ru + rzf - 1) >>> 5;
+        var run_a  = rzn;
+        var run_st = 0 - 1;                  # 0 gap, 1 one track, 2 three tracks
+        var sj = sfirst;
+        while (sj <= slast) {
+            var pa = sj * 32 - mc_cam_ru;
+            if (pa < rzn) { pa = rzn; }
+            var fseg = mc_cam_seg + sj;
+            var st = 1;
+            if (trk_live(fseg) == 1) {
+                if (trk_kind_at(fseg) == KIND_GAP) { st = 0; }
+                if (st == 1) { if (trk_multi_at(fseg) == 1) { st = 2; } }
             }
+            if (st != run_st) {
+                if (run_st > 0) { mc_floor_run(k, run_a, pa, run_st - 1, cam_x); }
+                run_a = pa;
+                run_st = st;
+            }
+            sj = sj + 1;
         }
-
-        # ⚠ A BEAM hangs across the bore at head height. Drawn from the ROCK band so it reads as
-        # structure rather than as a floor decal, and only on the near half of the frustum — a beam
-        # 40 m away is two pixels and just adds noise to the horizon.
-        if (kind == KIND_BEAM) {
-            if (rzn < CFG_BEAM_RZ) { if (mc_room(2) == 1) {
-                    var bt_n = mc_py(gn - MC_ARCH_Y, rzn);
-                    var bb_n = mc_py(gn - MC_ARCH_Y + 14, rzn);
-                    var bt_f = mc_py(gf - MC_ARCH_Y, rzf);
-                    var bb_f = mc_py(gf - MC_ARCH_Y + 14, rzf);
-                    mc_quad(&mc_vtx_a, &mc_n_a,
-                      lf, bt_f, wf, H, vf,   rf, bt_f, wf, T, vf,
-                      rn, bb_n, wn, T, vn,   ln, bb_n, wn, H, vn);
-                } }
-        }
-
-        # ⚠ TREASURE sits in its lane, just above the sleepers. Small, bright, and only drawn near —
-        # the lateral test that collects it does not care whether it was drawn, so a distant one
-        # costing triangles buys nothing.
-        if (kind == KIND_PICKUP) {
-            if (rzn < CFG_PICKUP_RZ) { if (mc_room(2) == 1) {
-                    var px = trk_lane_x(trk_lane_at(kseg)) - cam_x + cn;
-                    var p_l = mc_px(px - 5, rzn);
-                    var p_r = mc_px(px + 5, rzn);
-                    var p_b = mc_py(gn + MC_FLOOR_Y - 2, rzn);
-                    var p_t = mc_py(gn + MC_FLOOR_Y - 16, rzn);
-                    # ⛔ A CONSTANT ATTRIBUTE AT ALL FOUR CORNERS. Spanning the floor band made every
-                    # treasure a fragment of whatever floor texels it happened to cross — on screen they
-                    # read as random slivers of rail. One texel, one solid colour, one readable object.
-                    mc_quad(&mc_vtx_a, &mc_n_a,
-                      p_l, p_t, wn, MC_TEX_ORE, 0,   p_r, p_t, wn, MC_TEX_ORE, 0,
-                      p_r, p_b, wn, MC_TEX_ORE, 0,   p_l, p_b, wn, MC_TEX_ORE, 0);
-                } }
-        }
+        if (run_st > 0) { mc_floor_run(k, run_a, rzf, run_st - 1, cam_x); }
 
         # left wall — u runs floor-to-springing so the rock does not smear
         mc_quad(&mc_vtx_a, &mc_n_a,
@@ -517,53 +627,30 @@ fn mc_build(cam_x): i64 {
           rf,  arf, wf, H, vf,   crf, cef, wf, T, vf,
           crn, cen, wn, T, vn,   rn,  arn, wn, H, vn);
 
-        # ceiling — only where the chamfers drew a separate shoulder for it to sit between
-        if (rzn < CFG_CHAMFER_RZ) {
-            mc_quad(&mc_vtx_a, &mc_n_a,
-              clf, cef, wf, H, vf,   crf, cef, wf, T, vf,
-              crn, cen, wn, T, vn,   cln, cen, wn, H, vn);
-        }
+        # ceiling — ⛔ AT EVERY DEPTH. It was gated to rzn < 128 to save budget, which left the far
+        # half of the roof undrawn: op 0x0F's opaque background showed through as a black wedge
+        # across the top of EVERY frame, 15% of the upper half of the screen. The gate's coverage
+        # check passed it at 82.6%. The near ceiling it kept is above the top edge and culled anyway.
+        mc_quad(&mc_vtx_a, &mc_n_a,
+          clf, cef, wf, H, vf,   crf, cef, wf, T, vf,
+          crn, cen, wn, T, vn,   cln, cen, wn, H, vn);
 
+        mc_objects(k, rzn, rzf, cam_x);
         k = k - 1;
     }
 
-    # ---- ⭐⭐ THE CART, DRAWN LAST AND NEAREST ---------------------------------------------------
-    # ⛔ THE CART IS WHY THE SCALE WAS UNREADABLE. Every dimension in this game — gauge, track
-    # separation, bore, lean threshold — is measured in render units against nothing the player can
-    # see, so "wider" and "narrower" were judgements with no reference. Drawing the vehicle gives the
-    # eye the one measuring stick it needs, and it is the thing all those numbers are now derived
-    # FROM (CFG_CART_HW in config.cyr).
-    # ⚠ The camera IS the cart, so it sits at screen centre regardless of lean — the world moves past
-    # it. ⛔ DRAWN AFTER THE SLAB WALK, NOT BEFORE. op 0x0F REPLACES rather than composites and the
-    # walk runs FAR TO NEAR, so the last thing written wins. Drawing the cart first — which is what
-    # "it is nearest" wrongly suggests — means every slab paints over it and it never appears at all.
-    var cz  = CFG_CART_RZ;
-    var cw  = mc_wof(cz);
-    # ⚠ the centre line at the cart's depth, not at the near plane — on a bend the cart sits where
-    # the TRACK is, and reading endpoint 0 would leave it hanging off the rail through every curve.
-    # ⚠ Written as a bounded scan with an explicit found-flag. The first attempt used a sentinel
-    # (`ci = mc_nslab` to break, then subtract it back) which always resolved to endpoint 0 — the
-    # cart then sat on the near-plane centre line and slid off the rail through every bend.
-    var ci = 0;
-    var cfound = 0;
-    var cj = 0;
-    while (cj < mc_nslab) {
-        if (cfound == 0) {
-            if (load64(&mc_s_rz + cj * 8) >= cz) { ci = cj; cfound = 1; }
-        }
-        cj = cj + 1;
-    }
-    if (cfound == 0) { ci = mc_nslab - 1; }
-    var ccy = load64(&mc_s_cy + ci * 8);
-    var ccx = load64(&mc_s_cx + ci * 8) - cam_x;
-    var kl  = mc_px(ccx - CFG_CART_HW, cz);
-    var kr  = mc_px(ccx + CFG_CART_HW, cz);
-    var kb  = mc_py(ccy + MC_FLOOR_Y, cz);
-    var kt  = mc_py(ccy + MC_FLOOR_Y - CFG_CART_H, cz);
-    mc_quad(&mc_vtx_a, &mc_n_a,
-      kl, kt, cw, MC_TEX_CART, 0,   kr, kt, cw, MC_TEX_CART, 0,
-      kr, kb, cw, MC_TEX_CART, 0,   kl, kb, cw, MC_TEX_CART, 0);
-
+    # ---- ⭐⭐ THE CART IS DRAWN LAST — A DELIBERATE CHEAT ON PAINTER'S ORDER ----------------------
+    # ⛔ Strictly, anything the cart has already PASSED hangs between the camera and the cart and should
+    # be painted over it. That was tried, and measured on screen: a beam at rider height, once ducked,
+    # sits right across the camera's line of sight to the cart and hid the cart completely for ~11
+    # frames (0.2 s) — straight after the duck, which is exactly when a stacked gap needs the player
+    # to see their cart. Correct occlusion, unplayable result.
+    # ⇒ The player's own cart is never hidden by something it has left behind. Passed objects slide
+    #   behind it and off the bottom of the frame instead. Every object AHEAD of the cart is still
+    #   drawn before it, where painter's order and physics agree.
+    mc_cart_draw(cam_x);
+    # the HUD goes on top of everything, and is never shaken
+    mc_hud();
     return mc_n_a;
 }
 

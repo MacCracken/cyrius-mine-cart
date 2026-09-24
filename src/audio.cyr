@@ -64,6 +64,7 @@ var aud_svf_a2[16];
 var aud_svf_a3[16];
 var aud_svf_guard = 0;
 
+# the three SVF coefficient tables measured, not assumed: 1 if every span holds 16 slots
 fn aud_ok(): i64 {
     if ((&aud_svf_a2    - &aud_svf_a1) < 16 * 8) { return 0; }
     if ((&aud_svf_a3    - &aud_svf_a2) < 16 * 8) { return 0; }
@@ -71,23 +72,32 @@ fn aud_ok(): i64 {
     return 1;
 }
 
+# one SVF bucket: its three Q1.30 coefficients, in one call
+fn aud_st(b, a1, a2, a3): i64 {
+    store64(&aud_svf_a1 + b * 8, a1);
+    store64(&aud_svf_a2 + b * 8, a2);
+    store64(&aud_svf_a3 + b * 8, a3);
+    return 0;
+}
+
+# fill the 16-bucket SVF table (180 Hz .. 1600 Hz), precomputed with f64 on a host
 fn aud_svf_init(): i64 {
-    store64(&aud_svf_a1 +  0 * 8, 1055997993); store64(&aud_svf_a2 +  0 * 8,  12441259); store64(&aud_svf_a3 +  0 * 8,   146577);   #    180 Hz
-    store64(&aud_svf_a1 +  1 * 8, 1053242562); store64(&aud_svf_a2 +  1 * 8,  14354661); store64(&aud_svf_a3 +  1 * 8,   195640);   #    208 Hz
-    store64(&aud_svf_a1 +  2 * 8, 1050064059); store64(&aud_svf_a2 +  2 * 8,  16555638); store64(&aud_svf_a3 +  2 * 8,   261021);   #    241 Hz
-    store64(&aud_svf_a1 +  3 * 8, 1046399141); store64(&aud_svf_a2 +  3 * 8,  19085176); store64(&aud_svf_a3 +  3 * 8,   348093);   #    279 Hz
-    store64(&aud_svf_a1 +  4 * 8, 1042175523); store64(&aud_svf_a2 +  4 * 8,  21989352); store64(&aud_svf_a3 +  4 * 8,   463964);   #    322 Hz
-    store64(&aud_svf_a1 +  5 * 8, 1037310903); store64(&aud_svf_a2 +  5 * 8,  25319714); store64(&aud_svf_a3 +  5 * 8,   618029);   #    373 Hz
-    store64(&aud_svf_a1 +  6 * 8, 1031711813); store64(&aud_svf_a2 +  6 * 8,  29133585); store64(&aud_svf_a3 +  6 * 8,   822677);   #    431 Hz
-    store64(&aud_svf_a1 +  7 * 8, 1025272427); store64(&aud_svf_a2 +  7 * 8,  33494256); store64(&aud_svf_a3 +  7 * 8,  1094212);   #    499 Hz
-    store64(&aud_svf_a1 +  8 * 8, 1017873358); store64(&aud_svf_a2 +  8 * 8,  38471006); store64(&aud_svf_a3 +  8 * 8,  1454030);   #    577 Hz
-    store64(&aud_svf_a1 +  9 * 8, 1009380487); store64(&aud_svf_a2 +  9 * 8,  44138861); store64(&aud_svf_a3 +  9 * 8,  1930133);   #    668 Hz
-    store64(&aud_svf_a1 + 10 * 8,  999643887); store64(&aud_svf_a2 + 10 * 8,  50577996); store64(&aud_svf_a3 + 10 * 8,  2559045);   #    772 Hz
-    store64(&aud_svf_a1 + 11 * 8,  988496947); store64(&aud_svf_a2 + 11 * 8,  57872657); store64(&aud_svf_a3 + 11 * 8,  3388219);   #    893 Hz
-    store64(&aud_svf_a1 + 12 * 8,  975755792); store64(&aud_svf_a2 + 12 * 8,  66109437); store64(&aud_svf_a3 + 12 * 8,  4479049);   #   1034 Hz
-    store64(&aud_svf_a1 + 13 * 8,  961219171); store64(&aud_svf_a2 + 13 * 8,  75374743); store64(&aud_svf_a3 + 13 * 8,  5910569);   #   1196 Hz
-    store64(&aud_svf_a1 + 14 * 8,  944668980); store64(&aud_svf_a2 + 14 * 8,  85751235); store64(&aud_svf_a3 + 14 * 8,  7783969);   #   1383 Hz
-    store64(&aud_svf_a1 + 15 * 8,  925871622); store64(&aud_svf_a2 + 15 * 8,  97313029); store64(&aud_svf_a3 + 15 * 8, 10228011);   #   1600 Hz
+    aud_st( 0, 1055997993,  12441259,   146577);   #   180 Hz
+    aud_st( 1, 1053242562,  14354661,   195640);   #   208 Hz
+    aud_st( 2, 1050064059,  16555638,   261021);   #   241 Hz
+    aud_st( 3, 1046399141,  19085176,   348093);   #   279 Hz
+    aud_st( 4, 1042175523,  21989352,   463964);   #   322 Hz
+    aud_st( 5, 1037310903,  25319714,   618029);   #   373 Hz
+    aud_st( 6, 1031711813,  29133585,   822677);   #   431 Hz
+    aud_st( 7, 1025272427,  33494256,  1094212);   #   499 Hz
+    aud_st( 8, 1017873358,  38471006,  1454030);   #   577 Hz
+    aud_st( 9, 1009380487,  44138861,  1930133);   #   668 Hz
+    aud_st(10,  999643887,  50577996,  2559045);   #   772 Hz
+    aud_st(11,  988496947,  57872657,  3388219);   #   893 Hz
+    aud_st(12,  975755792,  66109437,  4479049);   #  1034 Hz
+    aud_st(13,  961219171,  75374743,  5910569);   #  1196 Hz
+    aud_st(14,  944668980,  85751235,  7783969);   #  1383 Hz
+    aud_st(15,  925871622,  97313029, 10228011);   #  1600 Hz
     return 0;
 }
 
@@ -101,6 +111,7 @@ var aud_ic1 = 0;
 var aud_ic2 = 0;
 var aud_bucket = 0;
 
+# one sample through the Cytomic/Simper state-variable filter; returns the low-pass output
 fn aud_svf_lp(x): i64 {
     var a1 = load64(&aud_svf_a1 + aud_bucket * 8);
     var a2 = load64(&aud_svf_a2 + aud_bucket * 8);
@@ -119,6 +130,7 @@ fn aud_svf_lp(x): i64 {
 # number of samples and desynchronise the track from the input log. Two generators, one purpose each.
 var aud_rng = 22222;
 
+# white noise in roughly [-1, 1] Q16.16, from audio's OWN xorshift — never the sim's
 fn aud_noise(): i64 {
     var x = aud_rng & 0xFFFFFFFF;
     x = (x ^ (x << 13)) & 0xFFFFFFFF;
@@ -167,6 +179,7 @@ fn aud_reset(): i64 {
 var aud_pcm[512];
 var aud_pcm_guard = 0;
 
+# the mix buffer measured: 1 if it holds one tick (800 frames) of S16 stereo
 fn aud_pcm_ok(): i64 {
     if ((&aud_pcm_guard - &aud_pcm) < AUD_FR_TICK * AUD_BPF) { return 0; }
     return 1;
@@ -198,7 +211,9 @@ fn aud_set_state(speed_q, braking, slipping): i64 {
     return 0;
 }
 
+# start the whip crack's noise burst (combat is a later step)
 fn aud_trigger_crack(): i64 { aud_crack_env = 65536; return 0; }
+# set the flood band's level, 0..65536 (the finale is a later step)
 fn aud_set_flood(amt): i64  { aud_flood_amt = amt; return 0; }
 
 # ---- one chunk of PCM ----------------------------------------------------------------------------------------
@@ -300,6 +315,7 @@ fn aud_tick(): i64 {
     return 0;
 }
 
+# release the sound device; closing zeroes the ring, so the DMA loops silence
 fn aud_close(): i64 {
     if (aud_up != 1) { return 0; }
     syscall(67, aud_slot);                                # snd_close zeroes the ring, so the
@@ -310,6 +326,8 @@ fn aud_close(): i64 {
 # The host has no sound device. aud_mix still runs — that is what --wav and the self-test use, and
 # it is the whole reason the synthesis is separable from the device.
 fn aud_init(): i64 { aud_svf_init(); return 0; }
+# top the device ring up to AUD_TARGET_FR frames; a no-op when no device is open
 fn aud_tick(): i64 { aud_mix(AUD_FR_TICK); aud_frames = aud_frames + AUD_FR_TICK; return 0; }
+# release the sound device; closing zeroes the ring, so the DMA loops silence
 fn aud_close(): i64 { return 0; }
 #endif

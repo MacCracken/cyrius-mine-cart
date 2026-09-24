@@ -1,0 +1,394 @@
+# gate.cyr — the host gate, `mine-cart --check`: will the kernel accept what this game emits?
+#
+# ⭐ Its own file so tests/deepvein.tcyr can run it too — main.cyr cannot be included by a test, because
+# its last line starts the game. The gate is the same code either way; `cyrius tests` and `--check`
+# cannot disagree about what passed.
+# ⚠ Included LAST (after gpu.cyr): it drives every other module, including the op-record packer.
+
+# ---- a mutation's verdict ----------------------------------------------------------------------
+# A planted defect must be caught EXACTLY ONCE and named by the kernel's own code. Caught-but-misnamed
+# is a failure too: the name is what a burn log would have said, and a wrong name sends the next
+# person after the wrong rule. Returns 1 if the mutation was NOT handled correctly.
+fn mc_mutation_verdict(want, name): i64 {
+    if (mc_ck_fail == 1) {
+        if (mc_ck_why == want) { ps("PASS -- reported "); ps(name); nl(); return 0; }
+        ps("FAIL -- caught, but called it "); pn(mc_ck_why); ps(" rather than "); ps(name); nl();
+        return 1;
+    }
+    ps("FAIL -- THE GATE CANNOT FAIL, so its passes mean nothing"); nl();
+    return 1;
+}
+
+# ---- the host gate ---------------------------------------------------------------------------
+# ⛔ THE ORDER HERE IS DELIBERATE AND IS THE LESSON OF THE RUNGS THIS GAME CONSUMES. The first
+# thing asserted is not "the records are correct" — it is that the gate CAN FAIL (the mutation at
+# the end) and that the frame is not EMPTY (the coverage sweep). Two blank buffers agree on
+# everything, and a validator that cannot reject has proven nothing about the frames it passed.
+fn mc_check(): i64 {
+    var bad = 0;
+    ps("mine-cart: host gate -- will the kernel accept what this game emits?"); nl(); nl();
+
+    # ---- ⭐ THE ARITHMETIC COMES FIRST, BEFORE ANY GEOMETRY CLAIM ----------------------------
+    # ⛔ Every record this gate goes on to validate is BUILT out of fx_mul, fx_sin and the track
+    # integrator. If the fixed-point core is wrong then the records may still be perfectly ABI-legal
+    # — right shape, right ranges, right reserved dwords — while describing the wrong tunnel. That
+    # is the same class of failure as the burn this repo already paid for: every assertion passing
+    # over a picture that was wrong. So the substrate is proven before anything built on it is.
+    # ⚠ Branch on != 0; never return this count as an exit status. Process exit codes truncate to 8
+    # bits, so a suite with exactly 256 failures would exit 0 and read as a pass.
+    if (fx_selftest() != 0) { bad = bad + 1; }
+    if (trk_selftest() != 0) { bad = bad + 1; }
+    if (cart_selftest() != 0) { bad = bad + 1; }
+    if (aud_selftest() != 0) { bad = bad + 1; }
+
+    # ---- buffers, MEASURED rather than assumed ----------------------------------------------
+    ps("  buffers: vertex lists ");
+    if (mc_bufs_ok() == 1) { ps("ok"); }
+    if (mc_bufs_ok() == 0) { ps("UNDER-SIZED"); bad = bad + 1; }
+    ps(", textures ");
+    if (mc_tex_ok() == 1) { ps("ok"); }
+    if (mc_tex_ok() == 0) { ps("UNDER-SIZED"); bad = bad + 1; }
+    ps(", frame buffer ");
+    if (mc_fb_ok() == 1) { ps("ok"); nl(); }
+    if (mc_fb_ok() == 0) { ps("UNDER-SIZED"); nl(); bad = bad + 1; }
+
+    mc_sin_init();
+    mc_tex_init();
+    # ⭐ the replay needs the texture (it compares final frames as PIXELS), so it runs after the init
+    if (rp_selftest() != 0) { bad = bad + 1; }
+    # both peaks start clean, so the agreement check below compares like with like
+    mc_peak_d = 0;
+    mc_peak_n = 0;
+    mc_ck_peak_d = 0;
+
+    # ---- TWO PASSES, and the split is the point -----------------------------------------------
+    # ⛔⛔ THE FIRST VERSION OF THIS GATE RAN ONE PASS OVER ARTIFICIAL CAMERA POSITIONS — the cart
+    # jammed against a tunnel wall at |x| = 60 of a 64 half-width — and then asserted a coverage
+    # floor over it. It failed at 41%, and the failure was the GATE's, not the game's: pressed
+    # against a wall, the geometry that would fill the screen lies nearer than the near plane and is
+    # not drawn, so the frame really is mostly background. The ride never produces that position;
+    # the cart tracks the rail with a lag and stays near the centre line.
+    # ⇒ A gate must probe states the system can ACTUALLY reach. So:
+    #     pass 1  the REAL ride path, driven by mc_cart_step itself — coverage asserted here
+    #     pass 2  deliberate extremes — ABI legality asserted here, and no coverage claim
+    #   ABI rules must hold everywhere, including at positions the player will never see. What the
+    #   screen looks like is only a meaningful question along the path the game actually flies.
+    var frames = 0;
+    var tris   = 0;
+    var mincov = 999999;
+    var mintop = 999999;
+    var maxlap = 0;
+    var mintri = 999999;
+    var maxtri = 0;
+    # ⛔ ACCUMULATE. mc_build RESETS the drop counters every frame, so reading them after the loop
+    # reports only the LAST frame — which said "0 dropped" while 26 triangles had gone missing
+    # across the run. A per-frame counter read once is a per-frame answer.
+    var dr_flat  = 0;
+    var dr_huge  = 0;
+    var dr_coord = 0;
+    var dr_band  = 0;
+    var dr_full  = 0;
+    var dr_cull  = 0;
+    var dr_refused = 0;
+
+    # ⛔ SEED THE RING BEFORE RIDING IT. Zeroed track globals are a perfectly legal PERFECTLY STRAIGHT
+    # track, so a gate that forgets this passes every assertion while never once exercising a curve —
+    # which is exactly the state where the accumulated centre line, the degenerate-sliver drops and
+    # the coordinate window all actually get tested. Straight track is the one case that cannot fail.
+    # ⛔⛔ THE GATE MUST PLAY THE GAME, NOT COAST THROUGH IT. This drove with cart_tick(0) — no
+    # input — which falls into the first gap at 87 m and restarts, forever. It therefore never
+    # reached a 3-track section, and reported "over-budget 0" while real play was dropping 30
+    # triangles a frame and losing the cart entirely. A gate that only probes the opening 87 m of a
+    # 500 m run is not measuring the game.
+    # ⚠ cart_autopilot() is the same reference pilot --sim and the film tool use, so the gate, the
+    # telemetry and the recorded video all traverse identical ground.
+    mc_cart_reset();
+    var f = 0;
+    while (f < 900) {
+        if (cart_tick(cart_autopilot()) == 0) { cart_reset(cart_seed, cart_chapter); }
+        var n = mc_build(cart_cam_x());
+        tris = tris + n;
+        if (n < mintri) { mintri = n; }
+        if (n > maxtri) { maxtri = n; }
+        dr_flat  = dr_flat  + mc_drop_flat;
+        dr_huge  = dr_huge  + mc_drop_huge;
+        dr_coord = dr_coord + mc_drop_coord;
+        dr_band  = dr_band  + mc_drop_band;
+        dr_full  = dr_full  + mc_drop_full;
+        dr_cull  = dr_cull  + mc_cull;
+        dr_refused = dr_refused + mc_refused;
+        frames = frames + 1;
+        mc_ck_list(&mc_vtx_a, mc_n_a);
+        if (mc_n_b != 0) { maxlap = maxlap + 1; }
+        if ((f % MC_COV_EVERY) == 0) {
+            # background EXCLUDED — see mc_ck_cover's note
+            var cov = mc_ck_cover(&mc_vtx_a, MC_BG_TRIS, mc_n_a);
+            if (cov < mincov) { mincov = cov; }
+            var tcov = mc_ck_cover_rows(&mc_vtx_a, MC_BG_TRIS, mc_n_a, 0, MC_H / 2);
+            if (tcov < mintop) { mintop = tcov; }
+        }
+        f = f + 1;
+    }
+
+    # ---- ⭐ pass 1b: THE SAME RIDE PATH, AT THE REAL ON-SCREEN OFFSET -------------------------
+    # ⛔ |D| IS EVALUATED AT THE DRAW RECT'S CORNERS, AND THE RECT NO LONGER STARTS AT (0,0). The
+    # frame is now drawn straight to its place in the back buffer, so qx1/qy1 move outward with
+    # dstxy and |D| grows with them. Measuring only at the origin would understate the one bound
+    # this gate exists to enforce. 80/96 is an 800x600 console; 960/520 is 2560x1440, the largest
+    # this game can meet — and D grows with the offset, so passing there bounds every console between.
+    var saved_dx = MC_DX;
+    var saved_dy = MC_DY;
+    var oi = 0;
+    while (oi < 2) {
+        MC_DX = 80;  MC_DY = 96;
+        if (oi == 1) { MC_DX = 960; MC_DY = 520; }
+        mc_cart_reset();
+        var q = 0;
+        while (q < 60) {
+            mc_cart_step();
+            mc_build(cart_cam_x());
+            dr_flat  = dr_flat  + mc_drop_flat;
+            dr_huge  = dr_huge  + mc_drop_huge;
+            dr_coord = dr_coord + mc_drop_coord;
+            dr_band  = dr_band  + mc_drop_band;
+            dr_full  = dr_full  + mc_drop_full;
+            dr_cull  = dr_cull  + mc_cull;
+            dr_refused = dr_refused + mc_refused;
+            frames = frames + 1;
+            mc_ck_list(&mc_vtx_a, mc_n_a);
+            q = q + 1;
+        }
+        oi = oi + 1;
+    }
+    MC_DX = saved_dx;
+    MC_DY = saved_dy;
+
+    # pass 2 — the extremes. ABI only.
+    # ⚠ THE EXTREMES ARE NOW DRIVEN BY THE TRACK, NOT BY A CLOSED FORM. There is no mc_track_x any
+    # more — curvature lives in the ring, so the only way to reach a hard-curving stretch is to ride
+    # to one. Each probe advances the sim and then jams the cart to a wall, which exercises the
+    # coordinate window against REAL accumulated centre-line offsets rather than invented ones.
+    var g = 0;
+    while (g < 60) {
+        var q = 0;
+        while (q < 17) { mc_cart_step(); q = q + 1; }
+        var cx = 0;
+        if ((g % 4) == 1) { cx = MC_TW - 2; }
+        if ((g % 4) == 2) { cx = 2 - MC_TW; }
+        if ((g % 4) == 3) { cx = 0 - (MC_TW - 2); }
+        var n2 = mc_build(cx);
+        tris = tris + n2;
+        dr_flat  = dr_flat  + mc_drop_flat;
+        dr_huge  = dr_huge  + mc_drop_huge;
+        dr_coord = dr_coord + mc_drop_coord;
+        dr_band  = dr_band  + mc_drop_band;
+        dr_full  = dr_full  + mc_drop_full;
+        dr_cull  = dr_cull  + mc_cull;
+        dr_refused = dr_refused + mc_refused;
+        frames = frames + 1;
+        mc_ck_list(&mc_vtx_a, mc_n_a);
+        if (mc_n_b != 0) { maxlap = maxlap + 1; }
+        g = g + 1;
+    }
+
+    ps("  "); pn(frames); ps(" frames built ("); pn(900); ps(" on the ride path, 120 at real screen offsets, ");
+    pn(60); ps(" at extremes), "); pn(tris); ps(" triangles"); nl();
+    ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_TRI_MAX);
+    ps(" permitted, "); pn(CFG_TRI_RESERVE); ps(" of them held in reserve for the cart"); nl();
+
+    # ---- drops, and the distinction that decides whether one is a hole -----------------------
+    # ⭐ dr_full IS THE NEWEST AND WAS THE MOST DANGEROUS OMISSION. mc_emit's over-budget path used
+    # to `return 0` without touching any counter, so a frame that silently lost its last N triangles
+    # reported a perfectly clean tally — "0 dropped" over a tunnel with the far end missing. It is
+    # grouped with the pixel-losing drops because that is exactly what it is.
+    ps("  dropped: coord "); pn(dr_coord); ps("  w-band "); pn(dr_band);
+    ps("  oversize "); pn(dr_huge); ps("  over-budget "); pn(dr_full);
+    ps(" -- these LOSE PIXELS: ");
+    if (dr_coord + dr_band + dr_huge + dr_full == 0) { ps("none"); nl(); }
+    if (dr_coord + dr_band + dr_huge + dr_full != 0) { ps("FAIL"); nl(); bad = bad + 1; }
+    ps("  dropped: degenerate "); pn(dr_flat);
+    ps(" -- cross is EXACTLY 0 (see geom.cyr), so these cover no pixel and are not holes"); nl();
+    ps("  culled: "); pn(dr_cull);
+    ps(" wholly outside the draw rect -- no sample inside them anywhere, so not drops either"); nl();
+    # ⚠ Not a failure: optional detail (side tracks, beams, gems, sparks) declining to emit because the
+    # reserve for the cart and the HUD would be breached. Reported so a budget squeeze is visible
+    # BEFORE it becomes a picture with things missing from it.
+    ps("  optional detail refused for room: "); pn(dr_refused); ps(" times"); nl();
+
+    # ---- the rule the geometry was designed around ------------------------------------------
+    ps("  peak |D| "); pn(mc_peak_d); ps(" of "); pn(MC_D_MAX);
+    ps(" permitted -- margin "); pn(MC_D_MAX / mc_peak_d); ps("x: ");
+    if (mc_peak_d <= MC_D_MAX) { ps("PASS"); nl(); }
+    if (mc_peak_d > MC_D_MAX) { ps("FAIL -- the batch would be refused GPO_E_DRANGE"); nl(); bad = bad + 1; }
+
+    ps("  peak |N| "); pn(mc_peak_n); ps(" (a register PAIR in the shader; the bound is 2^62): ");
+    if (mc_peak_n <= 4611686018427387904) { ps("PASS"); nl(); }
+    if (mc_peak_n > 4611686018427387904) { ps("FAIL"); nl(); bad = bad + 1; }
+
+    # ---- the re-parse verdict ---------------------------------------------------------------
+    ps("  re-parsed every packed record by the kernel's rules: ");
+    if (mc_ck_fail == 0) { ps("PASS -- 0 violations"); nl(); }
+    if (mc_ck_fail != 0) {
+        ps("FAIL -- "); pn(mc_ck_fail); ps(" violations, first was GPO_E_"); pn(mc_ck_why); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐⭐ THE EMITTER AND THE RE-PARSE MUST MEASURE THE SAME |D| ---------------------------
+    # ⛔ THEY DID NOT, AND NOTHING NOTICED. geom.cyr evaluates |D| at the draw rect's corners in
+    # framebuffer-absolute space, as the kernel does; the re-parse was still evaluating them at a rect
+    # pinned to (0,0), and peaked at 290,364,480 against the emitter's 277,334,400. Both passed,
+    # because both were under the bound — but the re-parse was checking four points the kernel never
+    # looks at. Two independent derivations of one quantity are only independent evidence if they
+    # AGREE; so assert that they do.
+    ps("  peak |D| from the emitter "); pn(mc_peak_d); ps(", from the re-parsed bytes "); pn(mc_ck_peak_d);
+    ps(": ");
+    if (mc_peak_d == mc_ck_peak_d) { ps("AGREE"); nl(); }
+    if (mc_peak_d != mc_ck_peak_d) {
+        ps("DISAGREE -- the gate is not checking the corners the kernel checks"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐ THE OP RECORD, AT EVERY CONSOLE THIS GAME CAN MEET ----------------------------------
+    # The record header is packed by the SAME mc_pack_op the ride dispatches, then re-parsed. Slot ids
+    # are placeholders (the kernel issues them). The triangle count is the busiest frame measured.
+    var opfail = mc_ck_fail;
+    var opd[64];                                   # ⚠ LOCAL: 64 bytes, one record
+    var gdx = MC_DX;
+    var gdy = MC_DY;
+    var ci = 0;
+    while (ci < 3) {
+        var fw = MC_W;  var fh = MC_H;  MC_DX = 0;  MC_DY = 0;       # the host: rect == screen
+        if (ci == 1) { fw = 800;  fh = 600;  MC_DX = 80;  MC_DY = 96; }
+        if (ci == 2) { fw = 2560; fh = 1440; MC_DX = 960; MC_DY = 520; }
+        mc_pack_op(&opd, 1, 2, maxtri);
+        mc_ck_op(&opd, fw, fh);
+        mc_pack_op(&opd, 1, 2, mintri);
+        mc_ck_op(&opd, fw, fh);
+        ci = ci + 1;
+    }
+    MC_DX = gdx;
+    MC_DY = gdy;
+    ps("  op record (rect, alignment, bounds, texture dims, count, 2^20 work budget) at 640x400,");
+    nl();
+    ps("    800x600 and 2560x1440: ");
+    if (mc_ck_fail == opfail) { ps("PASS"); nl(); }
+    if (mc_ck_fail != opfail) {
+        ps("FAIL -- GPO_E_"); pn(mc_ck_why); ps(" (the whole batch would be refused)"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐ NOT AN ABI RULE: is there a picture at all? --------------------------------------
+    # ⛔⛔ THE OLD FLOOR WAS "MORE THAN HALF", AND IT PASSED A BLACK HOLE IN EVERY FRAME. 0.2.1 left
+    # the far ceiling undrawn — op 0x0F's opaque background showed through as a black wedge across the
+    # top of the screen, ~17% of the upper half, on every frame of every ride — and this check said
+    # 82.6% and PASS. A threshold with that much room measures "not empty", which is not the same
+    # question as "not broken".
+    # ⇒ Two measurements now, because the two halves of the frame have different honest answers:
+    #    the TOP half is roof, arch and far wall on every frame this game can produce (a gap is a hole
+    #    in the FLOOR, and the floor never climbs above the horizon), so anything short of total is a
+    #    rendering hole. Measured over all 900 ride frames: 100% on every one. Held at 99%.
+    #    the WHOLE frame may legitimately show background through a gap under the cart. Measured
+    #    worst over all 900: 87.6%. Held at 75%.
+    var total = (MC_W / MC_CK_STEP) * (MC_H / MC_CK_STEP);
+    ps("  coverage: worst top half "); pn(mintop); ps(" of "); pn(total / 2);
+    ps(" samples (roof and walls: must be ~all of it): ");
+    if (mintop * 100 >= (total / 2) * 99) { ps("PASS"); nl(); }
+    if (mintop * 100 < (total / 2) * 99) { ps("FAIL -- a hole where the roof should be"); nl(); bad = bad + 1; }
+    ps("  coverage: worst RIDE frame fills "); pn(mincov); ps(" of "); pn(total);
+    ps(" samples, background EXCLUDED"); nl();
+    ps("    -- LEGAL AND EMPTY is the failure a burn cannot tell from a refused batch: ");
+    if (mincov * 4 >= total * 3) { ps("PASS"); nl(); }
+    if (mincov * 4 < total * 3) { ps("FAIL -- the tunnel does not fill the screen"); nl(); bad = bad + 1; }
+
+    # ---- ⭐⭐ THE FRAME MUST BE EXACTLY ONE RECORD ------------------------------------------
+    # ⛔ THIS GATE EXISTS BECAUSE 0.1.0 SHIPPED TWO AND IT COST AN IRON FRAME. op 0x0F REPLACES its
+    # whole rect — tri_persp.s writes bg to every lane no triangle covered, then stores
+    # unconditionally — so a second record over the same rect paints opaque black over everything
+    # the first drew. The first burn showed the walls and nothing else. Records do not layer, and
+    # nothing in the ABI says so; the only defence is to assert it here.
+    ps("  the frame is ONE op 0x0F record ("); pn(maxlap);
+    ps(" frames emitted a second list): ");
+    if (maxlap == 0) { ps("PASS -- op 0x0F REPLACES its rect, so records cannot be layered"); nl(); }
+    if (maxlap != 0) {
+        ps("FAIL -- a second record would black out the first"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐⭐ THE COORDINATE-FRAME GATE — op 0x0F VERTICES ARE FRAMEBUFFER-ABSOLUTE ----------
+    # ⛔⛔ THIS EXISTS BECAUSE THE OPPOSITE ASSUMPTION NEARLY WENT TO IRON. gpu_tper_prep_build folds
+    # dstxy into every plane CONSTANT, so the shader evaluates each edge at the SCREEN sample point
+    # 2*(dx+lx)+1. Emitting rect-local vertices with a non-zero dstxy pans the picture up-left by
+    # (dx,dy) — modelled at (80,96) that is 251,227 of 256,000 pixels wrong, and --verify would have
+    # failed near-totally against a PERFECTLY CORRECT kernel.
+    # ⚠ #92 carries TWO conventions: op 0x0A is rect-LOCAL, 0x0E/0x0F are ABSOLUTE. Nothing in the
+    # tree pinned that — gputri passes dstxy=0 on both — so this gate is the only thing that does.
+    # The assertion: moving dstxy must move EVERY vertex by exactly the same amount.
+    var fdx = MC_DX;
+    var fdy = MC_DY;
+    MC_DX = 0; MC_DY = 0;
+    mc_cart_to(60);
+    mc_build(cart_cam_x());
+    var n0 = mc_n_a;
+    var probe0x = mc_i32(&mc_vtx_a + 0) >>> 16;
+    var probe0y = mc_i32(&mc_vtx_a + 4) >>> 16;
+    var lastx = mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16;
+    MC_DX = 80; MC_DY = 96;
+    mc_cart_to(60);
+    mc_build(cart_cam_x());
+    var shifted = 0;
+    if (mc_n_a == n0) {
+        if ((mc_i32(&mc_vtx_a + 0) >>> 16) - probe0x == 80) {
+            if ((mc_i32(&mc_vtx_a + 4) >>> 16) - probe0y == 96) {
+                if ((mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16) - lastx == 80) { shifted = 1; }
+            }
+        }
+    }
+    MC_DX = fdx; MC_DY = fdy;
+    ps("  vertices are FRAMEBUFFER-ABSOLUTE: moving dstxy by (80,96) moves every vertex with it: ");
+    if (shifted == 1) { ps("PASS"); nl(); }
+    if (shifted != 1) {
+        ps("FAIL -- rect-local geometry with a non-zero dstxy pans the whole picture"); nl();
+        bad = bad + 1;
+    }
+
+    # ---- ⭐⭐ THE MUTATION. A gate that cannot fail has not passed. -------------------------
+    # Set one fraction bit in one coordinate of one already-accepted record — the exact defect
+    # that would cost a flash — and require the re-parse to catch it.
+    var saved_fail = mc_ck_fail;
+    var saved_why  = mc_ck_why;
+    mc_ck_fail = 0;
+    var probe = load32(&mc_vtx_a + 0) & 0xFFFFFFFF;
+    store32(&mc_vtx_a + 0, probe + 1);            # one sub-pixel bit
+    mc_ck_rec(&mc_vtx_a);
+    store32(&mc_vtx_a + 0, probe);
+    ps("  MUTATION: one fraction bit set in one coordinate is caught: ");
+    bad = bad + mc_mutation_verdict(30, "GPO_E_SUBPIXEL");
+
+    # ⚠ and the two rules this cut added to the mirror must be able to fail too, BY NAME
+    mc_ck_fail = 0;
+    store32(&mc_vtx_a + 60, 1);                   # the per-triangle reserved dword
+    mc_ck_rec(&mc_vtx_a);
+    store32(&mc_vtx_a + 60, 0);
+    ps("  MUTATION: a non-zero reserved dword is caught: ");
+    bad = bad + mc_mutation_verdict(24, "GPO_E_TRILIST");
+
+    mc_ck_fail = 0;
+    mc_pack_op(&opd, 1, 2, maxtri);
+    store32(&opd + 20, (96 * 65536) + 84);        # dx = 84: on screen, and NOT a multiple of 8
+    mc_ck_op(&opd, 800, 600);
+    ps("  MUTATION: an op record with dx off the 8-px tile is caught: ");
+    bad = bad + mc_mutation_verdict(32, "GPO_E_ALIGN");
+
+    mc_ck_fail = saved_fail;
+    mc_ck_why  = saved_why;
+
+    nl();
+    if (bad == 0) {
+        ps("mine-cart: PASS -- every record this game emits satisfies every rule #92 op 0x0F"); nl();
+        ps("           enforces, the frame is not empty, and the gate is able to fail."); nl();
+        return 95;
+    }
+    ps("mine-cart: FAIL -- "); pn(bad); ps(" propert(ies) broken; do NOT burn this."); nl();
+    return 90;
+}
+

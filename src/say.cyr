@@ -4,15 +4,19 @@
 # only), so these must have exactly one home. They lived in main.cyr first, which meant geom.cyr —
 # included earlier — could not report anything about a triangle it dropped.
 
+# length of a NUL-terminated string
 fn mc_slen(s): i64 {
     var n = 0;
     while (load8(s + n) != 0) { n = n + 1; }
     return n;
 }
 
+# print a NUL-terminated string
 fn ps(s): i64 { print(s, mc_slen(s)); return 0; }
+# print a newline
 fn nl(): i64 { print("\n", 1); return 0; }
 
+# print a signed decimal integer
 fn pn(v): i64 {
     if (v == 0) { print("0", 1); return 0; }
     var b[24];
@@ -24,4 +28,26 @@ fn pn(v): i64 {
     if (neg == 1) { print("-", 1); }
     while (i > 0) { i = i - 1; print(&b + i, 1); }
     return 0;
+}
+
+# ---- a non-negative decimal argument --------------------------------------------------------------
+# ⛔ ONE PARSER, AND IT REFUSES. There were three copies of `v = v * 10 + (c - 48)` (main, film,
+# refrender) and none of them looked at the character: `--frames 9x` parsed as 9*10 + ('x'-48) = 162,
+# and `--frames abc` as a large NEGATIVE number, which the ride loop treats as "unbounded". A typo in
+# a burn command should be named, not quietly turned into a different run.
+# Returns the value, or -1 if the string is empty or holds anything but the digits 0-9.
+fn mc_atoi(s): i64 {
+    var n = mc_slen(s);
+    if (n == 0) { return 0 - 1; }
+    if (n > 18) { return 0 - 1; }                 # past i64 range; nothing here needs it
+    var v = 0;
+    var k = 0;
+    while (k < n) {
+        var c = load8(s + k);
+        if (c < 48) { return 0 - 1; }
+        if (c > 57) { return 0 - 1; }
+        v = v * 10 + (c - 48);
+        k = k + 1;
+    }
+    return v;
 }

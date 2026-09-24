@@ -1,0 +1,106 @@
+# hud.cyr — the three numbers a player cannot feel: how deep, how fast, how much cart is left.
+#
+# ⭐ WHY THERE IS A HUD AT ALL, given a brief that says the margin must be FELT, not read. That rule is
+# about LEAN — there is still no lean bar, and there never will be; lean is the camera's offset and the
+# wall getting closer is the readout. But three things have no physical tell in this renderer:
+#     DEPTH      the score axis. The design plates put it top-left on every treatment ("1,412 m").
+#     INTEGRITY  six blocks, and a beam taken standing costs two. With nothing on screen, the third
+#                beam destroyed the cart out of nowhere — the run just ended.
+#     SPEED      against the REDLINE at 96: the one number the brake decision hangs on, and the one
+#                the apex bonus pushes past. The bar turns amber above it.
+# Every design plate carries these three, in some form; this is the plainest form of them.
+#
+# ⛔ IT IS PART OF THE SAME op 0x0F RECORD. There is no overlay op to put it in — a second 0x0F record
+# would black out the first — so the HUD is textured triangles like everything else: glyphs and swatches
+# from the sprite atlas, screen-space, drawn LAST so painter's order puts it on top. The gate therefore
+# validates it like any other geometry, and the budget reserve (CFG_TRI_RESERVE) holds room for it.
+# ⚠ Screen-space means every vertex shares one w, which makes the perspective-correct interpolation
+#   exactly affine — texels land on whole pixels because every quad is sized in whole texels.
+# ⚠ Not shaken. The derail shake moves the WORLD; a readout that jitters is a readout nobody can read.
+
+var HUD_W = 512;                     # the w every HUD vertex carries — inside the ABI band
+
+# screen position inside the draw rect, in pixels
+fn hud_x(x): i64 { return MC_DX + x; }
+# a HUD row, from draw-rect pixels to framebuffer pixels
+fn hud_y(y): i64 { return MC_DY + y; }
+
+# one screen-aligned quad, sampling the texel rectangle [u0, u1) x [v0, v1) (16.16, ends already -1)
+fn hud_quad(x0, y0, x1, y1, u0, v0, u1, v1): i64 {
+    var w = HUD_W;
+    mc_quad(&mc_vtx_a, &mc_n_a,
+      hud_x(x0), hud_y(y0), w, u0, v0,   hud_x(x1), hud_y(y0), w, u1, v0,
+      hud_x(x1), hud_y(y1), w, u1, v1,   hud_x(x0), hud_y(y1), w, u0, v1);
+    return 0;
+}
+
+# a quad of one solid texel
+fn hud_solid(x0, y0, x1, y1, tu, tv): i64 {
+    var u = (tu << 16) + 32768;
+    var v = (tv << 16) + 32768;
+    return hud_quad(x0, y0, x1, y1, u, v, u, v);
+}
+
+# ---- digits: a 3x5 font in the atlas, drawn at HUD_SCALE --------------------------------------------
+# glyph g lives at texel (32 + (g % 5) * 3, 36 + (g / 5) * 5)
+fn hud_digit(x, y, g): i64 {
+    var tu = 32 + (g % 5) * 3;
+    var tv = 36 + (g / 5) * 5;
+    return hud_quad(x, y, x + 3 * CFG_HUD_SCALE, y + 5 * CFG_HUD_SCALE,
+      tu << 16, tv << 16, ((tu + 3) << 16) - 1, ((tv + 5) << 16) - 1);
+}
+
+# ---- the three readouts --------------------------------------------------------------------------------
+fn mc_hud(): i64 {
+    if (CFG_HUD == 0) { return 0; }
+    var S = CFG_HUD_SCALE;
+    var pad = CFG_HUD_PAD;
+
+    # -- DEPTH, top-left: a four-digit odometer in metres -----------------------------------------------
+    var d = trk_depth_m();
+    if (d > 9999) { d = 9999; }
+    if (d < 0) { d = 0; }
+    var i = 0;
+    var div = 1000;
+    while (i < 4) {
+        hud_digit(pad + i * 4 * S, pad, (d / div) % 10);
+        div = div / 10;
+        i = i + 1;
+    }
+
+    # -- INTEGRITY, top-right: six pips, lit then spent ---------------------------------------------
+    # One quad for the lit run and one for the spent run, each sampling a 12-texel strip of alternating
+    # pips and gaps: 2 quads for 6 pips instead of 6.
+    var n = cart_integrity;
+    if (n < 0) { n = 0; }
+    if (n > 6) { n = 6; }
+    var px = MC_W - pad - 12 * CFG_HUD_PIP;
+    var py = pad;
+    var ph = 2 * CFG_HUD_PIP;
+    if (n > 0) {
+        hud_quad(px, py, px + 2 * n * CFG_HUD_PIP, py + ph,
+          32 << 16, 34 << 16, ((32 + 2 * n) << 16) - 1, (35 << 16) - 1);
+    }
+    if (n < 6) {
+        hud_quad(px + 2 * n * CFG_HUD_PIP, py, px + 12 * CFG_HUD_PIP, py + ph,
+          (32 + 2 * n) << 16, 35 << 16, (44 << 16) - 1, (36 << 16) - 1);
+    }
+
+    # -- SPEED, bottom-left: a bar to the absolute ceiling, a tick at the redline -------------------
+    var bw = CFG_HUD_BAR_W;
+    var bh = CFG_HUD_BAR_H;
+    var bx = pad;
+    var by = MC_H - pad - bh;
+    hud_solid(bx, by, bx + bw, by + bh, 32, 46);                        # the empty bar
+    var sp = cart_speed_sub();
+    var fill = (bw * sp) / CFG_SPEED_MAX;
+    if (fill > bw) { fill = bw; }
+    if (fill > 0) {
+        var col = 33;                                                   # cyan: under the redline
+        if (sp > CFG_SPEED_REDLINE) { col = 34; }                       # amber: over it — earned speed
+        hud_solid(bx, by, bx + fill, by + bh, col, 46);
+    }
+    var rx = bx + (bw * CFG_SPEED_REDLINE) / CFG_SPEED_MAX;
+    hud_solid(rx, by - 3, rx + 2, by + bh + 3, 35, 46);                # the redline tick
+    return 0;
+}

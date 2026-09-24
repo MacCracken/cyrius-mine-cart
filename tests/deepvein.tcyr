@@ -1,0 +1,39 @@
+# deepvein.tcyr — `cyrius tests`: the whole host gate, as a test.
+#
+# ⭐ NOT A SECOND TEST SUITE. This runs mc_check() — the exact code behind `mine-cart --check` — so the
+# toolchain's test runner and the burn gate cannot disagree about what passed: the fixed-point core,
+# the segment ring, the cart and input, the audio mix, the input replay, and then every packed record of
+# 1080 frames re-validated by the kernel's rules, with the mutations that prove the gate can fail.
+# `mine-cart --check` exits 95 on a pass (the burn convention); a test runner wants 0, so it is mapped.
+# stdlib auto-included via cyrius.cyml [deps]; the project's modules, in main.cyr's order:
+
+include "src/say.cyr"
+include "src/fx.cyr"
+include "src/fxtest.cyr"
+include "src/config.cyr"
+include "src/track.cyr"
+include "src/tracktest.cyr"
+include "src/input.cyr"
+include "src/cart.cyr"
+include "src/carttest.cyr"
+include "src/audio.cyr"
+include "src/audiotest.cyr"
+include "src/wav.cyr"
+include "src/emit.cyr"
+include "src/hud.cyr"
+include "src/geom.cyr"
+include "src/tex.cyr"
+include "src/refcore.cyr"
+include "src/replay.cyr"
+include "src/check.cyr"
+include "src/gpu.cyr"
+include "src/gate.cyr"
+
+# run the host gate; the test runner wants 0 where --check says 95
+fn main(): i64 {
+    if (mc_check() == 95) { return 0; }
+    return 1;
+}
+
+var exit_code = main();
+syscall(SYS_EXIT, exit_code);

@@ -9,6 +9,7 @@
 var att_fail = 0;
 var att_ran  = 0;
 
+# assert got == want, report the pair on failure
 fn att_eq(name, got, want): i64 {
     att_ran = att_ran + 1;
     if (got == want) { return 0; }
@@ -17,6 +18,7 @@ fn att_eq(name, got, want): i64 {
     return 1;
 }
 
+# assert a condition, report it by name on failure
 fn att_true(name, cond): i64 {
     att_ran = att_ran + 1;
     if (cond != 0) { return 0; }
@@ -84,6 +86,7 @@ fn att_zc(): i64 {
     return zc;
 }
 
+# the SVF must genuinely filter: less high-frequency energy out than in
 fn att_filter(): i64 {
     aud_svf_init();
     # lowest cutoff bucket: speed 0
@@ -204,6 +207,7 @@ fn att_nonsilent(): i64 {
     return 0;
 }
 
+# the audio suite, run by --check; returns the number of failed assertions
 fn aud_selftest(): i64 {
     att_fail = 0;
     att_ran  = 0;

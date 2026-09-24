@@ -27,6 +27,7 @@ fn fxt_eq(name, got, want): i64 {
     return 1;
 }
 
+# assert a condition, report it by name on failure
 fn fxt_true(name, cond): i64 {
     fxt_ran = fxt_ran + 1;
     if (cond != 0) { return 0; }
@@ -78,6 +79,7 @@ fn fxt_mul(): i64 {
     return 0;
 }
 
+# fx_div: exact quotients, sign handling, the divide-by-zero saturation
 fn fxt_div(): i64 {
     fxt_eq("6.0 / 3.0",   fx_div(6 * FX_ONE, 3 * FX_ONE), 2 * FX_ONE);
     fxt_eq("-6.0 / 3.0",  fx_div(0 - 6 * FX_ONE, 3 * FX_ONE), 0 - 2 * FX_ONE);
@@ -94,6 +96,7 @@ fn fxt_div(): i64 {
     return 0;
 }
 
+# fx_lerp: exact at both endpoints, monotone between
 fn fxt_lerp(): i64 {
     # ⭐ BOTH ENDPOINTS MUST BE EXACT. A lerp that lands one ulp short of b at t=1.0 makes every
     # easing in the game asymptotic instead of finished.
@@ -105,6 +108,7 @@ fn fxt_lerp(): i64 {
     return 0;
 }
 
+# clamp, abs and the xorshift generator's fixed points
 fn fxt_misc(): i64 {
     fxt_eq("clamp below", fx_clamp(0 - 5, 0, 10), 0);
     fxt_eq("clamp above", fx_clamp(50, 0, 10), 10);

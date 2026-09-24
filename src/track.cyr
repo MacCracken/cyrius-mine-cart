@@ -87,12 +87,27 @@ fn trk_ok(): i64 {
 # is not `%`.
 fn trk_slot(abs_seg): i64 { return abs_seg & CFG_RING_MASK; }
 
+# curvature of an absolute segment, brads per segment (+ = right)
 fn trk_curve_at(abs_seg): i64 { return load64(&trk_curve + trk_slot(abs_seg) * 8); }
+# grade of an absolute segment, brads per segment (+ = down)
 fn trk_grade_at(abs_seg): i64 { return load64(&trk_grade + trk_slot(abs_seg) * 8); }
+# what stands on an absolute segment: KIND_*
 fn trk_kind_at(abs_seg): i64  { return load64(&trk_kind  + trk_slot(abs_seg) * 8); }
+# an absolute segment's FLAG_* bits
 fn trk_flags_at(abs_seg): i64 { return load64(&trk_flags + trk_slot(abs_seg) * 8); }
+# the treasure lane of an absolute segment, 0..2 (rides in branch_b)
 fn trk_lane_at(abs_seg): i64  { return load64(&trk_branch_b + trk_slot(abs_seg) * 8); }
 
+# ⭐ A TREASURE THAT HAS BEEN TAKEN STOPS BEING DRAWN. The simulation sets this on the crossing that
+# collects it; nothing in the simulation reads it back, so it cannot change what the sim does — only
+# whether the renderer draws a gem the player already has.
+fn trk_take(abs_seg): i64 {
+    var s = trk_slot(abs_seg);
+    store64(&trk_flags + s * 8, load64(&trk_flags + s * 8) | FLAG_TAKEN);
+    return 0;
+}
+
+# 1 if an absolute segment is part of a three-track run
 fn trk_multi_at(abs_seg): i64 {
     if ((trk_flags_at(abs_seg) & FLAG_MULTI) != 0) { return 1; }
     return 0;
@@ -364,4 +379,5 @@ fn trk_advance(speed_sub): i64 {
 # drifts by an ulp in a direction-dependent way. pos_sub is non-negative here, but the convention is
 # uniform across the engine so that no call site has to know that.
 fn trk_depth_cm(): i64 { return trk_abs_seg * CFG_SEG_CM + (trk_pos_sub >>> 8); }
+# depth travelled, in whole metres — the score axis
 fn trk_depth_m(): i64  { return trk_depth_cm() / 100; }

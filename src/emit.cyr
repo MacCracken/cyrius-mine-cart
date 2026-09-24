@@ -1,0 +1,227 @@
+# emit.cyr — the #92 op 0x0F record emitter: vertex lists, projection, and every ABI rule, refused HERE.
+#
+# ⭐ THIS FILE IS THE GAME'S HALF OF THE op 0x0F ABI. Everything the kernel's gpo_validate_triperspec
+# refuses is refused HERE first, because a single bad record does not draw a bad triangle — it makes
+# `syscall(92, ...)` reject THE WHOLE BATCH, and the frame comes back as whatever was in the slot
+# before. On iron that is a black screen, and a black screen is indistinguishable from "no GPU",
+# "shader wrote nothing" and "readback failed".
+#
+# The rules, all of them (agnos kernel/core/syscall.cyr):
+#   · coordinates are 16.16 with the fraction EXACTLY zero        GPO_E_SUBPIXEL
+#   · |coordinate| <= 2^28 (i.e. +-4096 px)                       GPO_E_COORD
+#   · per-vertex w in [256, 4096]                                 GPO_E_WRANGE
+#   · frame area in [2^16, 2^42] — no degenerate triangles        GPO_E_AREA
+#   · texture dims are POWERS OF TWO, unconditionally             GPO_E_TEXDIM
+#   · <= 256 triangles per record                                 GPO_E_TRILIST
+#   · the per-triangle reserved dword is zero                     GPO_E_TRILIST
+#   · |D| <= 2^31-1 at the four DRAW RECT corners                 GPO_E_DRANGE
+#
+# ⚠ Split out of geom.cyr in 0.2.2 so the HUD (hud.cyr) can emit into the same record: Cyrius is
+# single-pass, and the frame builder calls the HUD while the HUD calls the emitter.
+
+# ---- the two vertex lists ---------------------------------------------------------------------
+# 64 B per triangle, exactly GPU_TPER_VTX_BYTES.
+# ⛔ SIZED IN 8-BYTE SLOTS, AND VERIFIED AT RUNTIME. A global `var X[N]` is N*8 bytes while a LOCAL
+# `var X[N]` is N bytes — an 8x asymmetry with no diagnostic either way. An under-sized vertex buffer
+# is exactly the overflow that cost the kernel's own instrument a burn: it corrupted the triangle
+# COUNT, and the symptom read as "the GPU did nothing".
+# ⚠ [2048] = 16384 B = 256 triangles, and MC_TRI_MAX is 256. THESE TWO MUST MOVE TOGETHER — raising
+# the cap without growing the array writes past the end of mc_vtx_a and into mc_vtx_b.
+var mc_vtx_a[2048];
+var mc_vtx_b[2048];        # kept so mc_bufs_ok() can still MEASURE the span at runtime
+var mc_vtx_guard = 0;
+var mc_n_a = 0;
+var mc_n_b = 0;            # ⛔ ALWAYS 0 — the frame is ONE record. See mc_build.
+
+# ---- rejection counters -------------------------------------------------------------------------
+var mc_drop_flat  = 0;     # exactly-degenerate: cross == 0, so it covers no pixel at all
+var mc_drop_huge  = 0;     # past the area ceiling — a REAL hole
+var mc_drop_coord = 0;
+var mc_drop_band  = 0;
+var mc_drop_full  = 0;     # over the per-record triangle budget. See mc_emit.
+var mc_cull       = 0;     # entirely outside the draw rect — NOT a drop: it covers no pixel anywhere
+var mc_peak_d     = 0;
+var mc_peak_n     = 0;
+var mc_trace      = 0;     # 1 = report every dropped triangle, for diagnosis
+
+# ---- projection -----------------------------------------------------------------------------------
+# rz is ALWAYS >= MC_ZN: the slab ladder is anchored to the near plane so nothing is ever behind the
+# camera and no near-plane clipping is needed. That is a geometry choice made specifically to avoid a
+# clipper, because a clipper is where sub-pixel coordinates and degenerate triangles come from, and
+# both of those are whole-batch rejections.
+#
+# ⛔⛔ VERTICES ARE FRAMEBUFFER-ABSOLUTE, NOT RECT-LOCAL. gpu_tper_prep_build folds dstxy into every
+# plane CONSTANT, so the shader evaluates each edge at the SCREEN sample point 2*(dx+lx)+1. Emitting
+# rect-local coordinates with a non-zero dstxy renders the window [dx,dx+w) x [dy,dy+h) OF THE SCENE
+# into the rect, panning the picture up-left by (dx,dy).
+# ⚠ #92 carries TWO conventions and that is why this is easy to get wrong: op 0x0A is rect-LOCAL,
+# while 0x0E and 0x0F are ABSOLUTE. main.cyr's gate asserts it rather than trusting it.
+# ⚠ mc_shx/mc_shy are the derail shake, a whole-pixel offset set once per frame in mc_build. Whole
+# pixels, so the sub-pixel ban is untouched; applied to EVERY vertex, so the gate measures it too.
+var mc_shx = 0;
+var mc_shy = 0;
+# project render-unit x at depth rz to a framebuffer-absolute pixel column
+fn mc_px(rx, rz): i64 { return MC_DX + MC_CX + mc_shx + (rx * MC_FOCAL) / rz; }
+# project render-unit y at depth rz to a framebuffer-absolute pixel row
+fn mc_py(ry, rz): i64 { return MC_DY + MC_CY + mc_shy + (ry * MC_FOCAL) / rz; }
+# the record's w for a depth: MC_WSC * rz, which the ABI bands to [256, 4096]
+fn mc_wof(rz): i64    { return MC_WSC * rz; }
+
+# ---- the band check: the kernel's own D and N arithmetic, reproduced exactly ------------------------
+# ⭐ Not a paraphrase of the rule — the same expression, on the same doubled-integer domain, at the
+# same four draw-rect corners, so "the game accepts it" and "the kernel accepts it" cannot drift.
+fn mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
+    var qx0 = 2 * MC_DX + 1;
+    var qx1 = 2 * (MC_DX + MC_W - 1) + 1;
+    var qy0 = 2 * MC_DY + 1;
+    var qy1 = 2 * (MC_DY + MC_H - 1) + 1;
+
+    var dax = 2 * x0; var day = 2 * y0;
+    var dbx = 2 * x1; var dby = 2 * y1;
+    var dcx = 2 * x2; var dcy = 2 * y2;
+
+    var W0 = 65536 / w0;
+    var W1 = 65536 / w1;
+    var W2 = 65536 / w2;
+
+    var k = 0;
+    while (k < 4) {
+        var qx = qx0; var qy = qy0;
+        if (k == 1) { qx = qx1; qy = qy0; }
+        if (k == 2) { qx = qx0; qy = qy1; }
+        if (k == 3) { qx = qx1; qy = qy1; }
+        var e0 = (dcx - dbx) * (qy - dby) - (dcy - dby) * (qx - dbx);
+        var e1 = (dax - dcx) * (qy - dcy) - (day - dcy) * (qx - dcx);
+        var e2 = (dbx - dax) * (qy - day) - (dby - day) * (qx - dax);
+
+        var D = e0 * W0 + e1 * W1 + e2 * W2;
+        if (D < 0) { D = 0 - D; }
+        if (D > mc_peak_d) { mc_peak_d = D; }
+        if (D > MC_D_MAX) { return 0; }
+
+        var Nu = e0 * (W0 * u0) + e1 * (W1 * u1) + e2 * (W2 * u2);
+        var Nv = e0 * (W0 * v0) + e1 * (W1 * v1) + e2 * (W2 * v2);
+        if (Nu < 0) { Nu = 0 - Nu; }
+        if (Nv < 0) { Nv = 0 - Nv; }
+        if (Nu > mc_peak_n) { mc_peak_n = Nu; }
+        if (Nv > mc_peak_n) { mc_peak_n = Nv; }
+        k = k + 1;
+    }
+    return 1;
+}
+
+# ---- emit one triangle ------------------------------------------------------------------------------
+# Returns 1 when written, 0 when DROPPED. A drop is a visible hole, so every drop is counted.
+fn mc_emit(list, np, x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2): i64 {
+    var n = load64(np);
+
+    # ---- ⭐⭐ CULL WHAT CANNOT BE SEEN, BEFORE IT SPENDS THE BUDGET --------------------------------
+    # ⛔ A QUARTER OF EVERY FRAME WAS DRAWN BELOW, ABOVE OR BESIDE THE SCREEN. The floor sits 72 ru
+    # below the eye, so it does not enter the frame until rz ~115; the ceiling likewise; the walls
+    # until rz ~84. Every slab nearer than that still emitted its floor, track, ceiling and walls —
+    # legal, rasterised to nothing, and paid for out of a 256-triangle record, which is why the far
+    # ceiling, the side tracks and the treasure had all been distance-gated into invisibility to
+    # make room for geometry nobody could see.
+    # ⭐ THIS IS EXACT, NOT A HEURISTIC. Pixel centres are the doubled points 2*p+1 for p in
+    # [DX, DX+W). If every vertex has x <= DX, every point of the triangle has doubled x <= 2*DX, which
+    # is left of the first centre, so no sample is inside it — in this rasteriser, the reference, or
+    # the kernel's. Likewise on the other three sides. Dropping such a triangle changes no pixel, and
+    # the film is byte-identical with and without this block.
+    if (x0 <= MC_DX) { if (x1 <= MC_DX) { if (x2 <= MC_DX) { mc_cull = mc_cull + 1; return 0; } } }
+    if (y0 <= MC_DY) { if (y1 <= MC_DY) { if (y2 <= MC_DY) { mc_cull = mc_cull + 1; return 0; } } }
+    var xe = MC_DX + MC_W;
+    var ye = MC_DY + MC_H;
+    if (x0 >= xe) { if (x1 >= xe) { if (x2 >= xe) { mc_cull = mc_cull + 1; return 0; } } }
+    if (y0 >= ye) { if (y1 >= ye) { if (y2 >= ye) { mc_cull = mc_cull + 1; return 0; } } }
+
+    # ⭐ THIS DROP USED TO BE SILENT AND UNCOUNTED, AND THAT WAS THE ONE REJECTION PATH THE GATE
+    # COULD NOT SEE. A frame that quietly lost its last N triangles reported a perfectly clean drop
+    # tally — "0 dropped" over a tunnel with the far end missing. Budget the geometry analytically;
+    # never discover the cap at runtime.
+    if (n >= MC_TRI_MAX) { mc_drop_full = mc_drop_full + 1; return 0; }
+
+    # coordinate window, +-4096 px
+    if (x0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y0 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y1 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y2 > 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (x2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y0 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y1 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+    if (y2 < 0 - 4096) { mc_drop_coord = mc_drop_coord + 1; return 0; }
+
+    # w band — the kernel refuses, never rescales
+    if (w0 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w1 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w2 < MC_W_MIN) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w0 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w1 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+    if (w2 > MC_W_MAX) { mc_drop_band = mc_drop_band + 1; return 0; }
+
+    # frame area, in the kernel's doubled-integer domain
+    var dax = 2 * x0; var day = 2 * y0;
+    var dbx = 2 * x1; var dby = 2 * y1;
+    var dcx = 2 * x2; var dcy = 2 * y2;
+    var cross = ((dbx - dax) * (dcy - day) - (dby - day) * (dcx - dax)) / 4;
+    if (cross < 0) { cross = 0 - cross; }
+    # ⭐ THE AREA-MIN RULE CAN ONLY FIRE AT cross == 0, and that decides whether a drop is a hole.
+    # a2 is |cross| << 16 and MC_AREA_MIN is 1 << 16, so a2 < MC_AREA_MIN requires |cross| == 0 — the
+    # triangle is EXACTLY collinear and covers no pixel in any rasteriser. Far slabs produce these
+    # routinely once the track curves: two edges a fraction of a pixel apart round to the same
+    # integer column, and the ABI forbids sub-pixel coordinates.
+    # ⚠ SO THE GATE MUST NOT ASSERT "all drops are zero" — it must hold coord/band/huge/full at zero
+    # and report flat separately. A curving track legitimately produces ~1 flat drop per frame.
+    var a2 = cross << 16;
+    if (a2 < MC_AREA_MIN) {
+        mc_drop_flat = mc_drop_flat + 1;
+        if (mc_trace == 1) {
+            ps("    degenerate: ("); pn(x0); ps(","); pn(y0); ps(") (");
+            pn(x1); ps(","); pn(y1); ps(") ("); pn(x2); ps(","); pn(y2);
+            ps(")  w "); pn(w0); ps("/"); pn(w1); ps("/"); pn(w2); nl();
+        }
+        return 0;
+    }
+    if (a2 > MC_AREA_MAX) { mc_drop_huge = mc_drop_huge + 1; return 0; }
+
+    if (mc_band_check(x0, y0, w0, u0, v0, x1, y1, w1, u1, v1, x2, y2, w2, u2, v2) == 0) {
+        mc_drop_band = mc_drop_band + 1;
+        return 0;
+    }
+
+    var b = list + n * 64;
+    store32(b +  0, x0 << 16); store32(b +  4, y0 << 16); store32(b +  8, w0);
+    store32(b + 12, u0);       store32(b + 16, v0);
+    store32(b + 20, x1 << 16); store32(b + 24, y1 << 16); store32(b + 28, w1);
+    store32(b + 32, u1);       store32(b + 36, v1);
+    store32(b + 40, x2 << 16); store32(b + 44, y2 << 16); store32(b + 48, w2);
+    store32(b + 52, u2);       store32(b + 56, v2);
+    store32(b + 60, 0);                       # the reserved dword — non-zero is GPO_E_TRILIST
+    store64(np, n + 1);
+    return 1;
+}
+
+# emit a quad as two triangles, corners in order a-b-c-d
+fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd): i64 {
+    var got = 0;
+    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc);
+    got = got + mc_emit(list, np, xa, ya, wa, ua, va, xc, yc, wc, uc, vc, xd, yd, wd, ud, vd);
+    return got;
+}
+
+# ---- the budget reserve --------------------------------------------------------------------------
+# ⛔ OPTIONAL DETAIL ASKS PERMISSION. The per-record cap is 256 and mc_emit's over-budget path drops
+# silently — so whatever is emitted LAST is whatever gets lost, and the cart is drawn last because
+# painter's order demands it. Gating optional geometry on remaining room inverts that: the things
+# that can be spared are the things that go.
+var mc_refused = 0;        # optional detail declined for want of room this frame — counted, not silent
+
+# 1 if n more optional triangles fit without eating the cart-and-HUD reserve
+fn mc_room(n): i64 {
+    if (mc_n_a + n <= MC_TRI_MAX - CFG_TRI_RESERVE) { return 1; }
+    mc_refused = mc_refused + 1;
+    return 0;
+}

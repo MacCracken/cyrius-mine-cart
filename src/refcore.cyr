@@ -12,10 +12,13 @@
 # ⭐ The arithmetic is the KERNEL'S, deliberately: doubled-integer pixel centres 2*p+1, edge functions
 # in that domain, W = 2^16/w, D = sum(e_i*W_i), N = sum(e_i*W_i*attr_i), u = N/D. Same expressions
 # gpo_validate_triperspec bounds and tri_persp.s evaluates. Disagreement IS the evidence.
-var rr_fb[128000];          # 640*400*4 = 1,024,000 B
+# ⭐ HEAP, NOT A 1 MB STATIC ARRAY — a megabyte of zeros in every binary that includes the reference,
+# which is the game itself (for --verify). Allocated on first use by rr_fb_ok().
+var rr_fb = 0;              # 640*400*4 = 1,024,000 B
 var rr_drawn = 0;           # pixels written this frame
 var rr_tris  = 0;           # triangles that covered at least one pixel
 
+# load a 32-bit field sign-extended, exactly as the shader reads a coordinate
 fn rr_i32(p): i64 {
     var v = load32(p) & 0xFFFFFFFF;
     if (v >= 2147483648) { v = v - 4294967296; }
@@ -32,12 +35,20 @@ fn rr_i32(p): i64 {
 # which is what makes layering two records over one rect visibly destructive here too.
 var MC_BG = 0xFF000000;
 
-fn rr_clear(): i64 {
-    var i = 0;
-    while (i < MC_W * MC_H) { store32(&rr_fb + i * 4, MC_BG); i = i + 1; }
-    return 0;
+# the reference frame buffer, allocated on first use: 1 if it exists
+fn rr_fb_ok(): i64 {
+    if (rr_fb == 0) { rr_fb = alloc(MC_W * MC_H * 4); }
+    if (rr_fb == 0) { return 0; }
+    return 1;
 }
 
+# fill the whole rect with op 0x0F's background, as the op does before any triangle
+fn rr_clear(): i64 {
+    if (rr_fb_ok() == 0) { return 0; }
+    var i = 0;
+    while (i < MC_W * MC_H) { store32(rr_fb + i * 4, MC_BG); i = i + 1; }
+    return 0;
+}
 
 # rasterise ONE triangle, perspective-correct, nearest-neighbour, REPLACE (op 0x0F's semantics)
 fn rr_tri(b, tex): i64 {
@@ -105,7 +116,7 @@ fn rr_tri(b, tex): i64 {
                     var tx = (uu >>> 16) & (MC_TEX - 1);
                     var ty = (vv >>> 16) & (MC_TEX - 1);
                     var c = load32(tex + (ty * MC_TEX + tx) * 4) & 0xFFFFFFFF;
-                    store32(&rr_fb + ((py - MC_DY) * MC_W + (px - MC_DX)) * 4, c);
+                    store32(rr_fb + ((py - MC_DY) * MC_W + (px - MC_DX)) * 4, c);
                     rr_drawn = rr_drawn + 1;
                     hit = 1;
                 }
@@ -118,7 +129,9 @@ fn rr_tri(b, tex): i64 {
     return 0;
 }
 
+# rasterise a list of packed triangles in order, into rr_fb
 fn rr_list(list, n, tex): i64 {
+    if (rr_fb_ok() == 0) { return 0; }
     var i = 0;
     while (i < n) { rr_tri(list + i * 64, tex); i = i + 1; }
     return 0;
@@ -127,7 +140,6 @@ fn rr_list(list, n, tex): i64 {
 # one op 0x0F record: bg over the WHOLE rect, then its triangles. Defined after rr_list because
 # Cyrius is single-pass.
 fn rr_record(list, n, tex): i64 {
-    var i = 0;
-    while (i < MC_W * MC_H) { store32(&rr_fb + i * 4, MC_BG); i = i + 1; }
+    rr_clear();
     return rr_list(list, n, tex);
 }

@@ -52,12 +52,14 @@ var SC_RIGHT = 205;        # 0xE0 0x4D -> 128 + 0x4D
 var SC_UP    = 200;        # 0xE0 0x48
 var SC_DOWN  = 208;        # 0xE0 0x50
 
+# the key-state pools measured: 1 if each spans 256 slots
 fn in_ok(): i64 {
     if ((&in_edge  - &in_held) < 256 * 8) { return 0; }
     if ((&in_guard - &in_edge) < 256 * 8) { return 0; }
     return 1;
 }
 
+# forget every key, carry, and tap — a new chapter starts with clean hands
 fn in_reset(): i64 {
     var i = 0;
     while (i < 256) {
@@ -85,7 +87,9 @@ fn in_flush_edges(): i64 {
     return 0;
 }
 
+# 1 while the key with this scancode index is down
 fn in_held_at(sc): i64 { return load64(&in_held + (sc & 255) * 8); }
+# 1 if the key went down since the last in_flush_edges()
 fn in_edge_at(sc): i64 { return load64(&in_edge + (sc & 255) * 8); }
 
 # ---- decode one drained scancode ----------------------------------------------------------------
@@ -155,6 +159,7 @@ var in_sw_r      = 0;
 # not ask for, at a fork, is about the worst input bug this game could have.
 var in_taps_frame = 0 - 1;
 
+# advance the device-side tick counter the double-tap detector measures in
 fn in_tick(): i64 {
     in_frame = in_frame + 1;
     in_sw_l = 0;

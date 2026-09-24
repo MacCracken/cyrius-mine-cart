@@ -25,31 +25,28 @@ include "src/config.cyr"
 include "src/track.cyr"
 include "src/input.cyr"
 include "src/cart.cyr"
+include "src/emit.cyr"
+include "src/hud.cyr"
 include "src/geom.cyr"
 include "src/tex.cyr"
 include "src/refcore.cyr"
 
+# render frame N (optionally at a dstxy offset) through the CPU reference to /tmp/mc_ref.raw
 fn main(): i64 {
     args_init();
     var frame = 120;
-    if (argc() > 1) {
-        var s = argv(1);
-        var v = 0;
-        var k = 0;
-        while (load8(s + k) != 0) { v = v * 10 + (load8(s + k) - 48); k = k + 1; }
-        frame = v;
-    }
+    if (argc() > 1) { frame = mc_atoi(argv(1)); }
+    if (frame < 0) { ps("refrender: frame must be a whole number"); nl(); return 2; }
 
     # optional dx dy — ⭐ THE INVARIANCE TEST. Vertices are framebuffer-absolute and refcore
     # rebases to rect-local, so the rendered IMAGE must be byte-identical for every dstxy. If it is
     # not, the game and the kernel disagree about the coordinate frame — which is exactly the defect
     # that nearly went to iron.
     if (argc() > 3) {
-        var sx = argv(2); var sy = argv(3);
-        var vx = 0; var kx = 0;
-        while (load8(sx + kx) != 0) { vx = vx * 10 + (load8(sx + kx) - 48); kx = kx + 1; }
-        var vy = 0; var ky = 0;
-        while (load8(sy + ky) != 0) { vy = vy * 10 + (load8(sy + ky) - 48); ky = ky + 1; }
+        var vx = mc_atoi(argv(2));
+        var vy = mc_atoi(argv(3));
+        if (vx < 0) { ps("refrender: dx must be a whole number"); nl(); return 2; }
+        if (vy < 0) { ps("refrender: dy must be a whole number"); nl(); return 2; }
         MC_DX = vx; MC_DY = vy;
     }
 
@@ -65,20 +62,20 @@ fn main(): i64 {
     ps("refrender: frame "); pn(frame); ps("  dstxy ("); pn(MC_DX); ps(","); pn(MC_DY);
     ps(")  lean "); pn(cart_cam_x());
     ps(" ru  depth "); pn(trk_depth_m()); ps(" m  "); pn(cart_kmh()); ps(" km/h"); nl();
-    ps("  ONE record, "); pn(mc_n_a); ps(" triangles (far cap, floor, walls, chamfers, ceiling)"); nl();
+    ps("  ONE record, "); pn(mc_n_a); ps(" triangles (bore, floor, tracks, hazards, cart, HUD)"); nl();
 
-    # RECORD ORDER, exactly as mc_gpu_frame dispatches it: A with the floor texture, then B with rock
+    # exactly as mc_gpu_frame dispatches it: ONE record, one texture (layering two was the 0.1.0 defect)
     # ⛔ rr_record, NOT rr_list — an op 0x0F record REPLACES its whole rect with bg first.
-    # ONE record now: layering two was the 0.1.0 defect.
     rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
     var after_a = rr_drawn;
     var tris_a  = rr_tris;
 
     ps("  the single record wrote "); pn(after_a); ps(" px from "); pn(tris_a);
     ps(" covering triangles"); nl();
-    ps("  total "); pn(rr_drawn); ps(" of "); pn(MC_W * MC_H); ps(" pixels touched"); nl();
+    ps("  "); pn(rr_drawn); ps(" pixel writes (overdraw included) over a "); pn(MC_W * MC_H);
+    ps("-pixel rect"); nl();
 
-    file_write_all("/tmp/mc_ref.raw", &rr_fb, MC_W * MC_H * 4);
+    file_write_all("/tmp/mc_ref.raw", rr_fb, MC_W * MC_H * 4);
     ps("  wrote /tmp/mc_ref.raw ("); pn(MC_W); ps("x"); pn(MC_H); ps(" BGRA)"); nl();
     return 0;
 }

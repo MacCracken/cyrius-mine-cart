@@ -1,0 +1,258 @@
+# replay.cyr — the input log: record a ride, replay it anywhere, prove it reproduced exactly.
+#
+# ⭐⭐ WHY THIS IS THE TEST THAT MATTERS MOST ON THIS TARGET. There is no debugger on AGNOS iron, no
+# core dump, no way to single-step a ride that went wrong. What there is instead is determinism: the
+# simulation is a pure function of (seed, input word per tick) — no clock, no keyboard, no rng outside
+# the generator — so a ride is fully described by its seed and its list of words. Record that list on
+# iron, replay it on a host, and the host reproduces the ride exactly: same track, same deaths, same
+# final frame, byte for byte. That makes every iron session a regression test, and every bug report
+# a file.
+# ⇒ This is step 11 of the build order. The input-word boundary (input.cyr) and the per-chapter seed
+#   (track.cyr) were laid down for it from the start; this file is the part that was missing.
+#
+# ⛔ WHAT MAKES THE CLAIM CHECKABLE RATHER THAN HOPEFUL: the log carries its own expected answer. The
+# recorder writes, after the words, a hash of the simulation state accumulated over EVERY tick and a
+# hash of the final frame's triangle list. A replay recomputes both and compares. "It looked the same"
+# is not a result; two 32-bit hashes that match over tens of thousands of ticks are.
+#
+# ---- the log format, little-endian ---------------------------------------------------------------
+#     0  "DVRP"                 magic
+#     4  u16 version = 1, u16 reserved = 0
+#     8  u32 seed
+#    12  u32 chapter
+#    16  u32 ticks              the number of words that follow
+#    20  u16 word[ticks]        exactly the words cart_tick() was handed, in order
+#     .  u32 state hash         over every tick (see rp_state)
+#     .  u32 frame hash         the final frame's packed op 0x0F triangle list
+# The words are the SIMULATION's input: IN_QUIT never reaches cart_tick, so it is never recorded.
+
+var RP_HDR     = 20;
+var RP_TRAILER = 8;
+var RP_MAX_TICKS = 216000;          # one hour at 60 Hz — 432 KB of words
+
+var rp_buf   = 0;                   # the log being recorded (heap)
+var rp_ticks = 0;
+var rp_on    = 0;                   # 1 while recording
+var rp_hash  = 0;                   # the running state hash of the ride being recorded or replayed
+var rp_err   = 0;                   # why a log was refused, for the report
+
+# ---- hashing ---------------------------------------------------------------------------------------
+# 32-bit FNV-1a over the low and high halves of each value. Not cryptographic; it only has to make an
+# accidental match between two different rides vanishingly unlikely, and it has to be the same
+# arithmetic on every target — so it is masked to 32 bits after every step and uses no shifts of
+# signed quantities.
+fn rp_mix(h, v): i64 {
+    h = ((h ^ (v & 0xFFFFFFFF)) * 16777619) & 0xFFFFFFFF;
+    h = ((h ^ ((v >>> 32) & 0xFFFFFFFF)) * 16777619) & 0xFFFFFFFF;
+    return h;
+}
+
+# ⭐ EVERYTHING THE NEXT TICK DEPENDS ON, folded in once per tick. If any of it diverged at any tick
+# of the ride, the final hash differs — a replay cannot drift and quietly converge back.
+fn rp_state(h): i64 {
+    h = rp_mix(h, trk_abs_seg);
+    h = rp_mix(h, trk_pos_sub);
+    h = rp_mix(h, trk_gen_to);
+    h = rp_mix(h, fx_rng);
+    h = rp_mix(h, cart_speed);
+    h = rp_mix(h, cart_lean);
+    h = rp_mix(h, cart_lean_vel);
+    h = rp_mix(h, cart_derail);
+    h = rp_mix(h, cart_bonus);
+    h = rp_mix(h, cart_slip);
+    h = rp_mix(h, cart_air);
+    h = rp_mix(h, cart_crouch);
+    h = rp_mix(h, cart_integrity);
+    h = rp_mix(h, cart_score);
+    h = rp_mix(h, cart_treasure);
+    h = rp_mix(h, cart_prev_curve);
+    h = rp_mix(h, cart_apex_armed);
+    h = rp_mix(h, cart_dead);
+    h = rp_mix(h, cart_ticks);
+    # ⚠ NOT cart_apex_hits / cart_derails: they are SESSION totals that cart_reset leaves alone, so
+    # they would make a replay's hash depend on whatever else ran earlier in the same process.
+    return h;
+}
+
+# the frame, as the kernel would receive it: the packed triangle list, every byte
+fn rp_frame_hash(): i64 {
+    var h = rp_mix(2166136261, mc_n_a);
+    var i = 0;
+    while (i < mc_n_a * 16) {
+        h = rp_mix(h, load32(&mc_vtx_a + i * 4) & 0xFFFFFFFF);
+        i = i + 1;
+    }
+    return h;
+}
+
+# ---- little-endian field access -------------------------------------------------------------------
+fn rp_put16(p, v): i64 { store8(p, v & 255); store8(p + 1, (v >>> 8) & 255); return 0; }
+# store a little-endian u32
+fn rp_put32(p, v): i64 { rp_put16(p, v & 65535); rp_put16(p + 2, (v >>> 16) & 65535); return 0; }
+# load a little-endian u16
+fn rp_get16(p): i64 { return (load8(p) & 255) + (load8(p + 1) & 255) * 256; }
+# load a little-endian u32
+fn rp_get32(p): i64 { return rp_get16(p) + rp_get16(p + 2) * 65536; }
+
+# ---- recording ---------------------------------------------------------------------------------------
+fn rp_begin(seed, chapter): i64 {
+    if (rp_buf == 0) { rp_buf = alloc(RP_HDR + RP_MAX_TICKS * 2 + RP_TRAILER); }
+    if (rp_buf == 0) { rp_on = 0; return 0; }
+    store8(rp_buf + 0, 68); store8(rp_buf + 1, 86); store8(rp_buf + 2, 82); store8(rp_buf + 3, 80);
+    rp_put16(rp_buf + 4, 1);
+    rp_put16(rp_buf + 6, 0);
+    rp_put32(rp_buf + 8, seed);
+    rp_put32(rp_buf + 12, chapter);
+    rp_ticks = 0;
+    rp_hash  = 2166136261;
+    rp_on    = 1;
+    return 1;
+}
+
+# ⭐ ONE CALL PER cart_tick, WITH THE SAME WORD, AFTER THE TICK (and after any death-restart), so the
+# state folded into the hash is the state the next tick starts from — on the recorder and the
+# replayer alike. A log that has hit its capacity simply stops growing; the ride goes on.
+fn rp_note(word): i64 {
+    if (rp_on != 1) { return 0; }
+    if (rp_ticks >= RP_MAX_TICKS) { return 0; }
+    rp_put16(rp_buf + RP_HDR + rp_ticks * 2, word & 65535);
+    rp_ticks = rp_ticks + 1;
+    rp_hash = rp_state(rp_hash);
+    return 1;
+}
+
+# seal the log: the count, then the two expected answers. Returns the log's length in bytes.
+fn rp_end(): i64 {
+    if (rp_on != 1) { return 0; }
+    rp_put32(rp_buf + 16, rp_ticks);
+    var t = rp_buf + RP_HDR + rp_ticks * 2;
+    rp_put32(t, rp_hash);
+    rp_put32(t + 4, rp_frame_hash());
+    rp_on = 0;
+    return RP_HDR + rp_ticks * 2 + RP_TRAILER;
+}
+
+# ---- replaying ---------------------------------------------------------------------------------------
+# Returns 1 if the replay reproduced BOTH recorded hashes, 0 if it diverged, and -1 if the log itself
+# is unreadable (rp_err says why). rp_hash / mc_n_a hold what the replay actually produced.
+var rp_want_state = 0;
+var rp_want_frame = 0;
+var rp_got_frame  = 0;
+
+# replay a log: 1 = both recorded hashes reproduced, 0 = diverged, -1 = not a log
+fn rp_run(buf, len): i64 {
+    rp_err = 0;
+    if (len < RP_HDR + RP_TRAILER) { rp_err = 1; return 0 - 1; }                 # too short
+    if (load8(buf + 0) != 68) { rp_err = 2; return 0 - 1; }                    # "DVRP"
+    if (load8(buf + 1) != 86) { rp_err = 2; return 0 - 1; }
+    if (load8(buf + 2) != 82) { rp_err = 2; return 0 - 1; }
+    if (load8(buf + 3) != 80) { rp_err = 2; return 0 - 1; }
+    if (rp_get16(buf + 4) != 1) { rp_err = 3; return 0 - 1; }                  # version
+    var seed    = rp_get32(buf + 8);
+    var chapter = rp_get32(buf + 12);
+    var ticks   = rp_get32(buf + 16);
+    if (ticks > RP_MAX_TICKS) { rp_err = 4; return 0 - 1; }
+    if (len != RP_HDR + ticks * 2 + RP_TRAILER) { rp_err = 4; return 0 - 1; }   # count vs size
+    rp_want_state = rp_get32(buf + RP_HDR + ticks * 2);
+    rp_want_frame = rp_get32(buf + RP_HDR + ticks * 2 + 4);
+
+    # ⚠ EXACTLY THE RIDE'S LOOP: one word to cart_tick, a death restarts the chapter with the same
+    # seed, then the state is folded in. Anything the ride does between ticks that touches the
+    # simulation must be mirrored here, and nothing else does.
+    cart_reset(seed, chapter);
+    rp_hash = 2166136261;
+    var t = 0;
+    while (t < ticks) {
+        var word = rp_get16(buf + RP_HDR + t * 2);
+        if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
+        rp_hash = rp_state(rp_hash);
+        t = t + 1;
+    }
+    mc_build(cart_cam_x());
+    rp_got_frame = rp_frame_hash();
+    if (rp_hash != rp_want_state) { return 0; }
+    if (rp_got_frame != rp_want_frame) { return 0; }
+    return 1;
+}
+
+# ---- the self-test, run by --check -----------------------------------------------------------------
+# ⭐ RECORD A RIDE, REPLAY IT, AND THEN PROVE THE REPLAY CAN FAIL. A replay test that cannot notice a
+# changed input proves nothing about the inputs it passed — so one bit of one word is flipped and the
+# replay is required to DIVERGE.
+var rpt_fail = 0;
+var rpt_ran  = 0;
+
+# assert a condition, report it by name on failure
+fn rpt_true(name, cond): i64 {
+    rpt_ran = rpt_ran + 1;
+    if (cond != 0) { return 0; }
+    rpt_fail = rpt_fail + 1;
+    ps("    FAIL "); ps(name); ps(": condition false"); nl();
+    return 1;
+}
+
+# record `ticks` of the reference autopilot into rp_buf, the way the ride records a person
+fn rpt_record(ticks): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    rp_begin(CFG_SEED_DEFAULT, 0);
+    var t = 0;
+    while (t < ticks) {
+        var word = cart_autopilot();
+        if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
+        rp_note(word);
+        t = t + 1;
+    }
+    mc_build(cart_cam_x());
+    return rp_end();
+}
+
+# the replay suite, run by --check; returns the number of failed assertions
+fn rp_selftest(): i64 {
+    rpt_fail = 0;
+    rpt_ran  = 0;
+
+    # 2400 ticks = 40 s: long enough to cross hazards, three-track runs and at least one gap
+    var len = rpt_record(2400);
+    rpt_true("a 40 s ride records", len == RP_HDR + 2400 * 2 + RP_TRAILER);
+    var rec_state = rp_hash;
+    var rec_frame = rp_get32(rp_buf + RP_HDR + 2400 * 2 + 4);
+    # the frame the recorder saw, as PIXELS — the claim is "byte-identical frame", so check bytes
+    rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+    var rec_px = rp_mix(2166136261, 0);
+    var i = 0;
+    while (i < MC_W * MC_H) { rec_px = rp_mix(rec_px, load32(rr_fb + i * 4) & 0xFFFFFFFF); i = i + 1; }
+
+    rpt_true("the replay reproduces the ride", rp_run(rp_buf, len) == 1);
+    rpt_true("...the same state at every tick", rp_hash == rec_state);
+    rpt_true("...and the same final frame", rp_got_frame == rec_frame);
+    rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+    var rep_px = rp_mix(2166136261, 0);
+    i = 0;
+    while (i < MC_W * MC_H) { rep_px = rp_mix(rep_px, load32(rr_fb + i * 4) & 0xFFFFFFFF); i = i + 1; }
+    rpt_true("...byte for byte, as pixels", rep_px == rec_px);
+
+    # an unrelated ride in between — the death-and-retry path — must leave nothing behind
+    cart_reset(CFG_SEED_DEFAULT + 9, 2);
+    i = 0;
+    while (i < 500) { cart_tick(IN_LEFT); i = i + 1; }
+    rpt_true("a replay survives an intervening ride", rp_run(rp_buf, len) == 1);
+
+    # ⛔ THE MUTATION: one bit of one word, halfway through. It MUST diverge.
+    var at = rp_buf + RP_HDR + 1200 * 2;
+    var keep = rp_get16(at);
+    rp_put16(at, keep ^ IN_BRAKE);
+    rpt_true("MUTATION: one flipped input bit is caught", rp_run(rp_buf, len) == 0);
+    rp_put16(at, keep);
+
+    # ...and a damaged log is refused as a log, not replayed as a different ride
+    store8(rp_buf + 0, 88);
+    rpt_true("a log with the wrong magic is refused", rp_run(rp_buf, len) == 0 - 1);
+    store8(rp_buf + 0, 68);
+    rpt_true("a log whose count disagrees with its size is refused", rp_run(rp_buf, len - 2) == 0 - 1);
+    rpt_true("...and the repaired log replays again", rp_run(rp_buf, len) == 1);
+
+    ps("  input replay:     "); pn(rpt_ran); ps(" assertions, ");
+    if (rpt_fail == 0) { ps("all pass"); nl(); }
+    if (rpt_fail != 0) { pn(rpt_fail); ps(" FAILED"); nl(); }
+    return rpt_fail;
+}

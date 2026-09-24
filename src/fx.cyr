@@ -84,6 +84,7 @@ fn fx_clamp(v, lo, hi): i64 {
     return v;
 }
 
+# absolute value
 fn fx_abs(v): i64 { if (v < 0) { return 0 - v; } return v; }
 
 # ---- the sine table --------------------------------------------------------------------------
@@ -113,39 +114,62 @@ fn fx_ok(): i64 {
     return 1;
 }
 
+# one sine-table entry, Q1.15
+fn fx_st(i, v): i64 { store64(&fx_sintab + i * 8, v); return 0; }
+
+# fill the 256-entry Q1.15 sine table: one full turn, cos = sin at +64
 fn fx_sin_init(): i64 {
-    store64(&fx_sintab +   0 * 8,      0); store64(&fx_sintab +   1 * 8,    804); store64(&fx_sintab +   2 * 8,   1608); store64(&fx_sintab +   3 * 8,   2410); store64(&fx_sintab +   4 * 8,   3212); store64(&fx_sintab +   5 * 8,   4011); store64(&fx_sintab +   6 * 8,   4808); store64(&fx_sintab +   7 * 8,   5602);
-    store64(&fx_sintab +   8 * 8,   6393); store64(&fx_sintab +   9 * 8,   7179); store64(&fx_sintab +  10 * 8,   7962); store64(&fx_sintab +  11 * 8,   8739); store64(&fx_sintab +  12 * 8,   9512); store64(&fx_sintab +  13 * 8,  10278); store64(&fx_sintab +  14 * 8,  11039); store64(&fx_sintab +  15 * 8,  11793);
-    store64(&fx_sintab +  16 * 8,  12539); store64(&fx_sintab +  17 * 8,  13279); store64(&fx_sintab +  18 * 8,  14010); store64(&fx_sintab +  19 * 8,  14732); store64(&fx_sintab +  20 * 8,  15446); store64(&fx_sintab +  21 * 8,  16151); store64(&fx_sintab +  22 * 8,  16846); store64(&fx_sintab +  23 * 8,  17530);
-    store64(&fx_sintab +  24 * 8,  18204); store64(&fx_sintab +  25 * 8,  18868); store64(&fx_sintab +  26 * 8,  19519); store64(&fx_sintab +  27 * 8,  20159); store64(&fx_sintab +  28 * 8,  20787); store64(&fx_sintab +  29 * 8,  21403); store64(&fx_sintab +  30 * 8,  22005); store64(&fx_sintab +  31 * 8,  22594);
-    store64(&fx_sintab +  32 * 8,  23170); store64(&fx_sintab +  33 * 8,  23731); store64(&fx_sintab +  34 * 8,  24279); store64(&fx_sintab +  35 * 8,  24811); store64(&fx_sintab +  36 * 8,  25329); store64(&fx_sintab +  37 * 8,  25832); store64(&fx_sintab +  38 * 8,  26319); store64(&fx_sintab +  39 * 8,  26790);
-    store64(&fx_sintab +  40 * 8,  27245); store64(&fx_sintab +  41 * 8,  27683); store64(&fx_sintab +  42 * 8,  28105); store64(&fx_sintab +  43 * 8,  28510); store64(&fx_sintab +  44 * 8,  28898); store64(&fx_sintab +  45 * 8,  29268); store64(&fx_sintab +  46 * 8,  29621); store64(&fx_sintab +  47 * 8,  29956);
-    store64(&fx_sintab +  48 * 8,  30273); store64(&fx_sintab +  49 * 8,  30571); store64(&fx_sintab +  50 * 8,  30852); store64(&fx_sintab +  51 * 8,  31113); store64(&fx_sintab +  52 * 8,  31356); store64(&fx_sintab +  53 * 8,  31580); store64(&fx_sintab +  54 * 8,  31785); store64(&fx_sintab +  55 * 8,  31971);
-    store64(&fx_sintab +  56 * 8,  32137); store64(&fx_sintab +  57 * 8,  32285); store64(&fx_sintab +  58 * 8,  32412); store64(&fx_sintab +  59 * 8,  32521); store64(&fx_sintab +  60 * 8,  32609); store64(&fx_sintab +  61 * 8,  32678); store64(&fx_sintab +  62 * 8,  32728); store64(&fx_sintab +  63 * 8,  32757);
-    store64(&fx_sintab +  64 * 8,  32767); store64(&fx_sintab +  65 * 8,  32757); store64(&fx_sintab +  66 * 8,  32728); store64(&fx_sintab +  67 * 8,  32678); store64(&fx_sintab +  68 * 8,  32609); store64(&fx_sintab +  69 * 8,  32521); store64(&fx_sintab +  70 * 8,  32412); store64(&fx_sintab +  71 * 8,  32285);
-    store64(&fx_sintab +  72 * 8,  32137); store64(&fx_sintab +  73 * 8,  31971); store64(&fx_sintab +  74 * 8,  31785); store64(&fx_sintab +  75 * 8,  31580); store64(&fx_sintab +  76 * 8,  31356); store64(&fx_sintab +  77 * 8,  31113); store64(&fx_sintab +  78 * 8,  30852); store64(&fx_sintab +  79 * 8,  30571);
-    store64(&fx_sintab +  80 * 8,  30273); store64(&fx_sintab +  81 * 8,  29956); store64(&fx_sintab +  82 * 8,  29621); store64(&fx_sintab +  83 * 8,  29268); store64(&fx_sintab +  84 * 8,  28898); store64(&fx_sintab +  85 * 8,  28510); store64(&fx_sintab +  86 * 8,  28105); store64(&fx_sintab +  87 * 8,  27683);
-    store64(&fx_sintab +  88 * 8,  27245); store64(&fx_sintab +  89 * 8,  26790); store64(&fx_sintab +  90 * 8,  26319); store64(&fx_sintab +  91 * 8,  25832); store64(&fx_sintab +  92 * 8,  25329); store64(&fx_sintab +  93 * 8,  24811); store64(&fx_sintab +  94 * 8,  24279); store64(&fx_sintab +  95 * 8,  23731);
-    store64(&fx_sintab +  96 * 8,  23170); store64(&fx_sintab +  97 * 8,  22594); store64(&fx_sintab +  98 * 8,  22005); store64(&fx_sintab +  99 * 8,  21403); store64(&fx_sintab + 100 * 8,  20787); store64(&fx_sintab + 101 * 8,  20159); store64(&fx_sintab + 102 * 8,  19519); store64(&fx_sintab + 103 * 8,  18868);
-    store64(&fx_sintab + 104 * 8,  18204); store64(&fx_sintab + 105 * 8,  17530); store64(&fx_sintab + 106 * 8,  16846); store64(&fx_sintab + 107 * 8,  16151); store64(&fx_sintab + 108 * 8,  15446); store64(&fx_sintab + 109 * 8,  14732); store64(&fx_sintab + 110 * 8,  14010); store64(&fx_sintab + 111 * 8,  13279);
-    store64(&fx_sintab + 112 * 8,  12539); store64(&fx_sintab + 113 * 8,  11793); store64(&fx_sintab + 114 * 8,  11039); store64(&fx_sintab + 115 * 8,  10278); store64(&fx_sintab + 116 * 8,   9512); store64(&fx_sintab + 117 * 8,   8739); store64(&fx_sintab + 118 * 8,   7962); store64(&fx_sintab + 119 * 8,   7179);
-    store64(&fx_sintab + 120 * 8,   6393); store64(&fx_sintab + 121 * 8,   5602); store64(&fx_sintab + 122 * 8,   4808); store64(&fx_sintab + 123 * 8,   4011); store64(&fx_sintab + 124 * 8,   3212); store64(&fx_sintab + 125 * 8,   2410); store64(&fx_sintab + 126 * 8,   1608); store64(&fx_sintab + 127 * 8,    804);
-    store64(&fx_sintab + 128 * 8,      0); store64(&fx_sintab + 129 * 8,   -804); store64(&fx_sintab + 130 * 8,  -1608); store64(&fx_sintab + 131 * 8,  -2410); store64(&fx_sintab + 132 * 8,  -3212); store64(&fx_sintab + 133 * 8,  -4011); store64(&fx_sintab + 134 * 8,  -4808); store64(&fx_sintab + 135 * 8,  -5602);
-    store64(&fx_sintab + 136 * 8,  -6393); store64(&fx_sintab + 137 * 8,  -7179); store64(&fx_sintab + 138 * 8,  -7962); store64(&fx_sintab + 139 * 8,  -8739); store64(&fx_sintab + 140 * 8,  -9512); store64(&fx_sintab + 141 * 8, -10278); store64(&fx_sintab + 142 * 8, -11039); store64(&fx_sintab + 143 * 8, -11793);
-    store64(&fx_sintab + 144 * 8, -12539); store64(&fx_sintab + 145 * 8, -13279); store64(&fx_sintab + 146 * 8, -14010); store64(&fx_sintab + 147 * 8, -14732); store64(&fx_sintab + 148 * 8, -15446); store64(&fx_sintab + 149 * 8, -16151); store64(&fx_sintab + 150 * 8, -16846); store64(&fx_sintab + 151 * 8, -17530);
-    store64(&fx_sintab + 152 * 8, -18204); store64(&fx_sintab + 153 * 8, -18868); store64(&fx_sintab + 154 * 8, -19519); store64(&fx_sintab + 155 * 8, -20159); store64(&fx_sintab + 156 * 8, -20787); store64(&fx_sintab + 157 * 8, -21403); store64(&fx_sintab + 158 * 8, -22005); store64(&fx_sintab + 159 * 8, -22594);
-    store64(&fx_sintab + 160 * 8, -23170); store64(&fx_sintab + 161 * 8, -23731); store64(&fx_sintab + 162 * 8, -24279); store64(&fx_sintab + 163 * 8, -24811); store64(&fx_sintab + 164 * 8, -25329); store64(&fx_sintab + 165 * 8, -25832); store64(&fx_sintab + 166 * 8, -26319); store64(&fx_sintab + 167 * 8, -26790);
-    store64(&fx_sintab + 168 * 8, -27245); store64(&fx_sintab + 169 * 8, -27683); store64(&fx_sintab + 170 * 8, -28105); store64(&fx_sintab + 171 * 8, -28510); store64(&fx_sintab + 172 * 8, -28898); store64(&fx_sintab + 173 * 8, -29268); store64(&fx_sintab + 174 * 8, -29621); store64(&fx_sintab + 175 * 8, -29956);
-    store64(&fx_sintab + 176 * 8, -30273); store64(&fx_sintab + 177 * 8, -30571); store64(&fx_sintab + 178 * 8, -30852); store64(&fx_sintab + 179 * 8, -31113); store64(&fx_sintab + 180 * 8, -31356); store64(&fx_sintab + 181 * 8, -31580); store64(&fx_sintab + 182 * 8, -31785); store64(&fx_sintab + 183 * 8, -31971);
-    store64(&fx_sintab + 184 * 8, -32137); store64(&fx_sintab + 185 * 8, -32285); store64(&fx_sintab + 186 * 8, -32412); store64(&fx_sintab + 187 * 8, -32521); store64(&fx_sintab + 188 * 8, -32609); store64(&fx_sintab + 189 * 8, -32678); store64(&fx_sintab + 190 * 8, -32728); store64(&fx_sintab + 191 * 8, -32757);
-    store64(&fx_sintab + 192 * 8, -32767); store64(&fx_sintab + 193 * 8, -32757); store64(&fx_sintab + 194 * 8, -32728); store64(&fx_sintab + 195 * 8, -32678); store64(&fx_sintab + 196 * 8, -32609); store64(&fx_sintab + 197 * 8, -32521); store64(&fx_sintab + 198 * 8, -32412); store64(&fx_sintab + 199 * 8, -32285);
-    store64(&fx_sintab + 200 * 8, -32137); store64(&fx_sintab + 201 * 8, -31971); store64(&fx_sintab + 202 * 8, -31785); store64(&fx_sintab + 203 * 8, -31580); store64(&fx_sintab + 204 * 8, -31356); store64(&fx_sintab + 205 * 8, -31113); store64(&fx_sintab + 206 * 8, -30852); store64(&fx_sintab + 207 * 8, -30571);
-    store64(&fx_sintab + 208 * 8, -30273); store64(&fx_sintab + 209 * 8, -29956); store64(&fx_sintab + 210 * 8, -29621); store64(&fx_sintab + 211 * 8, -29268); store64(&fx_sintab + 212 * 8, -28898); store64(&fx_sintab + 213 * 8, -28510); store64(&fx_sintab + 214 * 8, -28105); store64(&fx_sintab + 215 * 8, -27683);
-    store64(&fx_sintab + 216 * 8, -27245); store64(&fx_sintab + 217 * 8, -26790); store64(&fx_sintab + 218 * 8, -26319); store64(&fx_sintab + 219 * 8, -25832); store64(&fx_sintab + 220 * 8, -25329); store64(&fx_sintab + 221 * 8, -24811); store64(&fx_sintab + 222 * 8, -24279); store64(&fx_sintab + 223 * 8, -23731);
-    store64(&fx_sintab + 224 * 8, -23170); store64(&fx_sintab + 225 * 8, -22594); store64(&fx_sintab + 226 * 8, -22005); store64(&fx_sintab + 227 * 8, -21403); store64(&fx_sintab + 228 * 8, -20787); store64(&fx_sintab + 229 * 8, -20159); store64(&fx_sintab + 230 * 8, -19519); store64(&fx_sintab + 231 * 8, -18868);
-    store64(&fx_sintab + 232 * 8, -18204); store64(&fx_sintab + 233 * 8, -17530); store64(&fx_sintab + 234 * 8, -16846); store64(&fx_sintab + 235 * 8, -16151); store64(&fx_sintab + 236 * 8, -15446); store64(&fx_sintab + 237 * 8, -14732); store64(&fx_sintab + 238 * 8, -14010); store64(&fx_sintab + 239 * 8, -13279);
-    store64(&fx_sintab + 240 * 8, -12539); store64(&fx_sintab + 241 * 8, -11793); store64(&fx_sintab + 242 * 8, -11039); store64(&fx_sintab + 243 * 8, -10278); store64(&fx_sintab + 244 * 8,  -9512); store64(&fx_sintab + 245 * 8,  -8739); store64(&fx_sintab + 246 * 8,  -7962); store64(&fx_sintab + 247 * 8,  -7179);
-    store64(&fx_sintab + 248 * 8,  -6393); store64(&fx_sintab + 249 * 8,  -5602); store64(&fx_sintab + 250 * 8,  -4808); store64(&fx_sintab + 251 * 8,  -4011); store64(&fx_sintab + 252 * 8,  -3212); store64(&fx_sintab + 253 * 8,  -2410); store64(&fx_sintab + 254 * 8,  -1608); store64(&fx_sintab + 255 * 8,   -804);
+    fx_st(0, 0); fx_st(1, 804); fx_st(2, 1608); fx_st(3, 2410); fx_st(4, 3212); fx_st(5, 4011);
+    fx_st(6, 4808); fx_st(7, 5602); fx_st(8, 6393); fx_st(9, 7179); fx_st(10, 7962); fx_st(11, 8739);
+    fx_st(12, 9512); fx_st(13, 10278); fx_st(14, 11039); fx_st(15, 11793); fx_st(16, 12539);
+    fx_st(17, 13279); fx_st(18, 14010); fx_st(19, 14732); fx_st(20, 15446); fx_st(21, 16151);
+    fx_st(22, 16846); fx_st(23, 17530); fx_st(24, 18204); fx_st(25, 18868); fx_st(26, 19519);
+    fx_st(27, 20159); fx_st(28, 20787); fx_st(29, 21403); fx_st(30, 22005); fx_st(31, 22594);
+    fx_st(32, 23170); fx_st(33, 23731); fx_st(34, 24279); fx_st(35, 24811); fx_st(36, 25329);
+    fx_st(37, 25832); fx_st(38, 26319); fx_st(39, 26790); fx_st(40, 27245); fx_st(41, 27683);
+    fx_st(42, 28105); fx_st(43, 28510); fx_st(44, 28898); fx_st(45, 29268); fx_st(46, 29621);
+    fx_st(47, 29956); fx_st(48, 30273); fx_st(49, 30571); fx_st(50, 30852); fx_st(51, 31113);
+    fx_st(52, 31356); fx_st(53, 31580); fx_st(54, 31785); fx_st(55, 31971); fx_st(56, 32137);
+    fx_st(57, 32285); fx_st(58, 32412); fx_st(59, 32521); fx_st(60, 32609); fx_st(61, 32678);
+    fx_st(62, 32728); fx_st(63, 32757); fx_st(64, 32767); fx_st(65, 32757); fx_st(66, 32728);
+    fx_st(67, 32678); fx_st(68, 32609); fx_st(69, 32521); fx_st(70, 32412); fx_st(71, 32285);
+    fx_st(72, 32137); fx_st(73, 31971); fx_st(74, 31785); fx_st(75, 31580); fx_st(76, 31356);
+    fx_st(77, 31113); fx_st(78, 30852); fx_st(79, 30571); fx_st(80, 30273); fx_st(81, 29956);
+    fx_st(82, 29621); fx_st(83, 29268); fx_st(84, 28898); fx_st(85, 28510); fx_st(86, 28105);
+    fx_st(87, 27683); fx_st(88, 27245); fx_st(89, 26790); fx_st(90, 26319); fx_st(91, 25832);
+    fx_st(92, 25329); fx_st(93, 24811); fx_st(94, 24279); fx_st(95, 23731); fx_st(96, 23170);
+    fx_st(97, 22594); fx_st(98, 22005); fx_st(99, 21403); fx_st(100, 20787); fx_st(101, 20159);
+    fx_st(102, 19519); fx_st(103, 18868); fx_st(104, 18204); fx_st(105, 17530); fx_st(106, 16846);
+    fx_st(107, 16151); fx_st(108, 15446); fx_st(109, 14732); fx_st(110, 14010); fx_st(111, 13279);
+    fx_st(112, 12539); fx_st(113, 11793); fx_st(114, 11039); fx_st(115, 10278); fx_st(116, 9512);
+    fx_st(117, 8739); fx_st(118, 7962); fx_st(119, 7179); fx_st(120, 6393); fx_st(121, 5602);
+    fx_st(122, 4808); fx_st(123, 4011); fx_st(124, 3212); fx_st(125, 2410); fx_st(126, 1608);
+    fx_st(127, 804); fx_st(128, 0); fx_st(129, -804); fx_st(130, -1608); fx_st(131, -2410);
+    fx_st(132, -3212); fx_st(133, -4011); fx_st(134, -4808); fx_st(135, -5602); fx_st(136, -6393);
+    fx_st(137, -7179); fx_st(138, -7962); fx_st(139, -8739); fx_st(140, -9512); fx_st(141, -10278);
+    fx_st(142, -11039); fx_st(143, -11793); fx_st(144, -12539); fx_st(145, -13279); fx_st(146, -14010);
+    fx_st(147, -14732); fx_st(148, -15446); fx_st(149, -16151); fx_st(150, -16846); fx_st(151, -17530);
+    fx_st(152, -18204); fx_st(153, -18868); fx_st(154, -19519); fx_st(155, -20159); fx_st(156, -20787);
+    fx_st(157, -21403); fx_st(158, -22005); fx_st(159, -22594); fx_st(160, -23170); fx_st(161, -23731);
+    fx_st(162, -24279); fx_st(163, -24811); fx_st(164, -25329); fx_st(165, -25832); fx_st(166, -26319);
+    fx_st(167, -26790); fx_st(168, -27245); fx_st(169, -27683); fx_st(170, -28105); fx_st(171, -28510);
+    fx_st(172, -28898); fx_st(173, -29268); fx_st(174, -29621); fx_st(175, -29956); fx_st(176, -30273);
+    fx_st(177, -30571); fx_st(178, -30852); fx_st(179, -31113); fx_st(180, -31356); fx_st(181, -31580);
+    fx_st(182, -31785); fx_st(183, -31971); fx_st(184, -32137); fx_st(185, -32285); fx_st(186, -32412);
+    fx_st(187, -32521); fx_st(188, -32609); fx_st(189, -32678); fx_st(190, -32728); fx_st(191, -32757);
+    fx_st(192, -32767); fx_st(193, -32757); fx_st(194, -32728); fx_st(195, -32678); fx_st(196, -32609);
+    fx_st(197, -32521); fx_st(198, -32412); fx_st(199, -32285); fx_st(200, -32137); fx_st(201, -31971);
+    fx_st(202, -31785); fx_st(203, -31580); fx_st(204, -31356); fx_st(205, -31113); fx_st(206, -30852);
+    fx_st(207, -30571); fx_st(208, -30273); fx_st(209, -29956); fx_st(210, -29621); fx_st(211, -29268);
+    fx_st(212, -28898); fx_st(213, -28510); fx_st(214, -28105); fx_st(215, -27683); fx_st(216, -27245);
+    fx_st(217, -26790); fx_st(218, -26319); fx_st(219, -25832); fx_st(220, -25329); fx_st(221, -24811);
+    fx_st(222, -24279); fx_st(223, -23731); fx_st(224, -23170); fx_st(225, -22594); fx_st(226, -22005);
+    fx_st(227, -21403); fx_st(228, -20787); fx_st(229, -20159); fx_st(230, -19519); fx_st(231, -18868);
+    fx_st(232, -18204); fx_st(233, -17530); fx_st(234, -16846); fx_st(235, -16151); fx_st(236, -15446);
+    fx_st(237, -14732); fx_st(238, -14010); fx_st(239, -13279); fx_st(240, -12539); fx_st(241, -11793);
+    fx_st(242, -11039); fx_st(243, -10278); fx_st(244, -9512); fx_st(245, -8739); fx_st(246, -7962);
+    fx_st(247, -7179); fx_st(248, -6393); fx_st(249, -5602); fx_st(250, -4808); fx_st(251, -4011);
+    fx_st(252, -3212); fx_st(253, -2410); fx_st(254, -1608); fx_st(255, -804);
     return 0;
 }
 
@@ -177,6 +201,7 @@ fn fx_cos(brads): i64 { return fx_sin((brads + 16384) & 65535); }
 # deliberate: doubling is exact and reversible, whereas scaling by 65536/32767 needs a divide and
 # would make the value depend on rounding mode.
 fn fx_sin16(brads): i64 { return fx_sin(brads) * 2; }
+# cosine as Q16.16 (doubled Q1.15, 0.99997 at the peak)
 fn fx_cos16(brads): i64 { return fx_cos(brads) * 2; }
 
 # ---- xorshift32 ------------------------------------------------------------------------------
@@ -200,6 +225,7 @@ fn fx_srand(s): i64 {
     return 0;
 }
 
+# the next xorshift32 value, masked to 32 bits — advanced by the simulation ONLY
 fn fx_rand(): i64 {
     var x = fx_rng & 0xFFFFFFFF;
     x = (x ^ (x << 13)) & 0xFFFFFFFF;

@@ -5,6 +5,176 @@ All notable changes to cyrius-mine-cart are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.2.2] — 2026-09-24
+
+**Audit, repair, and the screenshots.** The toolchain moves to 6.6.6 with the kernel; the host gate's
+independent re-parse turns out to have been checking the wrong corners, and is fixed and made to
+prove it; and then the frame was *looked at* — a tool now writes screenshots on a host — which found
+three things every gate had passed: a black wedge where the far roof should be, three-track runs that
+were never on screen, and treasure that never rose above row 383 of 400. Fixing those found a fourth,
+worse one: the cart on screen was 9.9 m ahead of the cart the rules were applied to. With the frame
+honest, the build order's step 11 (the input-log replay) and a HUD land on top.
+
+### Changed
+
+- **Toolchain `6.6.2` → `6.6.6`**, the pin agnos 1.57.7 builds with, and the vendored stdlib re-synced
+  from it: every file in `lib/` is byte-identical to 6.6.6's, plus the three modules 6.6.6's `io.cyr`
+  now pulls in (`fmt`, `vec`, `alloc_cx`). That removes both `undefined function` warnings
+  (`fmt_int`, `fmt_int_buf`) the 6.6.2 build printed — an undefined function compiles to a `ud2`
+  stub, not a link error. Verified before any source change: the gate's output, three `--sim` runs
+  and all 1800 frames of a 30 s film byte-identical across the two toolchains.
+- **The binary is 23× smaller: 8,825,592 → 409,728 bytes** (agnos: 8,833,616 → 413,656). The `--wav`
+  capture buffer (6.4 MB), the `--verify` readback buffer and the CPU reference's frame (1 MB each)
+  were static arrays written into every binary on every target; they are heap now, allocated on the
+  paths that use them.
+- **The camera trails the cart by `CFG_CART_RZ` (124 ru, 9.9 m) instead of sitting on it.** The
+  simulation's position is the cart's; the renderer had put the *camera* there and drawn the cart
+  9.9 m further on, so the cart on screen reached a beam 0.37 s before the hit landed and had cleared
+  the whole far lip of a gap before the simulation decided it was falling in. A player who jumped
+  when the cart they could see reached the edge landed inside the gap. Renderer only: `--sim`, the
+  replay hashes and the audio are unchanged by it.
+- **The frame, redrawn from the atlas.** The texture's floor band is `u 0..31`, and `u 32..47` is now
+  a sprite atlas painted from character bitmaps: the cart's rear plate (rim, hazard band, tail lamps,
+  wheels), its core crate, the rider, a hazard-striped beam face, a faceted gem, a spark, and the
+  HUD's font and swatches. The rails moved under the wheels (they were at ±7 ru, inside the cart's
+  ±11). The floor is ballast only, as its comment already claimed while the code laid sleepers across
+  the whole 13.4 m bore. The rock lost the joint-every-32 cm comb that read as planking and gained a
+  timber set every segment, which sweeps past in step with the rail-joint click.
+- **Beams hang at rider height** (30..42 ru below the eye: a standing rider's helmet reaches 38, a
+  crouched one 45) with a hazard-striped face and a top, instead of at the arch's springing line
+  6.9 m above the cart in the walls' own rock texture.
+- **Things on the track are placed by segment, not by slab.** An object on the far half of a 64 ru
+  slab was never drawn; now every beam and gem stands at the exact depth `cart_tick` resolves it, and
+  each slab's floor is cut at the segment boundaries inside it, so a gap's lip no longer pops between
+  slab boundaries as it approaches.
+- `--sim`'s closing summary reports every life, not the last one — see Fixed.
+- Source split: `src/emit.cyr` (the op `0x0F` ABI half of the old `geom.cyr`), `src/hud.cyr`,
+  `src/replay.cyr`, and `src/gate.cyr` (the host gate, out of `main.cyr` so a test can run it).
+
+### Added
+
+- **Culling.** A triangle whose every vertex lies beyond one edge of the draw rect covers no pixel in
+  any rasteriser and is no longer emitted. It is exact — the film is byte-identical with and without
+  it — and it freed ~100 of every frame's 256 triangles, most of them floor, roof and wall slabs
+  above, below and beside the screen. That budget is what the rest of this release draws with.
+- **The input-log replay — the build order's step 11.** `--record F` (on the ride, or on `--sim`)
+  writes every word handed to `cart_tick`, then a hash of the simulation state over every tick and a
+  hash of the final frame's packed triangle list. `--replay F` re-runs it anywhere and exits 95 only
+  if both reproduce; `film --log F` renders a recorded ride as video and checks the same two hashes.
+  A ride that ends in a refused frame still writes its log. `--check` records a 40 s ride, replays
+  it, compares the final frame as pixels, survives an intervening ride, refuses damaged logs, and
+  flips one input bit to prove the replay notices (10 assertions).
+- **A HUD, in the same record**: a depth odometer (top left), six integrity pips (top right) and a
+  speed bar against the redline that turns amber above it (bottom left). Drawn last from the atlas,
+  never shaken, and held in the budget reserve (`CFG_TRI_RESERVE` 16 → 32).
+- **The cart shows what the simulation is doing**: it rises through the jump's arc, the rider drops
+  below the rim while crouched, the inside wheel lifts and sparks spray off the outside one from
+  `cart_warn() >= 2`, and the frame shakes as the derail clock runs down.
+- Treasure is a faceted diamond in its lane, drawn at every depth, and stops being drawn once taken
+  (`FLAG_TAKEN`, set by the simulation, read only by the renderer).
+- **`tools/shot.cyr`**: screenshots (PPM) of the reference ride at any frames — frame N is `film`'s
+  frame N — with a caption naming what the simulation has placed ahead. `--pilot 0` rides hands-off.
+- **The gate re-parses the op record itself** — alignment, bounds, texture dimensions, triangle count
+  and the kernel's `2^20` tile-triangle work budget (640×400 at 256 triangles spends 1,024,000 of it)
+  — at the host's offset and on 800×600 and 2560×1440 consoles, from a header now packed by one
+  function (`mc_pack_op`) the ride shares. It asserts that the emitter and the re-parse measured the
+  **same** peak `|D|`, and plants two more mutations (a reserved dword, an op record off the tile) that
+  must be caught and named.
+- **`tests/deepvein.tcyr`**: `cyrius tests` runs the host gate.
+- `docs/development/roadmap.md`, and `docs/screenshots/`.
+
+### Fixed
+
+- **The gate's re-parse evaluated `|D|` at the wrong corners.** The kernel bounds the denominator at
+  the draw rect's corners in framebuffer-absolute space (`2*dx+1`); the emitter had been corrected to
+  match when the frame moved to its on-screen offset, but the gate's independent re-parse still used
+  a rect pinned at (0,0). Over the gate's own run it peaked at 290,364,480 where the kernel's corners
+  give 277,334,400 — it was checking four points the kernel never evaluates. Restoring the old corners
+  now turns the gate red.
+- **A non-zero reserved dword was reported as code 21 (`GPO_E_WORK`)**; the kernel calls it 24
+  (`GPO_E_TRILIST`).
+- **The coverage check passed a hole in every frame.** Its floor was "more than half the screen", and
+  0.2.1's frames — with the far roof undrawn — measured 82.6%. The top half (roof, arch and far wall:
+  a gap never reaches it) must now be 99% covered, and was 100% on all 900 ride frames; the whole
+  frame must be 75% (worst measured 87.6%, a gap under the cart). With 0.2.1's ceiling gate put back,
+  the top half measures 82% and the gate fails.
+- **The far ceiling was not drawn** (it was distance-gated to save budget), leaving op `0x0F`'s black
+  background as a wedge across the top of every frame.
+- **Three-track runs were never visible**: side tracks were gated to `rz < 112`, and the floor does
+  not enter the frame until `rz ~115`. Treasure had the same gate and reached rows 383–399 of the
+  frame in 15% of frames, never higher.
+- `tools/dumptex.cyr` no longer compiled (ten undefined names since the constants moved to
+  `config.cyr`); `build/dumptex` was a fossil nobody could regenerate.
+- `--sim` counted every slipping tick of a life that ended twice, and its summary reported only the
+  last life — the hands-off pilot's "0 falls" after seven falls into the same gap. `--sim --frames 0`
+  died of SIGFPE. `cart_apex_hits` and `cart_derails` are session totals `cart_reset` never clears,
+  and are now documented and reported as such.
+- `--frames 9x` parsed as 162 and `--frames abc` as a negative (i.e. unbounded) ride; unknown flags
+  were ignored, so `--chek` rode instead of gating. One parser (`mc_atoi`) now refuses both, and an
+  unknown flag exits 2.
+- The ride said "DERAILED" for a fall into a gap and for a cart destroyed by beams alike.
+- A beam within 4 ru of the far plane pushed its top face's `w` past 4096 — caught by the gate the
+  first time it ran (four `w`-band drops), fixed before it could reach iron.
+- Stale comments in `config.cyr` (a 64 ru bore, an 8 ru gauge, rails at 45% of the threshold, a grip
+  table computed from constants two retunes old) — recomputed from the current constants.
+
+### Removed
+
+- Dead code: `mc_ck_overlap` (measured overlap between the two records the frame no longer has),
+  `mc_blit_fullscreen`, the unused `mc_slot_vb` / `mc_slot_tb`, the `CFG_SIDE_RZ` / `CFG_CHAMFER_RZ` /
+  `CFG_BEAM_RZ` / `CFG_PICKUP_RZ` distance gates, `MC_TEX_CART`, and the per-endpoint `mc_s_seg`.
+- `build/mine-cart-agnos` — a 0.1.0 artifact from 2026-07-30 that nothing builds or stages (the burn
+  script stages `build/mine-cart_agnos`).
+
+### Notes
+
+- Peak `|D|` 277,334,400 → **80,688,960**: the ABI margin went from 7× to **26×**, because the worst
+  `|D|` came from near-plane walls that were never on screen and are now culled.
+- Triangles per frame 180–252 → **165–231** of 256, while drawing the whole roof, every side track,
+  every beam, every gem, a five-part cart and the HUD. A 40,000-frame soak (autopilot and hands-off)
+  peaked at 231 with no refused detail, no pixel-losing drop and no re-parse violation.
+- `cyrius audit`: format clean, lint 51 warnings → 0, undocumented public functions 91 → 0, and a
+  tests step that runs.
+- **None of this has been on iron.** The README's screenshots are the CPU reference's; `--verify` on
+  hardware is the only instrument that can see a frame that is legal and wrong. See the roadmap.
+
+## [0.2.1] — 2026-09-11
+
+⚠ **Recorded retroactively in 0.2.2.** This entry originally said only "no source change" beside the
+toolchain bump, but four commits between 0.2.0 and it (`d4709b3`, `db002d1`, `941587e`, `52329b7`)
+carried the build order's steps 5, 7 and 10 and were never written down. They are below.
+
+### Added
+
+- **Synthesised audio** (`src/audio.cyr`): a speed-tracking rumble through a Cytomic/Simper
+  state-variable filter, rail-joint clicks at one per segment (so speed is audible), a brake squeal
+  and a higher slip screech; whip and flood voices scaffolded. `--wav` renders 20 s to a file so a
+  person can listen, since no assertion can say whether a mix sounds right. 14 assertions.
+- **Grip.** The wheel flange holds the cart until the lateral force exceeds a capacity that falls with
+  speed; past it the rail lets go — self-centring stops and three times the excess throws the cart
+  outward — and only the brake can reach it.
+- **Duck and jump.** Beams cost two of six integrity blocks unless crouched; three-segment gaps are
+  death unless airborne. Hang time is fixed (26 ticks), so a braked cart comes up short; a crouch
+  (27 ticks) cannot be cancelled. Hazards are placed with stacked pairs spaced wider than either
+  commitment, and none before the cart can clear them.
+- **Treasure** in three lanes, collected by lateral position at the segment crossing, scored by speed.
+- **Three-track runs** (`FLAG_MULTI`): the bore widened to 84 ru and the lean threshold to 72 ru, with
+  every track drawn as its own strip.
+- **The cart, drawn** 124 ru ahead of the camera, sized from the gauge.
+- The input word gained a double-tap SWITCH and a jump-plus-direction HOP, decoded and tested but not
+  yet acted on by the simulation.
+- `tools/film.cyr` — the ride as video, on a host — and one reference autopilot shared by `--sim`,
+  `--wav`, the film and the gate.
+
+### Changed
+
+- **Toolchain `6.4.78` → `6.6.2`.** Build, tests and every bench/fuzz/distlib target re-verified at
+  the new pin; the source was reformatted by `cyrfmt`, with no behavioural change.
+- README and `main.cyr`: the setu transport correction of 2026-08-03 (TCP on loopback retired as the
+  wrong primitive, pending the agnos socket).
+
 ## [0.2.0] — 2026-08-01
 
 **DEEPVEIN.** The tunnel ride becomes a game. The world is no longer a closed-form sine wave — it is
@@ -116,13 +286,8 @@ to use the 3D ops at all.
   loaded + run in ring 3 on the real kernel under QEMU. The GPU path itself is iron-only — `#86`
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
+[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...HEAD
+[0.2.2]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.1...0.2.2
+[0.2.1]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.0...0.2.1
+[0.2.0]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/MacCracken/cyrius-mine-cart/releases/tag/0.1.0
-
-## [Unreleased]
-
-## [0.2.1] - 2026-09-11
-
-### Changed
-
-- **Toolchain `6.4.78` → `6.6.2`.** No source change; the value form needed none.
-  Build, tests and every bench/fuzz/distlib target re-verified at the new pin.

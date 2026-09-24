@@ -11,21 +11,20 @@
 # black over everything the first drew. mine-cart 0.1.0 shipped as two records (floor+ceiling, then
 # walls) and its first iron frame showed exactly that: the walls survived, the floor and ceiling were
 # erased. So the whole frame is ONE record and can carry ONE texture.
-# ⇒ Two materials, banded along u: LEFT half (texels 0-63) is the floor, RIGHT half (64-127) is rock.
-#   Geometry keeps each surface inside its own band; v (along the track) wraps normally for both.
-# ⚠ MC_TEX / MC_TEXFULL / MC_TEX_HALF live in config.cyr — geom.cyr bands its u coordinates against
-#   them and is compiled BEFORE this file.
+# ⇒ Materials banded along u — see the column map in config.cyr (MC_TEX_HALF and below). Geometry
+#   keeps each surface inside its own band; v (along the track) wraps normally where it scrolls.
 #
-# ⛔ THERE IS NO LIGHTING. op 0x0F fetches a texel and stores it; the record carries no vertex colour
-# and no modulation field, so distance fog and lamp falloff are not available at all. Depth cueing
-# has to be baked into the texture or faked with geometry. What this file does instead is keep the
-# whole palette DARK and COLD and let the emissive rails carry the contrast — which is why the rails
-# are the brightest thing in the frame by a wide margin.
+# ⛔ THERE IS NO LIGHTING IN op 0x0F. It fetches a texel and stores it; the record carries no vertex
+# colour and no modulation field. Depth cueing would have to be baked into the texture or come from a
+# second, COMPOSITING op (see the roadmap: a [0x0F][0x0A] pair). What this file does instead is keep
+# the whole palette DARK and COLD and let the emissive rails carry the contrast — which is why the
+# rails are the brightest thing in the frame by a wide margin.
 
-var mc_tex_a[8192];        # THE texture: left half floor, right half rock
+var mc_tex_a[8192];        # THE texture
 var mc_tex_b[8192];        # scratch for the rock pass; also lets mc_tex_ok() MEASURE the span
 var mc_tex_guard = 0;
 
+# the texture pools measured: 1 if each holds 128 x 128 x 4 bytes
 fn mc_tex_ok(): i64 {
     if ((&mc_tex_b     - &mc_tex_a) < MC_TEX * MC_TEX * 4) { return 0; }
     if ((&mc_tex_guard - &mc_tex_b) < MC_TEX * MC_TEX * 4) { return 0; }
@@ -41,6 +40,7 @@ fn mc_hash(x, y): i64 {
     return h;
 }
 
+# pack an opaque XRGB8888 texel, clamping each channel to 0..255
 fn mc_rgb(r, g, b): i64 {
     if (r < 0) { r = 0; }
     if (g < 0) { g = 0; }
@@ -51,77 +51,53 @@ fn mc_rgb(r, g, b): i64 {
     return 0xFF000000 + (r * 65536) + (g * 256) + b;
 }
 
-# ---- the floor: wet ballast, dark sleepers, and two EMISSIVE rails ------------------------------
+# write one texel of THE texture
+fn mc_texel(x, y, c): i64 { store32(&mc_tex_a + (y * MC_TEX + x) * 4, c); return 0; }
+
+# ---- the floor band and the rail strip: u 0..31 and u 48..63 ------------------------------------
 # ⭐ THE RAILS ARE THE ONLY BRIGHT THING IN THE MINE, AND THAT IS THE WHOLE ART DIRECTION. With no
 # lighting available, the frame needs one high-contrast element that tells the player where the
 # track goes and how it bends — everything else can be texture. Cyan #4fe3ff against a near-black
 # blue ballast does that, and it is what makes a curve legible at 100 km/h.
-# ⛔ TEXEL (0,0) MUST STAY NEAR-BLACK AND SOLID: the far cap quad samples it with a CONSTANT
-# attribute at all three vertices to paint the darkness the tunnel recedes into. If it ever becomes
-# a rail texel, the far end of the shaft turns into a glowing block.
 fn mc_tex_floor(): i64 {
     var y = 0;
     while (y < MC_TEX) {
         var x = 0;
-        while (x < MC_TEX) {
-            # ballast — #0a1720 with grit
+        while (x < 64) {
+            # ⭐ BALLAST ONLY — and now it actually is. The comment said so for a whole release while
+            # the code still laid a sleeper band across all 32 columns, i.e. across the entire 13.4 m
+            # bore, so the floor read as one enormous sleeper field and the tracks did not stand out
+            # from it. Sleepers belong to TRACKS; the strip below carries its own.
+            # #0a1720 with grit, and wet patches where the shaft drains
             var n = mc_hash(x, y) % 18;
             var r = 10 + n; var g = 23 + n; var b = 32 + n;
+            if ((mc_hash(x / 4, y / 8) % 9) == 0) { r = r - 5; g = g - 2; b = b + 6; }
 
-            # sleepers: a band of dark timber every 32 texels down the run
-            if ((y & 31) < 11) {
-                var m = mc_hash(x * 3, y) % 12;
-                r = 26 + m; g = 30 + m; b = 34 + m;
-            }
+            # ---- u 48, 49: SOLID SWATCHES, sampled with a constant attribute ---------------------
+            # ⚠ Uniform down the whole column: a constant-attribute quad samples ONE texel, and if v
+            # ever drifts it must land on the same colour rather than on something else.
+            if (x == 48) { r = 214; g = 158; b = 74; }       # ore
+            if (x == 49) { r = 10;  g = 23;  b = 32; }       # the darkness the far cap recedes into
 
-            # ⭐⭐ THE FLOOR BAND IS NOW u 0..47, NOT u 0..63, AND THE REST IS RESERVED.
-            # The right edge of the old floor band is carved into two fixed-purpose regions, because
-            # a quad that samples "the floor" was picking up rail stripes and rendering treasure as
-            # fragments of rail — see MC_TEX_FLOOR / MC_TEX_ORE / MC_TEX_RAILPAIR in config.cyr.
-            #   u 0..47   the main track floor: ballast, sleepers, ONE pair of rails
-            #   u 48..49  solid swatches, sampled with a CONSTANT attribute (ore, cap darkness)
-            #   u 50..63  a RAIL-PAIR STRIP for side tracks in multi-rail sections
-            # ⛔⛔ NO RAILS IN THE FLOOR BAND ANY MORE, AND THIS IS THE FIX FOR THE WHOLE PROBLEM.
-            # The rails used to be painted into the floor texture, which stretches across the ENTIRE
-            # bore — so the "track" was as wide as the tunnel (a 4.6 m gauge), and side tracks drawn
-            # at +-22 ru landed inside it. On screen that read as a bundle of rails bunched to one
-            # side rather than as three tracks.
-            # ⇒ The floor is now BALLAST ONLY, and every track — including the main one — is drawn as
-            #   its own narrow strip quad from the rail-pair region below. A track becomes an OBJECT
-            #   with a position and a width, which is the only way three of them can coexist.
-
-            # ---- u 48..49: SOLID SWATCHES, sampled with a constant attribute -----------------------
-            # ⚠ These must be uniform down the whole column: a constant-attribute quad samples ONE
-            # texel, and if v ever drifts it must land on the same colour rather than on a sleeper.
-            if (x == 48) { r = 214; g = 158; b = 74; }      # ore — treasure, warm against all that cyan
-            if (x == 49) { r = 10;  g = 23;  b = 32; }      # the darkness the far cap recedes into
-            # ⭐ the cart's own plate. Dark steel, cold, so it sits as a silhouette against the rails
-            # rather than competing with them — it is the frame of reference, not the subject.
-            # ⛔ IT WAS INVISIBLE AT (26,38,46) — near-identical to the ballast it sits on, so the
-            # cart only showed up in frames where it happened to overlap a black gap. With no
-            # lighting in op 0x0F, CONTRAST IS THE ONLY WAY ANYTHING READS. Mid steel is bright
-            # enough to separate from the floor and cold enough not to compete with the rails, which
-            # have to stay the brightest thing in the frame.
-            if (x == 47) {
-                r = 74; g = 92; b = 104;
-                if ((y & 15) < 3) { r = 148; g = 168; b = 180; }   # a lit capping rail along the top
-            }
-
-            # ---- u 50..63: THE RAIL-PAIR STRIP for side tracks ------------------------------------
-            # ⭐ ONE QUAD PER SIDE TRACK INSTEAD OF TWO. A side track needs two rails, and drawing
-            # them as separate quads costs 4 triangles a slab per track — 128 across the frustum,
-            # against ~48 spare. A single strip carrying both rails costs 2, which fits.
+            # ---- u 50..63: THE RAIL-PAIR STRIP, every track is drawn from it --------------------
+            # ⭐ ONE QUAD PER TRACK INSTEAD OF TWO: both rails ride in one strip.
+            # ⭐⭐ THE RAILS SIT UNDER THE WHEELS. The strip is exactly the cart's width (CFG_TRACK_HW
+            # = CFG_CART_HW), and it is addressed [50, 63) — 13 texels, centre 56.5. The rails were at
+            # 53-54 and 59-60, i.e. +-7 ru: well inside the wheels (+-11), so the cart rode a track
+            # narrower than itself. They are at 51-52 and 60-61 now, +-12.5 ru, symmetric about the
+            # strip's centre and under the wheels painted on the cart's rear plate.
             if (x >= 50) {
                 var sn = mc_hash(x, y) % 14;
                 r = 8 + sn; g = 20 + sn; b = 28 + sn;             # darker ballast, so it reads as separate
-                if ((y & 31) < 9) { r = 22; g = 26; b = 30; }     # its own sleepers
-                if (x >= 53) { if (x <= 54) { r = 79; g = 227; b = 255; } }
-                if (x >= 59) { if (x <= 60) { r = 79; g = 227; b = 255; } }
-                if (x == 53) { r = 168; g = 236; b = 255; }
-                if (x == 59) { r = 168; g = 236; b = 255; }
+                if ((y & 31) < 9) { r = 34; g = 30; b = 28; }     # its own sleepers, wet timber
+                if (x == 51) { r = 168; g = 236; b = 255; }       # left rail: highlight...
+                if (x == 52) { r = 79;  g = 227; b = 255; }       # ...and body
+                if (x == 60) { r = 168; g = 236; b = 255; }       # right rail
+                if (x == 61) { r = 79;  g = 227; b = 255; }
             }
 
-            store32(&mc_tex_a + (y * MC_TEX + x) * 4, mc_rgb(r, g, b));
+            if (x < 32) { mc_texel(x, y, mc_rgb(r, g, b)); }
+            if (x >= 48) { mc_texel(x, y, mc_rgb(r, g, b)); }
             x = x + 1;
         }
         y = y + 1;
@@ -129,7 +105,145 @@ fn mc_tex_floor(): i64 {
     return 0;
 }
 
-# ---- the walls: cold wet rock, blocky courses, a scatter of ore -----------------------------------
+# ---- the sprite atlas: u 32..47 ------------------------------------------------------------------
+# ⭐ PIXEL ART AS STRINGS, because there is no asset pipeline and there should not be one: a 16x10
+# picture is shorter written out than described. Each character is a palette entry below. Every
+# tile is opaque — op 0x0F has no alpha — so a sprite's SHAPE comes from its geometry (a trapezoid
+# rider, a diamond gem) and the tile only colours it.
+fn mc_pal(c): i64 {
+    if (c == 82)  { return mc_rgb(148, 168, 180); }   # R  rim: lit steel capping
+    if (c == 100) { return mc_rgb(40,  50,  58);  }   # d  dark steel
+    if (c == 112) { return mc_rgb(74,  92,  104); }   # p  panel steel
+    if (c == 114) { return mc_rgb(118, 136, 148); }   # r  rivet
+    if (c == 97)  { return mc_rgb(224, 168, 44);  }   # a  hazard amber
+    if (c == 107) { return mc_rgb(18,  16,  14);  }   # k  hazard black
+    if (c == 76)  { return mc_rgb(236, 52,  38);  }   # L  tail lamp
+    if (c == 98)  { return mc_rgb(30,  36,  42);  }   # b  bumper
+    if (c == 119) { return mc_rgb(12,  14,  16);  }   # w  wheel
+    if (c == 104) { return mc_rgb(64,  70,  78);  }   # h  hub
+    if (c == 99)  { return mc_rgb(24,  28,  32);  }   # c  chassis
+    if (c == 101) { return mc_rgb(32,  36,  32);  }   # e  crate edge
+    if (c == 111) { return mc_rgb(52,  58,  50);  }   # o  crate olive
+    if (c == 115) { return mc_rgb(24,  26,  24);  }   # s  strap
+    if (c == 103) { return mc_rgb(150, 52,  128); }   # g  core glow — the magenta the Trust wants
+    if (c == 109) { return mc_rgb(236, 96,  212); }   # m  core
+    if (c == 72)  { return mc_rgb(58,  64,  72);  }   # H  helmet
+    if (c == 89)  { return mc_rgb(255, 238, 190); }   # Y  helmet lamp
+    if (c == 118) { return mc_rgb(38,  84,  100); }   # v  visor
+    if (c == 117) { return mc_rgb(24,  28,  34);  }   # u  suit
+    if (c == 116) { return mc_rgb(70,  50,  34);  }   # t  timber
+    if (c == 84)  { return mc_rgb(44,  32,  24);  }   # T  dark timber
+    if (c == 35)  { return mc_rgb(150, 226, 240); }   # #  HUD ink
+    if (c == 46)  { return mc_rgb(8,   16,  22);  }   # .  HUD paper
+    if (c == 65)  { return mc_rgb(236, 176, 52);  }   # A  integrity pip, intact
+    if (c == 68)  { return mc_rgb(44,  54,  62);  }   # D  integrity pip, spent
+    if (c == 120) { return mc_rgb(8,   16,  22);  }   # x  the gap between pips
+    if (c == 80)  { return mc_rgb(18,  28,  34);  }   # P  the empty speed bar
+    if (c == 67)  { return mc_rgb(79,  200, 230); }   # C  speed, under the redline
+    if (c == 77)  { return mc_rgb(236, 168, 44);  }   # M  speed, over it
+    if (c == 90)  { return mc_rgb(244, 84,  56);  }   # Z  the redline
+    return mc_rgb(255, 0, 255);                       # an unmapped character shows up LOUD
+}
+
+# paint one row of a tile from a string, starting at texel (x0, y)
+fn mc_row(x0, y, s): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) { mc_texel(x0 + i, y, mc_pal(load8(s + i))); i = i + 1; }
+    return 0;
+}
+
+# paint the sprite atlas at u 32..47: cart, crate, rider, beam, gem, spark, HUD
+fn mc_tex_atlas(): i64 {
+    # -- the cart's rear plate, 16 x 10 at (32, 0): rim, hazard band, tail lamps, wheels over the rails
+    mc_row(32, 0, "RRRRRRRRRRRRRRRR");
+    mc_row(32, 1, "dddddddddddddddd");
+    mc_row(32, 2, "dppppppppppppppd");
+    mc_row(32, 3, "dpppakakakakpppd");
+    mc_row(32, 4, "dpppkakakakapppd");
+    mc_row(32, 5, "drpppppppppppprd");
+    mc_row(32, 6, "dLLppppppppppLLd");
+    mc_row(32, 7, "bbbbbbbbbbbbbbbb");
+    mc_row(32, 8, "cwwwwccccccwwwwc");
+    mc_row(32, 9, "cwhhwccccccwhhwc");
+
+    # -- the core crate, 8 x 8 at (32, 10): olive steel, two straps, and the thing you stole glowing
+    mc_row(32, 10, "eeeeeeee");
+    mc_row(32, 11, "esoooose");
+    mc_row(32, 12, "esggggse");
+    mc_row(32, 13, "esgmmgse");
+    mc_row(32, 14, "esgmmgse");
+    mc_row(32, 15, "esggggse");
+    mc_row(32, 16, "esoooose");
+    mc_row(32, 17, "eeeeeeee");
+
+    # -- the rider, 8 x 8 at (40, 10): helmet with a lamp, visor, suit. Mapped onto a trapezoid.
+    mc_row(40, 10, "HHHYYHHH");
+    mc_row(40, 11, "HHHYYHHH");
+    mc_row(40, 12, "HvvvvvvH");
+    mc_row(40, 13, "uuuuuuuu");
+    mc_row(40, 14, "uuuuuuuu");
+    mc_row(40, 15, "uuuuuuuu");
+    mc_row(40, 16, "uuuuuuuu");
+    mc_row(40, 17, "uuuuuuuu");
+
+    # -- a beam's face, 16 x 8 at (32, 18): timber edges, hazard bands across the middle
+    # ⚠ Stretched 168 ru wide by 12 tall, so a texel is ~11 ru wide and 1.5 tall — diagonal stripes
+    #   would render nearly flat. Vertical bands read as a barrier at every distance.
+    mc_row(32, 18, "TTTTTTTTTTTTTTTT");
+    mc_row(32, 19, "tttttttttttttttt");
+    mc_row(32, 20, "aakkaakkaakkaakk");
+    mc_row(32, 21, "aakkaakkaakkaakk");
+    mc_row(32, 22, "aakkaakkaakkaakk");
+    mc_row(32, 23, "aakkaakkaakkaakk");
+    mc_row(32, 24, "tttttttttttttttt");
+    mc_row(32, 25, "TTTTTTTTTTTTTTTT");
+
+    # -- the treasure gem, 8 x 8 at (32, 26): four facets, lit from the upper left ----------------
+    # The tile is mapped ROTATED onto a diamond (mc_gem): its top edge becomes the upper-right side,
+    # its left edge the upper-left side. So the tile's four diagonal quadrants ARE the four facets.
+    var gy = 0;
+    while (gy < 8) {
+        var gx = 0;
+        while (gx < 8) {
+            var c = mc_rgb(176, 112, 40);                               # lower-left facet
+            if (gy < gx) {
+                c = mc_rgb(120, 70, 24);                                # lower-right, the shadow side
+                if (gx + gy < 7) { c = mc_rgb(226, 160, 64); }          # upper-right
+            }
+            if (gy >= gx) { if (gx + gy <= 7) { c = mc_rgb(255, 214, 120); } }   # upper-left, lit
+            mc_texel(32 + gx, 26 + gy, c);
+            gx = gx + 1;
+        }
+        gy = gy + 1;
+    }
+    mc_texel(32 + 1, 26 + 2, mc_rgb(255, 250, 232));                    # the glint
+
+    # -- a spark: one white-hot texel at (40, 26) ---------------------------------------------------
+    mc_texel(40, 26, mc_rgb(255, 236, 180));
+
+    # -- the HUD (hud.cyr): integrity pips, a 3x5 digit font, and the speed bar's swatches ---------
+    # pips at rows 34 (lit) and 35 (spent): one texel of pip, one of gap, six times
+    mc_row(32, 34, "AxAxAxAxAxAx");
+    mc_row(32, 35, "DxDxDxDxDxDx");
+    # digits 0-4 across rows 36..40, 5-9 across rows 41..45 — glyph g at (32 + (g % 5) * 3, 36 + (g / 5) * 5)
+    mc_row(32, 36, "###.#.#######.#");
+    mc_row(32, 37, "#.###...#..##.#");
+    mc_row(32, 38, "#.#.#.###.#####");
+    mc_row(32, 39, "#.#.#.#....#..#");
+    mc_row(32, 40, "############..#");
+    mc_row(32, 41, "###############");
+    mc_row(32, 42, "#..#....##.##.#");
+    mc_row(32, 43, "######.#.######");
+    mc_row(32, 44, "..##.#.#.#.#..#");
+    mc_row(32, 45, "######.#.######");
+    # swatches at row 46: the empty bar, the fill under the redline, the fill over it, the redline
+    mc_row(32, 46, "PCMZ");
+    return 0;
+}
+
+# ---- the walls: cold wet rock, and a timber set every segment ------------------------------------
+# ⚠ On every rock surface u runs ACROSS the surface (floor to springing on a wall) and v runs ALONG
+# the track, 128 texels to the 32 ru segment. So a feature at a fixed v appears once per segment.
 fn mc_tex_rock(): i64 {
     var y = 0;
     while (y < MC_TEX) {
@@ -139,17 +253,31 @@ fn mc_tex_rock(): i64 {
             var n = mc_hash(x + 7, y + 11) % 26;
             var r = 14 + n / 2; var g = 40 + n; var b = 50 + n;
 
-            # blocky courses, so the perspective has something rectilinear to shear
-            if ((y & 15) == 0) { r = r - 8; g = r - 6; b = b - 18; }
-            var off = 0;
-            if ((y & 31) < 16) { off = 8; }
-            if (((x + off) & 31) == 0) { r = r - 8; g = g - 14; b = b - 18; }
+            # ⭐ BLOCKS, NOT SLATS. A dark line every 16 v-texels was a joint every 32 cm along the
+            # wall — a dense regular comb of vertical lines that read as a planked corridor. Joints
+            # are one-in-four now (every 1.28 m), jittered per course so no two courses line up.
+            var course = x / 16;
+            var jog = mc_hash(course, 3) & 31;
+            if (((y + jog) & 63) == 0) { r = r - 10; g = g - 16; b = b - 18; }
+            if ((x & 15) == 0) { r = r - 6; g = g - 10; b = b - 12; }
 
-            # ⭐ ore glints in amber — the ONLY warm colour in the mine, and rare enough that a still
+            # ⭐ ore glints in amber — the ONLY warm colour in the rock, and rare enough that a still
             # frame is not uniform noise while a moving one sparkles.
             if ((mc_hash(x, y * 5) % 701) == 0) { r = 176; g = 128; b = 58; }
             # rarer magenta seams: the thing the Trust actually wants
             if ((mc_hash(x * 11, y) % 2237) == 0) { r = 150; g = 52; b = 128; }
+
+            # ⭐⭐ THE TIMBER SET. v 0..7 of every repeat is a support timber: posts up the walls, a
+            # cap across the roof, one per 2.56 m segment. It is the strongest motion cue in the
+            # frame — at the redline they sweep past at 10.4 a second, in step with the rail-joint
+            # click, because both are one-per-segment — and it is what makes this a MINE rather than a
+            # culvert. Dark and wet so the rails stay the brightest thing on screen.
+            if (y < 8) {
+                var tn = mc_hash(x, 97) % 10;
+                r = 50 + tn; g = 37 + tn; b = 28 + tn / 2;
+                if (y == 0) { r = r - 18; g = g - 14; b = b - 10; }
+                if (y == 7) { r = r - 22; g = g - 17; b = b - 12; }
+            }
 
             store32(&mc_tex_b + (y * MC_TEX + x) * 4, mc_rgb(r, g, b));
             x = x + 1;
@@ -159,10 +287,11 @@ fn mc_tex_rock(): i64 {
     return 0;
 }
 
-# build the combined texture: floor material in u 0..63, rock in u 64..127
+# build the combined texture: floor and strips in u 0..31 and 48..63, the atlas in 32..47, rock 64..127
 fn mc_tex_init(): i64 {
-    mc_tex_floor();                       # fills the whole 128x128 with the floor material
-    mc_tex_rock();                        # ... then the right half is overwritten with rock
+    mc_tex_floor();
+    mc_tex_atlas();
+    mc_tex_rock();
     var y = 0;
     while (y < MC_TEX) {
         var x = 64;

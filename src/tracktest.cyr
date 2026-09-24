@@ -13,6 +13,7 @@
 var trt_fail = 0;
 var trt_ran  = 0;
 
+# assert got == want, report the pair on failure
 fn trt_eq(name, got, want): i64 {
     trt_ran = trt_ran + 1;
     if (got == want) { return 0; }
@@ -21,6 +22,7 @@ fn trt_eq(name, got, want): i64 {
     return 1;
 }
 
+# assert a condition, report it by name on failure
 fn trt_true(name, cond): i64 {
     trt_ran = trt_ran + 1;
     if (cond != 0) { return 0; }
@@ -155,6 +157,7 @@ fn trt_stream_sum(seed, chapter, ticks): i64 {
     return h;
 }
 
+# the same seed generates the same track, from a cold start, in any order
 fn trt_determinism(): i64 {
     var a = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);
     var b = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);

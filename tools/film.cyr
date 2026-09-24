@@ -12,7 +12,12 @@
 # autopilot --sim uses. What comes out is the game, rendered slowly.
 #
 # Usage:  cyrius build tools/film.cyr build/film && ./build/film [seconds] [pilot]
+#         ./build/film --log RIDE.dvrp      render a RECORDED ride (mine-cart --record) instead
 #         writes /tmp/mc_film.raw — 640x400 BGRA frames, back to back, 60 fps.
+#
+# ⭐⭐ --log IS HOW A RIDE ON IRON BECOMES A VIDEO. The ride records its input words; this replays them
+# through the same simulation and draws every frame, then checks the log's two recorded hashes so the
+# video is provably of THAT ride and not of a near miss.
 
 include "lib/io.cyr"
 include "src/say.cyr"
@@ -22,31 +27,72 @@ include "src/track.cyr"
 include "src/input.cyr"
 include "src/cart.cyr"
 include "src/audio.cyr"
+include "src/emit.cyr"
+include "src/hud.cyr"
 include "src/geom.cyr"
 include "src/tex.cyr"
 include "src/refcore.cyr"
+include "src/replay.cyr"
 
-fn film_arg(i, dflt): i64 {
-    if (argc() <= i) { return dflt; }
-    var s = argv(i);
-    var v = 0;
-    var k = 0;
-    while (k < mc_slen(s)) { v = v * 10 + (load8(s + k) - 48); k = k + 1; }
-    return v;
+# 1 if two NUL-terminated strings are equal
+fn mc_streq_film(a, b): i64 {
+    if (mc_slen(a) != mc_slen(b)) { return 0; }
+    var i = 0;
+    while (i < mc_slen(a)) {
+        if (load8(a + i) != load8(b + i)) { return 0; }
+        i = i + 1;
+    }
+    return 1;
 }
 
+# argument i as a whole number, or dflt when it is absent (-1 if it is not a number)
+fn film_arg(i, dflt): i64 {
+    if (argc() <= i) { return dflt; }
+    return mc_atoi(argv(i));
+}
+
+# ride (or replay a log) and write every frame of it to /tmp/mc_film.raw
 fn main(): i64 {
     args_init();
+    # --log RIDE.dvrp: the words come from a recorded ride, the length from its tick count
+    var log = 0;
+    var loglen = 0;
+    var lenb[8];
+    if (argc() > 2) {
+        if (mc_streq_film(argv(1), "--log") == 1) {
+            log = file_read_whole(argv(2), &lenb);
+            loglen = load64(&lenb);
+            if (log == 0) { ps("film: cannot read "); ps(argv(2)); nl(); return 2; }
+            if (loglen < RP_HDR + RP_TRAILER) { ps("film: not an input log"); nl(); return 2; }
+            if (load8(log) != 68) { ps("film: not an input log"); nl(); return 2; }
+            if (loglen != RP_HDR + rp_get32(log + 16) * 2 + RP_TRAILER) {
+                ps("film: damaged input log"); nl(); return 2;
+            }
+        }
+    }
     var seconds = film_arg(1, 15);
     var pilot   = film_arg(2, 1);
+    if (log != 0) { seconds = 1; pilot = 0; }
+    if (seconds < 1) { ps("film: seconds must be a whole number >= 1"); nl(); return 2; }
+    if (pilot < 0) { ps("film: pilot must be 0 or 1"); nl(); return 2; }
+    if (pilot > 1) { ps("film: pilot must be 0 or 1"); nl(); return 2; }
+    if (rr_fb_ok() == 0) { ps("film: cannot allocate the frame buffer"); nl(); return 1; }
 
     fx_sin_init();
     mc_tex_init();
     cart_reset(CFG_SEED_DEFAULT, 0);
 
     var frames = seconds * CFG_TICK_HZ;
-    ps("film: "); pn(frames); ps(" frames at "); pn(CFG_TICK_HZ); ps(" fps ("); pn(seconds);
-    ps(" s), pilot "); pn(pilot); nl();
+    if (log != 0) {
+        cart_reset(rp_get32(log + 8), rp_get32(log + 12));
+        frames = rp_get32(log + 16);
+        rp_hash = 2166136261;
+        ps("film: a RECORDED ride, "); pn(frames); ps(" ticks, seed "); pn(rp_get32(log + 8)); nl();
+    }
+    if (log == 0) {
+        ps("film: "); pn(frames); ps(" frames at "); pn(CFG_TICK_HZ); ps(" fps ("); pn(seconds);
+        ps(" s), pilot "); pn(pilot); nl();
+    }
 
     # ⛔ TRUNCATE FIRST. file_write_all opens for write, but every frame after it APPENDS via an
     # offset write — so a stale longer film from a previous run would leave its tail behind and the
@@ -61,17 +107,20 @@ fn main(): i64 {
     while (f < frames) {
         var word = 0;
         if (pilot == 1) { word = cart_autopilot(); }
+        if (log != 0) { word = rp_get16(log + RP_HDR + f * 2); }
         if (cart_tick(word) == 0) {
             derails = derails + 1;
-            ps("  ** DERAILED at "); pn(trk_depth_m()); ps(" m, frame "); pn(f); ps(" **"); nl();
+            ps("  ** "); ps(mc_death_name()); ps(" at "); pn(trk_depth_m()); ps(" m, frame "); pn(f);
+            ps(" **"); nl();
             cart_reset(cart_seed, cart_chapter);
         }
+        if (log != 0) { rp_hash = rp_state(rp_hash); }
 
         mc_build(cart_cam_x());
         # ⛔ rr_record, NOT rr_list — an op 0x0F record REPLACES its whole rect with background first,
         # and a reference that writes only covered pixels is MORE FORGIVING THAN THE HARDWARE.
         rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
-        sys_write(fd, &rr_fb, MC_W * MC_H * 4);
+        sys_write(fd, rr_fb, MC_W * MC_H * 4);
 
         # ⚠ Report the SLIP, not just the position. A frame log that shows only depth and speed
         # cannot distinguish "riding well" from "about to lose it", which is the whole thing the
@@ -101,9 +150,18 @@ fn main(): i64 {
         f = f + 1;
     }
     file_close(fd);
+    if (log != 0) {
+        # ⭐ PROVE THE VIDEO IS OF THAT RIDE: the same two hashes --replay checks
+        var want_s = rp_get32(log + RP_HDR + frames * 2);
+        var want_f = rp_get32(log + RP_HDR + frames * 2 + 4);
+        ps("film: state hash "); pn(rp_hash); ps(" (recorded "); pn(want_s); ps("), frame hash ");
+        pn(rp_frame_hash()); ps(" (recorded "); pn(want_f); ps(") -- ");
+        if (rp_hash == want_s) { if (rp_frame_hash() == want_f) { ps("the film IS the recorded ride"); nl(); } }
+        if (rp_hash != want_s) { ps("DIVERGED"); nl(); }
+    }
 
     ps("film: done -- "); pn(trk_depth_m()); ps(" m, "); pn(cart_apex_hits);
-    ps(" apexes, "); pn(derails); ps(" derails"); nl();
+    ps(" apexes, "); pn(derails); ps(" deaths"); nl();
     return 0;
 }
 
