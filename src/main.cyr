@@ -36,8 +36,11 @@
 # — `aethersafha-clients-test.py` reached "connected: 2, presented: 2" on 2026-08-02 (QEMU `-smp 1`
 # only; never iron, `-smp 4` fault-kills). The greens that came from the `AETHERSAFHA_SETU_SELFTEST`
 # kernel hook assigning `net_ip = 0x7F000001` remain FALSE GREENS; hook and smokes are DELETED.
-# So the transport is in flux, and that is a second, independent reason there is no windowed mode
-# yet. The GPU-addressing reason below is the durable one and stands entirely on its own.
+# ⭐ SETTLED 2026-08-07 (agnos ipc.md §9.6, bites 6-9). The replacement is the kernel CHANNEL band,
+# `#97 chan_op` (`anu` was only a candidate name). setu 0.8.0 speaks it on agnos with its TCP arm
+# deleted, aethersafha mints and endows one channel per client ("presented: 2" under `-smp 4`), and
+# puka presents a composited window. So the transport is no longer a reason there is no windowed
+# mode. The GPU-addressing reason below is the only one, and it is the durable one.
 #
 # The problem is that **no GPU op that writes colour lets the caller name where the colour goes.**
 # gpu_tri_persp derives its destination from two kernel module globals (gpu_bb_a_mc / gpu_bb_b_mc,
@@ -193,6 +196,11 @@ fn mc_sim(ticks, pilot, record): i64 {
     var max_curve  = 0;
     var max_slip_run = 0;
     var cur_slip_run = 0;
+    # ⭐ THE FORKS: which way each was taken, and how long the run spent on the wet shaft
+    var fk_wet  = 0;
+    var fk_spur = 0;
+    var wet_ticks = 0;
+    var wet_slip  = 0;
     var t = 0;
     while (t < ticks) {
         var word = 0;
@@ -204,6 +212,13 @@ fn mc_sim(ticks, pilot, record): i64 {
         var cvn = 0;
         if (trk_live(trk_abs_seg) == 1) { cvn = fx_abs(trk_curve_at(trk_abs_seg)); }
         if (cvn > max_curve) { max_curve = cvn; }
+        if (trk_live(trk_abs_seg) == 1) {
+            if (trk_wet_at(trk_abs_seg) == 1) {
+                wet_ticks = wet_ticks + 1;
+                if (cart_slip == 1) { wet_slip = wet_slip + 1; }
+            }
+        }
+        var was_pending = trk_fork_pending();
         if (cart_tick(word) == 0) {
             ps("    DIED at "); pn(trk_depth_m()); ps(" m after "); pn(cart_ticks);
             ps(" ticks ("); pn(cart_ticks / CFG_TICK_HZ); ps(" s) -- "); ps(mc_death_name());
@@ -212,6 +227,17 @@ fn mc_sim(ticks, pilot, record): i64 {
             if (trk_depth_m() > deepest) { deepest = trk_depth_m(); }
             mc_sim_bank();
             cart_reset(cart_seed, cart_chapter);
+        }
+        # a fork that was open before this tick and is final after it was just taken
+        if (was_pending == 1) {
+            if (trk_fork_lock == 1) {
+                if (trk_fork_side < 0) { fk_wet = fk_wet + 1; }
+                if (trk_fork_side > 0) { fk_spur = fk_spur + 1; }
+                ps("    FORK at "); pn(trk_depth_m()); ps(" m -- took the ");
+                if (trk_fork_side < 0) { ps("WET SHAFT (x2, slick)"); }
+                if (trk_fork_side > 0) { ps("SERVICE SPUR"); }
+                nl();
+            }
         }
         rp_note(word);
 
@@ -254,6 +280,8 @@ fn mc_sim(ticks, pilot, record): i64 {
     pn(max_slip_run); ps(" ticks"); nl();
     ps("  worst lean "); pn(max_lean >>> 16); ps(" ru of "); pn(CFG_LEAN_THRESH >>> 16);
     ps(" threshold, hardest curve met "); pn(max_curve); ps(" of "); pn(CFG_CURVE_MAX); nl();
+    ps("  forks taken: "); pn(fk_wet); ps(" wet shaft, "); pn(fk_spur); ps(" service spur; on the wet shaft for ");
+    pn(wet_ticks); ps(" ticks, slipping for "); pn(wet_slip); ps(" of them"); nl();
     ps("  the generator produced "); pn(trk_gen_count); ps(" segments, ABI curve clamp fired ");
     pn(trk_clamp_hits); ps(" times"); nl();
     if (rp_on == 1) {
@@ -410,7 +438,14 @@ fn mc_replay(path): i64 {
     var len = load64(&lenb);
     if (buf == 0) { ps("mine-cart: cannot read "); ps(path); nl(); return 2; }
     var r = rp_run(buf, len);
+    # ⭐ A LOG FROM ANOTHER SIMULATION IS NAMED, NOT REPLAYED INTO A FALSE "DIVERGED" (see RP_SIM_REV)
     if (r < 0) {
+        if (rp_err == 5) {
+            ps("mine-cart: "); ps(path); ps(" was recorded by simulation revision "); pn(rp_get16(buf + 6));
+            ps(", and this build is revision "); pn(RP_SIM_REV); nl();
+            ps("           -- replay it with the build that recorded it (0.2.2 is revision 0)"); nl();
+            return 2;
+        }
         ps("mine-cart: "); ps(path); ps(" is not a DEEPVEIN input log (reason "); pn(rp_err); ps(")"); nl();
         return 2;
     }
@@ -433,16 +468,23 @@ fn mc_replay(path): i64 {
 # shipped without: its first iron frame drew the WALLS where the floor and ceiling belonged (a
 # kernel prep-arena race between the frame's two op 0x0F records) and every host assertion passed,
 # because every record was ABI-perfect. Only an image comparison can see a defect like that.
-fn mc_verify(frame): i64 {
+# ⭐ pilot 0 is frame N of the input-less ride — frame 120 is the one rung 19 closed on. pilot 1 is
+# frame N of the autopilot's ride (mc_cart_to_pilot), which is how a fork's chamber, nose and clipped
+# face-on geometry get onto the GPU at all: the input-less ride never reaches one.
+fn mc_verify(frame, pilot): i64 {
     mc_sin_init();
     mc_tex_init();
 
     if (mc_fbinfo() != 1) { ps("mine-cart: no framebuffer -- needs agnos"); nl(); return 3; }
     if (mc_gpu_init() != 1) { ps("mine-cart: GPU setup failed"); nl(); return 4; }
 
-    mc_cart_to(frame);
+    mc_cart_to_pilot(frame, pilot);
     mc_build(cart_cam_x());
-    ps("mine-cart: VERIFY frame "); pn(frame); ps(" -- GPU vs CPU reference, "); pn(mc_n_a);
+    ps("mine-cart: VERIFY frame "); pn(frame);
+    if (pilot == 0) { ps(" of the hands-off ride"); }
+    if (pilot == 1) { ps(" of the autopilot's ride"); }
+    if (mc_fork_on == 1) { ps(" (a fork's chamber is in view)"); }
+    ps(" -- GPU vs CPU reference, "); pn(mc_n_a);
     ps(" triangles in ONE op 0x0F record at ("); pn(MC_DX); ps(","); pn(MC_DY); ps(")"); nl();
 
     if (mc_fb_ok() == 0) { ps("mine-cart: cannot allocate the readback buffer"); nl(); return 7; }
@@ -535,6 +577,10 @@ fn main(): i64 {
     var record = 0;                 # a path, when --record was given
     var replay = 0;                 # likewise --replay
     var pilot  = 1;
+    # ⚠ --verify has its own defaults (frame 120, hands off — the frame rung 19 closed on), so it needs
+    #   to know whether --pilot and --frames were said or merely defaulted
+    var pilot_said  = 0;
+    var frames_said = 0;
     # ⚠ 900 = 15 s. The DEFAULT RIDE IS BOUNDED on purpose: the iron burn runs `run /bin/mine-cart`
     # with no arguments and needs it to come back. Pass --frames 0 to ride until ESC.
     var frames = 900;
@@ -549,6 +595,7 @@ fn main(): i64 {
         if (mc_streq(a, "--wav") == 1)    { wav = 1; known = 1; }
         if (mc_streq(a, "--frames") == 1) {
             known = 1;
+            frames_said = 1;
             i = i + 1;
             frames = 0 - 1;
             if (i < argc()) { frames = mc_atoi(argv(i)); }
@@ -568,6 +615,7 @@ fn main(): i64 {
         }
         if (mc_streq(a, "--pilot") == 1) {
             known = 1;
+            pilot_said = 1;
             i = i + 1;
             pilot = 0 - 1;
             if (i < argc()) { pilot = mc_atoi(argv(i)); }
@@ -578,7 +626,9 @@ fn main(): i64 {
             ps("DEEPVEIN / mine-cart"); nl();
             ps("  (no flag)    ride. Needs agnos + a GPU. Bounded to 900 frames (15 s) unless --frames"); nl();
             ps("  --check      host gate: re-validate every emitted record, needs no GPU (exit 95 = pass)"); nl();
-            ps("  --verify     GPU vs CPU reference, byte-compared. Needs agnos + a GPU"); nl();
+            ps("  --verify     GPU vs CPU reference, byte-compared. Needs agnos + a GPU. Frame 120 of the"); nl();
+            ps("               hands-off ride, or with --pilot 1 --frames N frame N of the autopilot's"); nl();
+            ps("               (715 is inside the first fork, where shot and film show it)"); nl();
             ps("  --sim        run the simulation headless and print telemetry (tuning)"); nl();
             ps("  --wav        render 20 s of the mix to /tmp/deepvein.wav and LISTEN to it"); nl();
             ps("  --pilot N    0 = hands off the controls, 1 = crude autopilot (--sim, --wav)"); nl();
@@ -588,6 +638,8 @@ fn main(): i64 {
             ps("  --trace      report every dropped triangle, for diagnosis"); nl();
             nl();
             ps("  Controls: A/D or arrows lean, W or UP jumps, S or DOWN ducks, SHIFT brakes, ESC quits."); nl();
+            ps("            At a fork, double-tap A (the wet shaft, x2) or D (the service spur) to throw"); nl();
+            ps("            the switch; the cart takes the spur if you never do."); nl();
             return 0;
         }
         # ⛔ AN UNKNOWN FLAG IS AN ERROR, NOT A RIDE. `--chek` used to be silently ignored, which turned
@@ -604,7 +656,14 @@ fn main(): i64 {
     # indistinguishable from the gate having been skipped. One line removes that ambiguity.
     ps("mine-cart: argc "); pn(argc()); ps(" -- mode ");
     if (check == 1) { ps("CHECK (host gate, no GPU needed)"); nl(); return mc_check(); }
-    if (verify == 1) { ps("VERIFY (GPU vs CPU reference)"); nl(); return mc_verify(120); }
+    if (verify == 1) {
+        ps("VERIFY (GPU vs CPU reference)"); nl();
+        var vpilot = 0;
+        if (pilot_said == 1) { vpilot = pilot; }
+        var vframe = 120;
+        if (frames_said == 1) { vframe = frames; }
+        return mc_verify(vframe, vpilot);
+    }
     if (sim == 1) { ps("SIM (headless, no GPU -- tuning telemetry)"); nl(); return mc_sim(frames, pilot, record); }
     if (replay != 0) { ps("REPLAY (headless, no GPU)"); nl(); return mc_replay(replay); }
     if (wav == 1) {

@@ -25,8 +25,8 @@ cyrius build src/main.cyr build/mine-cart
 | Mode | What it does |
 |---|---|
 | *(default)* | Ride. Needs AGNOS and a GPU. Bounded to 900 frames (15 s) unless `--frames` says otherwise. |
-| `--check` | The host gate — 242 self-test assertions, then 1080 frames built and every record re-validated the way the kernel would. Runs anywhere, needs no GPU. Exit 95 = pass. |
-| `--verify` | One frame, GPU vs the CPU reference, byte-compared. Needs AGNOS and a GPU. |
+| `--check` | The host gate — 301 self-test assertions, then 2520 frames built and every record re-validated the way the kernel would. Runs anywhere, needs no GPU. Exit 95 = pass. |
+| `--verify` | One frame, GPU vs the CPU reference, byte-compared. Needs AGNOS and a GPU. Frame 120 of the hands-off ride by default; `--pilot 1 --frames N` verifies frame N of the autopilot's ride instead — 715 is inside the first fork. |
 | `--sim` | Run the simulation headless and print telemetry. The tuning instrument. |
 | `--record F` | Ride (or `--sim`) and write every input word to `F`. |
 | `--replay F` | Re-run a recorded ride headless. Exit 95 only if it reproduced exactly. |
@@ -35,7 +35,8 @@ cyrius build src/main.cyr build/mine-cart
 | `--frames N` | Bound the ride or the `--sim` run (0 = ride until ESC). |
 | `--trace` | Report every dropped triangle, for diagnosis. |
 
-**Controls:** A/D or the arrows lean, W or UP jumps, S or DOWN ducks, SHIFT brakes, ESC quits.
+**Controls:** A/D or the arrows lean, W or UP jumps, S or DOWN ducks, SHIFT brakes, ESC quits. At a
+fork, double-tap A for the wet shaft or D for the service spur.
 
 `cyrius tests` runs the same host gate through `tests/deepvein.tcyr`.
 
@@ -46,7 +47,7 @@ rasteriser that reproduces exactly what op `0x0F` is asked to draw:
 
 | Tool | What it does |
 |---|---|
-| `tools/shot.cyr` | `shot [--pilot 0\|1] DIR FRAME...` writes screenshots (PPM) of the reference ride. |
+| `tools/shot.cyr` | `shot [--pilot 0\|1\|2] DIR FRAME...` writes screenshots (PPM) of the reference ride; pilot 2 leaves every fork's switch alone. |
 | `tools/film.cyr` | `film [seconds] [pilot]` writes the ride as raw 640x400 BGRA video to `/tmp/mc_film.raw`; `film --log F` films a **recorded** ride and checks its hashes. |
 | `tools/refrender.cyr` | One frame, optionally at a screen offset, to `/tmp/mc_ref.raw`. |
 | `tools/dumptex.cyr` | The texture, with per-channel statistics. |
@@ -73,6 +74,31 @@ What stands on a segment is part of the segment: a **beam** at rider height (duc
 often a run of **three tracks** side by side.
 
 ![Three tracks through a bend](docs/screenshots/three-tracks.png)
+
+## Forks
+
+Every few hundred metres the shaft splits. A sign hangs over the track two segments before the switch
+points — **◄ WET ×2** on the left, **DRY ×1 ►** on the right — and whichever side the switch is set to
+is lit. Double-tap A or D to throw it; the lit rails change sides with it. Cross the points and the
+choice is final. Leave it alone and the cart takes the service spur.
+
+The **wet shaft** pays double for every treasure, and its rails are slick: the flange holds 80% of
+what it holds dry, so a bend that holds at the redline on the spur lets go on the wet shaft. Its
+hazards come closer together, with more jump-then-duck pairs. The **service spur** is dry and pays
+the ordinary rate. Either branch runs 400–800 m before it gives way to the trunk again.
+
+![The sign, switched to the wet shaft; then the chamber, the nose, and the dark mouth of the spur](docs/screenshots/fork.png)
+
+The ring never holds both branches. Past the points it holds the one the cart will take, and the
+other is drawn as its mirror — exact, because the approach to a fork is dead straight. Throwing the
+switch negates the neck's curvature in place, so nothing the camera has already seen moves. The
+generator runs 48 segments ahead but stops at the end of the 20-segment neck until the choice is
+made, because everything past it depends on the choice; the neck is longer than the view reaches,
+so the pause never shows. Between the points and the **nose**, where the two bores are a full bore
+apart, both branches share one widening chamber; past it the branch not taken is a dark mouth.
+
+The sign is in view for 1.26 s before the points at the absolute top speed, 1.36 s at the redline:
+the brief asks for a 1.2 s telegraph, and `--check` re-derives it from the frustum.
 
 ## The loop
 
@@ -115,7 +141,14 @@ frame's packed triangle list. `mine-cart --replay ride.dvrp` re-runs it anywhere
 no keyboard, and passes only if both hashes reproduce. On a target with no debugger that replay is
 the only regression test that exists — and `film --log ride.dvrp` turns a ride on iron into a video
 on a host. `--check` records and replays a 40 s ride itself, compares the final frame as pixels, and
-then flips one input bit to prove the replay notices.
+then flips one input bit to prove the replay notices — and takes the recorded switch throw back out,
+to prove the replay notices the cart went down the other branch.
+
+A log carries only its seed and its words; the track is regenerated by whichever build replays it.
+So the log also records **which simulation made it**, and a build refuses another's log by name rather
+than replaying it into a divergence that would look like a determinism bug. Forks changed the track
+past 230 m, so this build is revision 1 and 0.2.2 is revision 0: **replay a 0.2.2 ride with the 0.2.2
+build.**
 
 On AGNOS it is staged as `/bin/mine-cart` by the kernel repo's `scripts/burn/stage-tools.sh`.
 
@@ -131,7 +164,7 @@ On AGNOS it is staged as `/bin/mine-cart` by the kernel repo's `scripts/burn/sta
 ```
 
 640×400, one 128×128 procedural texture, sixteen slabs off an 8/16/32/64 render-unit ladder, and
-**up to 231 of the record's 256 triangles** on the busiest frame. Near slabs are short and far ones
+**up to 235 of the record's 256 triangles** on the busiest frame. Near slabs are short and far ones
 long: a uniform walk makes the nearest slab 280 px tall on a 400 px screen and the farthest 2 px, so
 a curve reads as a polygon rather than a bend. A triangle wholly outside the draw rect is not emitted
 at all — it could not cover a pixel in any rasteriser — which frees a hundred triangles a frame for
@@ -172,6 +205,10 @@ It also asserts things that are not ABI rules at all:
 - **That the gate can fail.** It mutates accepted records — one fraction bit, one reserved dword, an
   op record off the 8-pixel tile — and requires the re-parse to catch each one and name it
   correctly, and it flips one bit of a recorded ride and requires the replay to diverge.
+- **The fork, both ways, at the extremes.** It rides to the first fork twice — switch thrown, switch
+  left alone — and builds the approach, the chamber and the nose with the camera on the rail and
+  jammed to either wall, at all three consoles. The first time it ran it found a 2× `|D|` margin that
+  the ride path had never leaned far enough to see.
 
 ## Geometry notes
 
@@ -183,6 +220,13 @@ the near plane closer *and* the far plane in by the same factor. The frustum use
 **No near-plane clipper.** The segment grid is anchored *to* the near plane, so nothing is ever
 behind the camera. That is deliberate: a clipper is where sub-pixel coordinates and degenerate
 triangles come from, and both of those are whole-batch rejections.
+
+**Face-on geometry *is* clipped — to the draw rect, not the near plane.** For a triangle whose three
+vertices share one `w`, the kernel's `|D|` is simply its area times `65536/w`, all of it, on screen or
+not. The fork added three such surfaces the camera passes close to (its sign, the dark mouth, the
+nose), and the dark mouth measured `|D|` 819,686,400 unclipped. They are built as convex polygons,
+clipped to the rect and fanned: exact, because at one `w` the texture mapping is affine and the new
+corners lie on the rect's whole-pixel edges. Walls and floors recede, and are never clipped.
 
 **Degenerate triangles are dropped, and that is not a hole.** The kernel's area floor is `2^16` and
 the area is `|cross| << 16`, so the rule can only fire when `cross` is *exactly* zero — the triangle
@@ -215,6 +259,11 @@ is already GPU-visible memory.
 > `AETHERSAFHA_SETU_SELFTEST` kernel hook assigning `net_ip = 0x7F000001` remain **false greens**;
 > hook and smokes are deleted. The `#86` carveout and the GPU reasoning below are unaffected either
 > way — they are about *memory*, not transport.
+>
+> ⭐ **Settled 2026-08-07.** The replacement is the kernel **channel band**, `#97 chan_op` (`anu` was
+> only a candidate name). setu 0.8.0 speaks it on agnos with its TCP arm deleted, aethersafha mints and
+> endows one channel per client ("presented: 2" under `-smp 4`), and puka presents a composited
+> window. Transport is no longer a reason this game is fullscreen; the one below is.
 
 The boundary is that **no GPU op that writes colour lets the caller name where the colour goes.**
 `gpu_tri_persp` derives its destination from two kernel module globals (`gpu_bb_a_mc`/`gpu_bb_b_mc`),
@@ -230,18 +279,19 @@ to the back buffer, in the same dispatch. Colour never got the field depth has.
 
 `0.2.2` — the loop, the hazards and the treasure, drawn where the rules apply them; a HUD; and the
 input-log replay that turns every ride into a regression test. Built with Cyrius 6.6.6, the toolchain
-agnos itself builds with.
+agnos itself builds with. **Unreleased on top of it: forks** (the build order's step 6) — see the
+[CHANGELOG](CHANGELOG.md).
 
 ![0.2.1 and 0.2.2, the same moment of the same ride](docs/screenshots/before-after.png)
 
 Measured with `--sim` over 30 s: hands off the controls, the cart takes the beams standing and falls
-into the first gap every time, at 87 m (7 falls, 15 beams taken); the reference autopilot reaches
-736 m with 5 clean apexes, 7 jumps, 11 ducks and no deaths, slipping for 13% of the run. That gap
-is the difficulty, and it is the number to argue with.
+into the first gap every time, at 87 m (7 falls, 15 beams taken), and never reaches a fork; the
+reference autopilot throws the first fork's switch to the wet shaft at 281 m and reaches 732 m with
+5 clean apexes, 6 jumps, 11 ducks and no deaths — slipping for 10% of the run, and for 15% of its
+time on the wet shaft. That gap is the difficulty, and it is the number to argue with.
 
-Still to come, in the order the brief builds them: forks and their 1.2 s telegraph, rail hops on the
-three-track runs, pursuers and the whip, and the flood finale. See
-[`docs/development/roadmap.md`](docs/development/roadmap.md).
+Still to come, in the order the brief builds them: rail hops on the three-track runs, pursuers and
+the whip, and the flood finale. See [`docs/development/roadmap.md`](docs/development/roadmap.md).
 
 ## License
 

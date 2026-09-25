@@ -12,10 +12,11 @@
 # ⚠ THE SAME RIDE AS film AND --sim. Same seed, same reference autopilot, and frame N here is frame N
 # of /tmp/mc_film.raw — so a defect seen in the video can be pulled out as a still by its number.
 #
-# Usage:  cyrius build tools/shot.cyr build/shot && ./build/shot [--pilot 0|1] OUTDIR FRAME [FRAME ...]
+# Usage:  cyrius build tools/shot.cyr build/shot && ./build/shot [--pilot 0|1|2] OUTDIR FRAME [FRAME ...]
 #         writes OUTDIR/deepvein-NNNNN.ppm (640x400, binary P6) for each frame, in any order.
 #         --pilot 0 rides hands-off (it takes beams, falls in gaps and dies); the default is the
-#         reference autopilot.
+#         reference autopilot, which throws each fork's switch to the wet shaft; --pilot 2 is the same
+#         pilot leaving every switch alone, so the cart takes the service spur.
 
 include "lib/io.cyr"
 include "src/say.cyr"
@@ -62,6 +63,20 @@ fn shot_caption(frame): i64 {
     if (cart_air > 0) { ps("  AIR "); pn(cart_air); }
     if (cart_crouch > 0) { ps("  DUCK "); pn(cart_crouch); }
     if (trk_multi_at(trk_abs_seg) == 1) { ps("  [3-TRACK]"); }
+    if (trk_neck_at(trk_abs_seg) == 1) { ps("  [NECK]"); }
+    if (trk_wet_at(trk_abs_seg) == 1) { ps("  [WET]"); }
+    # ⭐ the fork: where its points are, and which way the switch lies
+    if (trk_fork_at >= 0) {
+        var fd = trk_fork_at - trk_abs_seg;
+        if (fd >= 0 - CFG_FORK_NOSE) {
+            if (fd <= 16) {
+                ps("  points@"); pn(fd); ps(" switch ");
+                if (trk_fork_side < 0) { ps("WET"); }
+                if (trk_fork_side > 0) { ps("DRY"); }
+                if (trk_fork_lock == 1) { ps(" (final)"); }
+            }
+        }
+    }
     var s = 1;
     while (s <= 16) {
         var a = trk_abs_seg + s;
@@ -70,6 +85,7 @@ fn shot_caption(frame): i64 {
             if (k == KIND_BEAM)   { ps("  beam@"); pn(s); }
             if (k == KIND_GAP)    { ps("  gap@"); pn(s); }
             if (k == KIND_PICKUP) { ps("  gem@"); pn(s); }
+            if (k == KIND_SIGN)   { ps("  sign@"); pn(s); }
         }
         s = s + 1;
     }
@@ -119,10 +135,10 @@ fn main(): i64 {
             }
         }
     }
-    if (pilot < 0) { ps("shot: --pilot takes 0 or 1"); nl(); return 2; }
-    if (pilot > 1) { ps("shot: --pilot takes 0 or 1"); nl(); return 2; }
+    if (pilot < 0) { ps("shot: --pilot takes 0, 1 or 2"); nl(); return 2; }
+    if (pilot > 2) { ps("shot: --pilot takes 0, 1 or 2"); nl(); return 2; }
     if (argc() < first + 2) {
-        ps("usage: shot [--pilot 0|1] OUTDIR FRAME [FRAME ...]   (frames of the ride, as in film)"); nl();
+        ps("usage: shot [--pilot 0|1|2] OUTDIR FRAME [FRAME ...]   (frames of the ride, as in film)"); nl();
         return 2;
     }
     var dir = argv(first);
@@ -149,6 +165,7 @@ fn main(): i64 {
         while (f <= want) {
             var word = 0;
             if (pilot == 1) { word = cart_autopilot(); }
+            if (pilot == 2) { word = cart_autopilot() & (0 - 1 - IN_SW_LEFT); }
             if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
             f = f + 1;
         }

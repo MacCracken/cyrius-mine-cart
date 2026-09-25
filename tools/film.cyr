@@ -68,6 +68,13 @@ fn main(): i64 {
             if (loglen != RP_HDR + rp_get32(log + 16) * 2 + RP_TRAILER) {
                 ps("film: damaged input log"); nl(); return 2;
             }
+            # ⭐ another simulation's log would film a different ride — say so (see RP_SIM_REV)
+            if (rp_get16(log + 6) != RP_SIM_REV) {
+                ps("film: that ride was recorded by simulation revision "); pn(rp_get16(log + 6));
+                ps(" and this build is revision "); pn(RP_SIM_REV);
+                ps(" -- film it with the build that recorded it"); nl();
+                return 2;
+            }
         }
     }
     var seconds = film_arg(1, 15);

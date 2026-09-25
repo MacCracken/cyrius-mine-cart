@@ -36,8 +36,11 @@ var trk_curve[128];        # i16  brads of heading change across this segment, +
 var trk_grade[128];        # i16  brads of pitch,                             + = down
 var trk_kind[128];         # u8   KIND_*
 var trk_flags[128];        # u8   FLAG_* bitfield
-var trk_branch_a[128];     # u16  segment index of the default (straight) branch
-var trk_branch_b[128];     # u16  segment index of the alternate branch
+# ⚠ THE TWO BRANCH INDICES ARE RESERVED, NOT USED BY FORKS. They were laid down for a fork that points at
+#   two stretches of ring; the fork that shipped (step 6) keeps ONE path in the ring and mirrors its neck
+#   in place instead (trk_fork_switch), so branch_a is always written 0 and branch_b carries the lane.
+var trk_branch_a[128];     # u16  reserved — written 0
+var trk_branch_b[128];     # u16  a treasure's lane (see trk_lane_at)
 var trk_guard = 0;         # ⛔ overrun sentinel — see trk_ok()
 
 # ---- position ----------------------------------------------------------------------------------
@@ -61,6 +64,23 @@ var trk_haz_pair    = 0;   # >0 = a stacked partner is due this many segments af
 var trk_haz_pair_kind = 0; # what that partner will be
 var trk_gap_left    = 0;   # segments remaining in the gap currently being laid
 var trk_multi_left  = 0;   # segments remaining in the current 3-track run
+
+# ---- ⭐⭐ THE FORK ----------------------------------------------------------------------------------
+# ⭐ ONE PATH IN THE RING, ALWAYS. The ring holds the branch the cart will take; the other branch is
+# never simulated, only drawn — as the MIRROR of the neck, which is exact because the trunk under a fork
+# is dead straight. Throwing the switch negates the neck's curvature in place (trk_fork_switch): the
+# picture of the two branches does not move, only which of them is the ring — and so which is lit.
+# ⛔ THE GENERATOR STOPS AT THE END OF THE NECK UNTIL THE CART HAS CHOSEN. Everything past the neck
+# depends on the choice (the wet shaft is laid differently), and the generator runs 48 segments ahead
+# while the choice is made about one second out. The neck is CFG_BRANCH_NECK segments, longer than the
+# 12.1 the view reaches from the cart, so the pause is never on screen.
+# ⚠ ALL OF IT IS RESET BY trk_reset(), like the rest of the generator state.
+var trk_fork_next   = 0;   # absolute segment of the NEXT fork's points
+var trk_fork_at     = 0;   # absolute segment of the current fork's points; -1 before the first
+var trk_fork_side   = 1;   # the branch the ring holds through it: 1 right (spur, default), -1 left (wet)
+var trk_fork_lock   = 0;   # 1 once the cart has crossed the points — the choice is final
+var trk_branch      = 0;   # what the generator is laying: 0 trunk, 1 the wet shaft, 2 the service spur
+var trk_branch_left = 0;   # segments of the branch still to lay (its tail included)
 
 # ---- counters, for the gate ---------------------------------------------------------------------
 var trk_gen_count   = 0;   # segments generated this chapter — proves streaming actually streams
@@ -133,6 +153,94 @@ fn trk_live(abs_seg): i64 {
     return 1;
 }
 
+# ---- the fork, as the rest of the engine sees it -------------------------------------------------------
+# 1 while a fork has been laid and the cart has not yet crossed its points — the only time a switch counts
+fn trk_fork_pending(): i64 {
+    if (trk_fork_at < 0) { return 0; }
+    if (trk_fork_lock == 1) { return 0; }
+    return 1;
+}
+
+# 1 if an absolute segment is part of a fork's neck
+fn trk_neck_at(abs_seg): i64 {
+    if ((trk_flags_at(abs_seg) & FLAG_NECK) != 0) { return 1; }
+    return 0;
+}
+
+# 1 if an absolute segment is on the wet shaft
+fn trk_wet_at(abs_seg): i64 {
+    if ((trk_flags_at(abs_seg) & FLAG_WET) != 0) { return 1; }
+    return 0;
+}
+
+# the neck's curvature at neck segment i, before the side is applied: brads/segment, never negative.
+# ⚠ Ramped at CFG_CURVE_RAMP on the way up and the way down, so neither end of the neck is a kink.
+fn trk_fork_dc(i): i64 {
+    var up = (i + 1) * CFG_CURVE_RAMP;
+    if (up > CFG_FORK_DC) { up = CFG_FORK_DC; }
+    var down = (CFG_FORK_EASE - i) * CFG_CURVE_RAMP;
+    if (down < 0) { down = 0; }
+    if (down < up) { return down; }
+    return up;
+}
+
+# ---- ⭐⭐ THROWING THE SWITCH ---------------------------------------------------------------------------
+# side: 1 = right (the spur), -1 = left (the wet shaft). Returns 1 if the switch moved.
+# ⭐ THE NECK IS MIRRORED IN PLACE. The trunk under a fork is straight, so the neck's curvature is purely
+# the branch's own turn, and the other branch is exactly its negation — negating it swaps which branch
+# is the ring and changes nothing else. Nothing behind the camera moves (the neck starts at the points,
+# which the cart has not reached), and the renderer draws both branches either way, so on screen the
+# switch is what it would be on a real turnout: the lit rails and the lit panel change sides.
+# ⚠ Neck segments not yet generated are laid on the new side by trk_gen_one, which reads trk_fork_side.
+# ⛔ REFUSED ONCE THE CART HAS CROSSED THE POINTS. After that the ring under the cart is the branch.
+fn trk_fork_switch(side): i64 {
+    if (trk_fork_pending() == 0) { return 0; }
+    if (side == trk_fork_side) { return 0; }
+    trk_fork_side = side;
+    var a = trk_fork_at;
+    while (a < trk_fork_at + CFG_BRANCH_NECK) {
+        if (trk_live(a) == 1) {
+            var s = trk_slot(a);
+            store64(&trk_curve + s * 8, 0 - load64(&trk_curve + s * 8));
+        }
+        a = a + 1;
+    }
+    return 1;
+}
+
+# ---- what the generator is laying, and the hazard rhythm that goes with it --------------------------------
+# 0 = the trunk, 1 = the wet shaft, 2 = the spur. A branch's last CFG_BRANCH_TAIL segments are laid as
+# trunk again, which is how it "ramps back to the trunk's values".
+fn trk_laying(): i64 {
+    if (trk_branch == 0) { return 0; }
+    if (trk_branch_left <= CFG_BRANCH_TAIL) { return 0; }
+    return trk_branch;
+}
+
+# minimum segments between hazards on what is being laid
+fn trk_haz_min(): i64 {
+    var b = trk_laying();
+    if (b == 1) { return CFG_WET_HAZ_GAP_MIN; }
+    if (b == 2) { return CFG_SPUR_HAZ_GAP_MIN; }
+    return CFG_HAZ_GAP_MIN;
+}
+
+# maximum segments between hazards on what is being laid
+fn trk_haz_max(): i64 {
+    var b = trk_laying();
+    if (b == 1) { return CFG_WET_HAZ_GAP_MAX; }
+    if (b == 2) { return CFG_SPUR_HAZ_GAP_MAX; }
+    return CFG_HAZ_GAP_MAX;
+}
+
+# percent of hazards followed by a stacked partner on what is being laid
+fn trk_haz_pair_pct(): i64 {
+    var b = trk_laying();
+    if (b == 1) { return CFG_WET_HAZ_PAIR_PCT; }
+    if (b == 2) { return CFG_SPUR_HAZ_PAIR_PCT; }
+    return CFG_HAZ_PAIR_PCT;
+}
+
 # ---- writing a segment ---------------------------------------------------------------------------
 # ⛔ THE DECLARED FIELD WIDTHS ARE ENFORCED HERE AND NOWHERE ELSE. Storing an out-of-range value into
 # a full i64 slot would "work" and then overflow the moment anyone packs these fields for real, or
@@ -165,46 +273,101 @@ fn trk_put(abs_seg, curve, grade, kind, flags, ba, bb): i64 {
 # player reached it in one run or after nine deaths.
 # ⛔ NEVER call this to "re-derive" a segment that has scrolled out of the ring. It would consume rng
 # draws out of order and desynchronise every segment after it.
+# Returns 1 when it laid a segment, 0 when it is waiting at a fork for the cart to choose.
 fn trk_gen_one(): i64 {
     var abs = trk_gen_to;
 
-    # -- a new phrase? Pick fresh targets. --------------------------------------------------------
-    if (trk_phrase_left <= 0) {
-        trk_phrase_left = fx_rand_range(CFG_PHRASE_MIN, CFG_PHRASE_MAX);
-        # ⚠ A THIRD OF PHRASES ARE DEAD STRAIGHT ON PURPOSE. Continuous curvature gives the player
-        # nowhere to recover lean, and a track with no rest reads as uniformly hard rather than
-        # rhythmic. The straights are where the brake-into/release-at-apex loop gets set up.
-        #
-        # ⛔⛔ ONE DRAW, TESTED TWICE — NOT TWO DRAWS. This was two independent `fx_rand_n(100)` calls
-        # against the same threshold, which is not a coin flip with two outcomes, it is two coins:
-        #     both fire     22.4%  (curve overwrites straight)
-        #     only curve    43.6%
-        #     only straight 11.6%  <- the ACTUAL straight rate, against 34% intended
-        #     NEITHER fires 11.6%  <- and this silently inherited the PREVIOUS phrase's target,
-        #                             so a "new" phrase was sometimes just the old one continuing
-        # The comment above said a third and the generator delivered an eighth. Draw once, branch on
-        # the stored value, and the number in config.cyr means what it says.
-        var roll = fx_rand_n(100);
-        if (roll < CFG_STRAIGHT_PCT) {
-            trk_tgt_curve = 0;
-        } else {
-            var mag = fx_rand_range(CFG_CURVE_MAX / 8, CFG_CURVE_MAX);
-            if (fx_rand_n(2) == 0) { mag = 0 - mag; }
-            trk_tgt_curve = mag;
+    # ---- ⭐⭐ THE FORK: where this segment sits relative to the current fork's points ---------------
+    # The next fork becomes current as the stream reaches its lead-in, and from then on every zone is
+    # measured from its points (fz = 0):
+    #     [-LEADIN, 0)             the track straightens (no new phrases, target curve 0)
+    #     [-CLEAR - GAP, NECK)     QUIET: no hazard may start, so a gap in progress ends before CLEAR
+    #     [-CLEAR, NECK)           STERILE: nothing on the track, no side tracks
+    #     -SIGN_LEAD, 0            the sign, and the points
+    #     [0, NECK)                the neck: FLAG_NECK, curvature = side x trk_fork_dc
+    #     NECK                     the cart has chosen: lay the branch it chose
+    var leadin = CFG_FORK_CLEAR + CFG_FORK_STRAIGHT;
+    if (abs >= trk_fork_next - leadin) {
+        if (trk_fork_at != trk_fork_next) {
+            trk_fork_at = trk_fork_next;
+            trk_fork_side = 1;
+            trk_fork_lock = 0;
         }
-        # a new phrase may open a 3-track run
-        if (trk_multi_left <= 0) {
-            if (abs >= CFG_MULTI_NONE_SEGS) {
-                if (fx_rand_n(100) < CFG_MULTI_PCT) {
-                    trk_multi_left = fx_rand_range(CFG_MULTI_MIN_SEGS, CFG_MULTI_MAX_SEGS);
+    }
+    var fz = 0 - 1000000;
+    if (trk_fork_at >= 0) { fz = abs - trk_fork_at; }
+    # ⛔ THE PAUSE. Past the neck the track depends on the choice, so nothing is laid until it is made.
+    if (fz >= CFG_BRANCH_NECK) {
+        if (trk_fork_lock == 0) { return 0; }
+    }
+    var approach = 0;
+    if (fz >= 0 - leadin) { if (fz < 0) { approach = 1; } }
+    var neck = 0;
+    if (fz >= 0) { if (fz < CFG_BRANCH_NECK) { neck = 1; } }
+    var quiet = 0;
+    if (fz >= 0 - CFG_FORK_CLEAR - CFG_GAP_SEGS) { if (fz < CFG_BRANCH_NECK) { quiet = 1; } }
+    var sterile = 0;
+    if (fz >= 0 - CFG_FORK_CLEAR) { if (fz < CFG_BRANCH_NECK) { sterile = 1; } }
+
+    # ⭐ THE FIRST SEGMENT PAST THE NECK: the cart has crossed the points, so lay what it chose. The rng
+    #   draws below happen here, after the pause, in segment order — so the branch is a pure function of
+    #   the seed and the choice, however long the choice took.
+    if (fz == CFG_BRANCH_NECK) {
+        trk_branch = 2;
+        if (trk_fork_side < 0) { trk_branch = 1; }
+        trk_branch_left = fx_rand_range(CFG_BRANCH_MIN_SEGS, CFG_BRANCH_MAX_SEGS);
+        # ⚠ continue from the neck AS IT NOW IS — a switch may have mirrored it since it was laid
+        trk_cur_curve = trk_curve_at(abs - 1);
+        trk_phrase_left = 0;
+        trk_haz_next = abs + fx_rand_range(trk_haz_min(), trk_haz_max());
+    }
+
+    # -- a new phrase? Pick fresh targets. --------------------------------------------------------
+    # ⚠ Never inside a fork's lead-in or neck: the lead-in holds the track straight and the neck's shape
+    #   is the fork's own. The phrase that was running simply holds its grade target until the branch.
+    var phrase_ok = 1;
+    if (approach == 1) { phrase_ok = 0; }
+    if (neck == 1) { phrase_ok = 0; }
+    if (trk_phrase_left <= 0) {
+        if (phrase_ok == 1) {
+            trk_phrase_left = fx_rand_range(CFG_PHRASE_MIN, CFG_PHRASE_MAX);
+            # ⚠ A THIRD OF PHRASES ARE DEAD STRAIGHT ON PURPOSE. Continuous curvature gives the player
+            # nowhere to recover lean, and a track with no rest reads as uniformly hard rather than
+            # rhythmic. The straights are where the brake-into/release-at-apex loop gets set up.
+            #
+            # ⛔⛔ ONE DRAW, TESTED TWICE — NOT TWO DRAWS. This was two independent `fx_rand_n(100)` calls
+            # against the same threshold, which is not a coin flip with two outcomes, it is two coins:
+            #     both fire     22.4%  (curve overwrites straight)
+            #     only curve    43.6%
+            #     only straight 11.6%  <- the ACTUAL straight rate, against 34% intended
+            #     NEITHER fires 11.6%  <- and this silently inherited the PREVIOUS phrase's target,
+            #                             so a "new" phrase was sometimes just the old one continuing
+            # The comment above said a third and the generator delivered an eighth. Draw once, branch on
+            # the stored value, and the number in config.cyr means what it says.
+            var roll = fx_rand_n(100);
+            if (roll < CFG_STRAIGHT_PCT) {
+                trk_tgt_curve = 0;
+            } else {
+                var mag = fx_rand_range(CFG_CURVE_MAX / 8, CFG_CURVE_MAX);
+                if (fx_rand_n(2) == 0) { mag = 0 - mag; }
+                trk_tgt_curve = mag;
+            }
+            # a new phrase may open a 3-track run
+            if (trk_multi_left <= 0) {
+                if (abs >= CFG_MULTI_NONE_SEGS) {
+                    if (fx_rand_n(100) < CFG_MULTI_PCT) {
+                        trk_multi_left = fx_rand_range(CFG_MULTI_MIN_SEGS, CFG_MULTI_MAX_SEGS);
+                    }
                 }
             }
+            trk_tgt_grade = fx_rand_range(0 - CFG_GRADE_MAX / 2, CFG_GRADE_MAX) + CFG_GRADE_BIAS;
+            if (trk_tgt_grade >  CFG_GRADE_MAX) { trk_tgt_grade =  CFG_GRADE_MAX; }
+            if (trk_tgt_grade < 0 - CFG_GRADE_MAX) { trk_tgt_grade = 0 - CFG_GRADE_MAX; }
         }
-        trk_tgt_grade = fx_rand_range(0 - CFG_GRADE_MAX / 2, CFG_GRADE_MAX) + CFG_GRADE_BIAS;
-        if (trk_tgt_grade >  CFG_GRADE_MAX) { trk_tgt_grade =  CFG_GRADE_MAX; }
-        if (trk_tgt_grade < 0 - CFG_GRADE_MAX) { trk_tgt_grade = 0 - CFG_GRADE_MAX; }
     }
     trk_phrase_left = trk_phrase_left - 1;
+    # ⭐ the lead-in unwinds whatever bend the fork arrives in, at the ordinary ramp
+    if (approach == 1) { trk_tgt_curve = 0; }
 
     # -- ramp toward the target, never step ------------------------------------------------------
     # ⚠ A step change in curvature is a visible HINGE in the rail — the tunnel kinks at that seam
@@ -219,6 +382,10 @@ fn trk_gen_one(): i64 {
     if (dg < 0 - CFG_GRADE_RAMP) { dg = 0 - CFG_GRADE_RAMP; }
     trk_cur_grade = trk_cur_grade + dg;
 
+    # ⭐ THE NECK IS THE FORK'S OWN SHAPE: the chosen side of the profile, laid exactly. The lead-in has
+    #   already unwound the trunk to zero, so this is continuous with it and the mirror is exact.
+    if (neck == 1) { trk_cur_curve = trk_fork_side * trk_fork_dc(fz); }
+
     # -- what is ON this segment ------------------------------------------------------------------
     # ⭐ HAZARDS AND PICKUPS LIVE IN THE SEGMENT, NOT IN A PARALLEL LIST. The segment IS the world, so
     # there is no second structure to keep in sync, nothing to sort, and streaming a segment out of
@@ -231,6 +398,9 @@ fn trk_gen_one(): i64 {
     # ⚠ Decided at PHRASE boundaries so a 3-track section lines up with a curve phrase rather than
     # starting mid-bend, and never overlapping a gap — hopping between rails while airborne over a
     # hole is a combination nothing in the design has an answer for yet.
+    # ⚠ Cut short where a fork's sterile stretch begins: side tracks running into the points would be a
+    #   third and fourth track at a switch that has two.
+    if (sterile == 1) { trk_multi_left = 0; }
     if (trk_multi_left > 0) {
         flags = flags | FLAG_MULTI;
         trk_multi_left = trk_multi_left - 1;
@@ -246,32 +416,37 @@ fn trk_gen_one(): i64 {
             # ⚠ NOTHING within CFG_HAZ_NONE_SEGS of the gate. A chapter that opens with a hazard
             # kills the player before they have seen the track, and on a respawn that reads as the
             # game cheating rather than as a mistake they made.
+            # ⚠ ...and no hazard STARTS in a fork's quiet zone, which is a gap's width longer than its
+            #   sterile stretch, so a gap begun just before it is over before the approach is clear.
             if (abs >= CFG_HAZ_NONE_SEGS) {
-                if (abs >= trk_haz_next) {
-                    # ⭐ STACKED PAIRS ARE WHAT MAKE THIS A RHYTHM RATHER THAN A SET OF EVENTS. A gap
-                    # immediately followed by a beam forces jump->duck with no time to think, which is
-                    # the only way the two verbs ever interact.
-                    # ⚠ Before the gap gate, EVERY hazard is a beam — the cart cannot yet jump.
-                    var pick = 1;
-                    if (abs >= CFG_GAP_NONE_SEGS) { pick = fx_rand_n(2); }
-                    if (pick == 0) { kind = KIND_GAP;  trk_gap_left = CFG_GAP_SEGS - 1; }
-                    if (pick != 0) { kind = KIND_BEAM; }
-                    if (fx_rand_n(100) < CFG_HAZ_PAIR_PCT) {
-                        trk_haz_pair = CFG_HAZ_PAIR_SEGS;
-                        # the partner is always the OTHER verb — a gap-gap pair is just a wider gap
-                        trk_haz_pair_kind = KIND_BEAM;
-                        if (kind == KIND_BEAM) {
-                            trk_haz_pair_kind = KIND_GAP;
-                            # ...unless a gap is still not allowed, in which case there is no pair
-                            if (abs + CFG_HAZ_PAIR_SEGS < CFG_GAP_NONE_SEGS) { trk_haz_pair = 0; }
+                if (quiet == 0) {
+                    if (abs >= trk_haz_next) {
+                        # ⭐ STACKED PAIRS ARE WHAT MAKE THIS A RHYTHM RATHER THAN A SET OF EVENTS. A gap
+                        # immediately followed by a beam forces jump->duck with no time to think, which
+                        # is the only way the two verbs ever interact.
+                        # ⚠ Before the gap gate, EVERY hazard is a beam — the cart cannot yet jump.
+                        var pick = 1;
+                        if (abs >= CFG_GAP_NONE_SEGS) { pick = fx_rand_n(2); }
+                        if (pick == 0) { kind = KIND_GAP;  trk_gap_left = CFG_GAP_SEGS - 1; }
+                        if (pick != 0) { kind = KIND_BEAM; }
+                        if (fx_rand_n(100) < trk_haz_pair_pct()) {
+                            trk_haz_pair = CFG_HAZ_PAIR_SEGS;
+                            # the partner is always the OTHER verb — a gap-gap pair is just a wider gap
+                            trk_haz_pair_kind = KIND_BEAM;
+                            if (kind == KIND_BEAM) {
+                                trk_haz_pair_kind = KIND_GAP;
+                                # ...unless a gap is still not allowed, in which case there is no pair
+                                if (abs + CFG_HAZ_PAIR_SEGS < CFG_GAP_NONE_SEGS) { trk_haz_pair = 0; }
+                            }
                         }
+                        trk_haz_next = abs + fx_rand_range(trk_haz_min(), trk_haz_max());
                     }
-                    trk_haz_next = abs + fx_rand_range(CFG_HAZ_GAP_MIN, CFG_HAZ_GAP_MAX);
                 }
             }
         }
     }
-    # the stacked partner falls due a couple of segments after its opener
+    # the stacked partner falls due a couple of segments after its opener — never in a quiet zone
+    if (quiet == 1) { trk_haz_pair = 0; }
     if (trk_haz_pair > 0) {
         trk_haz_pair = trk_haz_pair - 1;
         if (trk_haz_pair == 0) {
@@ -279,36 +454,57 @@ fn trk_gen_one(): i64 {
                 kind = trk_haz_pair_kind;
                 if (kind == KIND_GAP) { trk_gap_left = CFG_GAP_SEGS - 1; }
                 # push the next ordinary hazard back so the pair is not immediately crowded
-                if (trk_haz_next < abs + CFG_HAZ_GAP_MIN) { trk_haz_next = abs + CFG_HAZ_GAP_MIN; }
+                if (trk_haz_next < abs + trk_haz_min()) { trk_haz_next = abs + trk_haz_min(); }
             }
         }
     }
 
-    # treasure goes on segments that are otherwise clear
+    # treasure goes on segments that are otherwise clear — and never on a fork's approach or neck
     if (kind == KIND_PLAIN) {
-        if (fx_rand_n(100) < CFG_PICKUP_PCT) {
-            kind = KIND_PICKUP;
-            lane = fx_rand_n(CFG_PICKUP_LANES);      # 0 = left, 1 = centre, 2 = right
+        if (sterile == 0) {
+            if (fx_rand_n(100) < CFG_PICKUP_PCT) {
+                kind = KIND_PICKUP;
+                lane = fx_rand_n(CFG_PICKUP_LANES);      # 0 = left, 1 = centre, 2 = right
+            }
         }
     }
 
-    # ⚠ lane rides in branch_b, which is unused for everything except a fork. Documented here because
-    # a field doing two jobs is exactly the sort of thing that rots silently.
+    # ---- the fork's own furniture, and the branch's character -----------------------------------------
+    if (fz == 0 - CFG_FORK_SIGN_LEAD) { kind = KIND_SIGN; }
+    if (fz == 0) { kind = KIND_FORK; }
+    if (neck == 1) { flags = flags | FLAG_NECK; }
+    if (trk_laying() == 1) { flags = flags | FLAG_WET; }
+
+    # ⚠ lane rides in branch_b, which forks do not use (see trk_branch_a). Documented here because a
+    # field doing two jobs is exactly the sort of thing that rots silently.
     trk_put(abs, trk_cur_curve, trk_cur_grade, kind, flags, 0, lane);
+
+    # ⭐ THE BRANCH RUNS DOWN, AND AT ITS END THE TRUNK RESUMES AND THE NEXT FORK IS SCHEDULED
+    if (trk_branch != 0) {
+        trk_branch_left = trk_branch_left - 1;
+        if (trk_branch_left <= 0) {
+            trk_branch = 0;
+            trk_fork_next = abs + 1 + fx_rand_range(CFG_FORK_GAP_MIN, CFG_FORK_GAP_MAX) + leadin;
+        }
+    }
 
     trk_gen_to = trk_gen_to + 1;
     trk_gen_count = trk_gen_count + 1;
-    return 0;
+    return 1;
 }
 
 # Top the ring up so there are always CFG_GEN_AHEAD segments in front of the cart.
 # ⚠ Bounded by the ring size, not by the loop condition alone: generating more than CFG_RING_LIVE
 # ahead would overwrite the segment the cart is standing on.
+# ⛔ AND IT STOPS WHERE THE GENERATOR DOES: at a fork's neck, trk_gen_one lays nothing until the cart
+# has chosen, and a loop that kept calling it would spin forever inside a single tick.
 fn trk_stream(): i64 {
     var want = trk_abs_seg + CFG_GEN_AHEAD;
     var limit = trk_abs_seg + CFG_RING_LIVE - 1;
     if (want > limit) { want = limit; }
-    while (trk_gen_to <= want) { trk_gen_one(); }
+    while (trk_gen_to <= want) {
+        if (trk_gen_one() == 0) { return 0; }
+    }
     return 0;
 }
 
@@ -335,6 +531,12 @@ fn trk_reset(seed, chapter): i64 {
     trk_haz_pair_kind = 0;
     trk_gap_left = 0;
     trk_multi_left = 0;
+    trk_fork_next = CFG_FORK_FIRST;
+    trk_fork_at = 0 - 1;
+    trk_fork_side = 1;
+    trk_fork_lock = 0;
+    trk_branch = 0;
+    trk_branch_left = 0;
     trk_gen_count = 0;
     trk_clamp_hits = 0;
 
@@ -367,6 +569,12 @@ fn trk_advance(speed_sub): i64 {
     while (trk_pos_sub >= CFG_SUB_PER_SEG) {
         trk_pos_sub = trk_pos_sub - CFG_SUB_PER_SEG;
         trk_abs_seg = trk_abs_seg + 1;
+        # ⭐ THE POINTS. The wheels pass the switch and the choice is final — here, in the position carry,
+        #   not in cart_tick, so that anything that moves the cart (the tests drive this directly) locks
+        #   a fork and releases the generator, rather than stranding it at the neck.
+        if (trk_fork_pending() == 1) {
+            if (trk_abs_seg >= trk_fork_at) { trk_fork_lock = 1; }
+        }
     }
     trk_stream();
     return 0;

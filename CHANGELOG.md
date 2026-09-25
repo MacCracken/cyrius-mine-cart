@@ -7,6 +7,105 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and this pro
 
 ## [Unreleased]
 
+**Forks — the build order's step 6.** Every few hundred metres the shaft splits: a sign in the tunnel
+(design plate 1A) says **◄ WET ×2** and **DRY ×1 ►**, a double-tap throws the switch, the lit rails
+change sides with it, and the cart commits at the points. The wet shaft pays double and runs on slick
+rails between closer hazards; the spur is dry and pays the ordinary rate. The ring still holds one
+path — the other branch is only ever drawn, as a mirror — and the generator waits at the end of the
+fork's neck until the cart has chosen. The new gate pass that rides the fork both ways at the extremes
+found, the first time it ran, a 2× `|D|` margin that the ride path had never leaned far enough to see;
+face-on geometry is now clipped to the draw rect, and the margin is 21×.
+
+### Added
+
+- **Forks** (`src/track.cyr`, `src/geom.cyr`). The generator lays a fork in stages measured from its
+  points: a straightening lead-in, a sterile approach (`CFG_FORK_CLEAR` — nothing on the track, no side
+  tracks), the sign `CFG_FORK_SIGN_LEAD` segments before the points, and a `CFG_BRANCH_NECK`-segment
+  neck in which each branch turns away at up to `CFG_FORK_DC` and eases back to straight. The first
+  fork's points are at segment `CFG_FORK_FIRST` (282 m); each branch runs 156–312 segments, its last
+  `CFG_BRANCH_TAIL` laid as trunk again, and the next fork follows 60–120 segments on.
+- **The switch.** `IN_SW_LEFT` / `IN_SW_RIGHT` (the double-tap that 0.2.1 decoded and nothing read)
+  throw it any time before the points: left is the wet shaft, right the service spur, and a cart whose
+  switch is never touched takes the spur (plate 1B: "NO INPUT — CART TAKES IT"). Crossing the points
+  makes it final — in the position carry, not in `cart_tick`, so anything that moves the cart locks a
+  fork and releases the generator.
+- **One path in the ring, and a mirror.** The trunk under a fork is dead straight, so the branch not
+  taken is exactly the negation of the neck's curvature. Throwing the switch negates the neck in place
+  (`trk_fork_switch`): nothing the camera has seen moves, and on screen the lit rails and the lit panel
+  change sides, as a turnout's blades would. The generator runs 48 segments ahead but stops at the end
+  of the neck until the choice is made; the neck is longer than the view, so the pause never shows.
+- **The split, drawn.** From the points to the **nose** (`CFG_FORK_NOSE`, where the two bores are
+  170 ru apart against the 168 they need) both branches share one chamber whose walls follow each
+  branch's outer side, so each track keeps a full bore of room on the side it can lean toward. The
+  walk lands a slab endpoint exactly on the nose. Past it the ring's bore continues and the branch not
+  taken is a dark mouth; the rock between them faces the camera. The unlit branch's rails are drawn
+  from a new one-row atlas tile in dim steel, so the route the cart will take is the only bright one.
+- **The sign** (plate 1A): two 16 × 13 atlas panels per branch, lit and unlit, lettered in the HUD's
+  3 × 5 cell and hung above the eye so it cannot be mistaken for a beam. In view 1.26 s before the
+  points at 103 km/h and 1.36 s at the redline; tracktest re-derives the brief's 1.2 s from the frustum.
+- **The wet shaft and the service spur.** Decided 2026-09-24: the wet shaft's "RISK III" is slick
+  rails *and* closer hazards. Grip on `FLAG_WET` segments is scaled by `CFG_WET_GRIP` (0.80) after the
+  speed fade, which moves the redline let-go curve from ~536 to ~430 brads/segment; hazards come every
+  10–24 segments with 45% stacked pairs; treasure scores `CFG_WET_YIELD` (×2). The spur has its own
+  knobs, set to the trunk's for now.
+- **Face-on geometry is clipped to the draw rect** (`mc_fo_*` in `src/emit.cyr`). For a triangle at one
+  `w`, `|D|` is its whole area times `65536/w`, on screen or off. Unclipped, the sign passed under at
+  w 280 measured 193,130,496 and the dark mouth, with the camera jammed toward it as the nose reached
+  the near plane, 819,686,400 — a 2× margin. Such surfaces are now convex polygons, clipped one rect
+  edge at a time and fanned: exact, because at one `w` the mapping is affine and the clipped corners
+  lie on whole-pixel edges.
+- **The gate rides the fork both ways at the extremes**: to the first fork twice (switch thrown, switch
+  left alone), through the approach, chamber and nose every third tick with the camera on the rail and
+  jammed to either wall, at all three consoles — 1,440 frames. And a face-on corner refused for want
+  of room counts as a pixel-losing drop.
+- **The input log records which simulation made it** (the u16 that 0.2.2 wrote as a reserved zero).
+  A log is only a seed and words, so a build that simulates differently replays a different ride and
+  reports a divergence that reads exactly like a determinism bug. `--replay` and `film --log` now
+  refuse another revision's log by name. This build is revision 1; 0.2.2 is 0.
+- **`--verify --pilot 1 --frames N`** verifies frame N of the autopilot's ride — the frame `shot` and
+  `film` call N. The default, frame 120 of the hands-off ride, never reaches a fork; 715 is inside one.
+- `--sim` reports each fork taken and the ticks spent on the wet shaft, and slipping there;
+  `tools/shot.cyr --pilot 2` rides the autopilot with every switch left alone; shot captions name the
+  points, the switch, the sign, the neck and the wet shaft; `--help` documents the switch.
+- Tests: the segment ring 43 → 84 assertions (the fork's placement, straightness, sterility and
+  profile; the pause, the lock and the refusal after it; the mirror; the wet flag; determinism across
+  a choice; and the nose, the 1.2 s telegraph and the neck-outlasts-the-view re-derived from the
+  constants), cart + input 110 → 124 (the switch word, the default, slick rails, the yield), replay
+  10 → 14 (a switch left unthrown must diverge; another revision's log is refused by name).
+- `docs/screenshots/fork.png`.
+
+### Changed
+
+- **The track differs from 0.2.2 from the first fork's lead-in on (segment 90, 230 m).** Everything
+  before it is identical — the fork logic draws nothing from the rng until it is laid — so hands off,
+  the cart still falls into the first gap at 87 m every time.
+- The reference autopilot throws every fork's switch to the wet shaft, so `--sim`, the gate and the
+  film all measure what the risky line demands.
+- The replay's per-tick state hash includes the fork (which, which way, whether final, what is being
+  laid).
+- Corrected the window notes in the README, `src/main.cyr` and `src/gpu.cyr`: the transport is
+  settled — setu 0.8.0 speaks the agnos channel band (`#97 chan_op`, of which `anu` was only a
+  candidate name), and puka has presented a composited window since 2026-08-07. What still rules out a
+  window is that no colour-writing op lets the caller name its destination.
+
+### Removed
+
+- `vendor/setu.cyr`: nothing included it, it carried the TCP-on-loopback transport agnos retired, and
+  agnos's transport cut (`planning/ipc.md` §10.2) listed it as a hand-vendored copy to remove by hand.
+
+### Notes
+
+- Peak `|D|` 80,688,960 → **99,385,920** (margin 26× → **21×**), now measured over the fork at the
+  extremes at all three consoles as well as everything 0.2.2 measured. Before face-on clipping, the
+  same passes measured 819,686,400.
+- Triangles per frame on the ride path 165–235 of 256 (0.2.2: 165–231, on a track without forks);
+  through the fork at the extremes, at most 213. No drop that loses pixels in 2,520 frames.
+- `--sim`, 30 s: the autopilot throws the first fork's switch at 281 m and reaches 732 m with no
+  deaths; over two minutes it takes three wet shafts, reaches 3,031 m on one life, and slips for 13.6%
+  of its 4,039 ticks on the wet shaft against 8.3% off it. Hands off: 87 m, every time, no fork.
+- Binary 409,728 → 443,072 bytes (agnos: 413,656 → 451,088).
+- **None of this has been on iron** — nor has 0.2.2. The roadmap lists what to run on the hardware.
+
 ## [0.2.2] — 2026-09-24
 
 **Audit, repair, and the screenshots.** The toolchain moves to 6.6.6 with the kernel; the host gate's

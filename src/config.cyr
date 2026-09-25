@@ -86,6 +86,7 @@ var KIND_GAP     = 2;                # jump   — gap / broken rail / wrecked ca
 var KIND_FORK    = 3;                # branch point
 var KIND_PICKUP  = 4;                # treasure / idol
 var KIND_GATE    = 5;                # chapter gate — the respawn anchor
+var KIND_SIGN    = 6;                # the fork's sign, hanging CFG_FORK_SIGN_LEAD segments before its points
 
 # ---- segment flags (bitfield) -------------------------------------------------------------------
 var FLAG_NONE    = 0;
@@ -98,6 +99,11 @@ var FLAG_MULTI   = 8;
 # ⭐ SET BY THE SIMULATION WHEN A TREASURE IS COLLECTED, so the renderer stops drawing it. Written only
 # by cart_tick on the crossing (deterministic), read only by the renderer — the generator never sees it.
 var FLAG_TAKEN   = 16;
+# ⭐ A FORK'S NECK: the CFG_BRANCH_NECK segments from its points on. The ring holds the branch the cart
+# will take; the renderer draws the other one as this segment's MIRROR (see trk_fork_switch).
+var FLAG_NECK    = 32;
+# ⭐ THE WET SHAFT: slick rails (CFG_WET_GRIP) and treasure worth CFG_WET_YIELD times as much.
+var FLAG_WET     = 64;
 
 # ---- multi-rail sections ------------------------------------------------------------------------------
 # ⚠ 26 put 54% of all ticks on 3-track sections — measured, not guessed. A section that occupies
@@ -193,6 +199,13 @@ var CFG_BEAM_DEPTH = 4;              # thickness along the track (32 cm); the ca
 var CFG_GEM_HW     = 5;              # treasure diamond half-width
 var CFG_GEM_HH     = 6;              # ...and half-height
 var CFG_GEM_LIFT   = 4;              # its lowest point, above the ballast
+# ⭐ THE FORK'S SIGN HANGS ABOVE THE EYE, NOT AT RIDER HEIGHT, so it can never read as a beam. Two
+#   panels either side of the centre line, each 56 x 44 ru — the 16 x 13 tile's own aspect — kept
+#   inside the arch (the chamfer passes x = 60 at y = -57).
+var CFG_SIGN_X0    = 4;              # inner edge of each panel, from the centre line
+var CFG_SIGN_X1    = 60;             # outer edge
+var CFG_SIGN_TOP   = 56;             # above the eye
+var CFG_SIGN_BOT   = 12;
 
 # ---- the cart's parts, in render units, relative to its centre line and rim ----------------------------
 var CFG_JUMP_LIFT  = 12;             # height at the top of the jump's arc (~1 m)
@@ -277,6 +290,18 @@ var ATL_GEM_V0    = 1703936;         # 26 << 16
 var ATL_GEM_V1    = 2228223;         # (34 << 16) - 1
 var ATL_SPARK_U   = 2654208;         # (40 << 16) + 0.5 — one white-hot texel
 var ATL_SPARK_V   = 1736704;         # (26 << 16) + 0.5
+# ⭐ THE UNLIT TRACK: the rail-pair strip's pattern in dim steel, ONE row at (32..44, 47). The branch a
+#   fork will NOT take is drawn from it at a constant v — no sleepers scroll past, because it is dark.
+var ATL_RAILDIM_U0 = 2097152;        # 32 << 16
+var ATL_RAILDIM_U1 = 2949119;        # (45 << 16) - 1 — 13 texels, rails at 33-34 and 42-43
+var ATL_RAILDIM_V  = 3112960;        # (47 << 16) + 0.5
+# ⭐ THE FORK'S SIGN: two 16 x 13 panels per branch, lit and unlit, at u 32..47. Rows:
+#     48..60  WET  x2, lit        61..73  WET  x2, unlit
+#     74..86  DRY  x1, lit        87..99  DRY  x1, unlit
+var ATL_SIGN_U0   = 2097152;         # 32 << 16
+var ATL_SIGN_U1   = 3145727;         # (48 << 16) - 1
+var ATL_SIGN_ROW  = 48;              # first row of the first panel
+var ATL_SIGN_H    = 13;              # rows per panel
 
 # ---- the draw rect's origin on screen ---------------------------------------------------------------------
 # ⚠ BOTH MUST BE MULTIPLES OF 8 or the record is GPO_E_ALIGN. On an 800x600 console the exact centre
@@ -515,6 +540,49 @@ var CFG_BRANCH_MAX_SEGS = 312;       # 799 m — 1800 ticks at the redline
 var CFG_BRANCH_NECK     = 20;        # sterile segments after the fork mouth (max renderer reach is 16)
 var CFG_BRANCH_TAIL     = 24;        # segments over which the branch ramps back to the trunk's values
 var CFG_TREASURE_SCORE = 100;        # score per treasure
+
+# ---- ⭐⭐ FORKS: the build order's step 6 ------------------------------------------------------------
+# A fork is a pair of switch POINTS, a sterile NECK in which the two branches curve apart, and a NOSE
+# where their bores separate. The player picks with the double-tap SWITCH (IN_SW_LEFT / IN_SW_RIGHT)
+# any time before the cart reaches the points; crossing them makes the choice final.
+# ⭐ LEFT IS THE WET SHAFT, RIGHT THE SERVICE SPUR, as on the design plates ("WET SHAFT ◄ A" / "SERVICE
+# SPUR D ►"), and the cart takes the spur if the player never switches ("NO INPUT — CART TAKES IT").
+var CFG_FORK_FIRST     = 110;        # the first fork's points, in segments from the chapter gate (282 m)
+var CFG_FORK_GAP_MIN   = 60;         # trunk segments between one branch's end and the next fork's lead-in
+var CFG_FORK_GAP_MAX   = 120;
+# ⚠ THE APPROACH IS STRAIGHT AND EMPTY. The view reaches 12.1 segments past the cart, so for
+#   CFG_FORK_CLEAR segments before the points nothing stands on the track and no side tracks run: the
+#   one decision on screen is the fork. The track straightens over the CFG_FORK_STRAIGHT before that,
+#   which also makes the branches exact mirrors of each other (the trunk under them is dead straight).
+var CFG_FORK_CLEAR     = 12;
+var CFG_FORK_STRAIGHT  = 8;          # 8 x CFG_CURVE_RAMP unwinds even the hardest curve, 1024
+# ⭐⭐ THE BRIEF'S 1.2 s TELEGRAPH, AND WHY THE SIGN HANGS TWO SEGMENTS SHORT OF THE POINTS. The sign
+#   first enters the frame at the far plane, 388 ru ahead of the cart. Hung AT the points that is
+#   1.17 s of warning at 103 km/h — short. Two segments earlier it is 1.26 s at 103 and 1.36 s at the
+#   96 km/h redline. tracktest asserts the arithmetic, so retuning the frustum cannot quietly break it.
+var CFG_FORK_SIGN_LEAD = 2;
+# ⭐ THE NECK: each branch curves away at up to CFG_FORK_DC (ramped at CFG_CURVE_RAMP, so there is no
+#   kink at the points) and eases back to straight by segment CFG_FORK_EASE — 27 degrees each way.
+#   384 is the "gentle bend" row of the grip table: it holds at the redline, so the fork is a choice,
+#   not a hazard. The bores are a full 2 x MC_TW apart at CFG_FORK_NOSE; tracktest re-derives that.
+var CFG_FORK_DC        = 384;        # brads/segment
+var CFG_FORK_EASE      = 15;
+var CFG_FORK_NOSE      = 13;         # 170 ru apart there, against the 168 two bores need
+
+# ---- ⭐ THE TWO BRANCHES: risk and yield ------------------------------------------------------------
+# ⭐ THE WET SHAFT IS "YIELD HIGH, RISK III" — decided 2026-09-24 as slick rails AND closer hazards.
+#   Grip is scaled after the speed fade, so a bend that holds dry at the redline can let go wet: the
+#   let-go curve falls from ~536 to ~430 brads/segment. And treasure scores double.
+var CFG_WET_GRIP        = 52429;     # Q16.16 = 0.80 of the dry flange's capacity
+var CFG_WET_YIELD       = 2;         # treasure multiplier on FLAG_WET segments
+var CFG_WET_HAZ_GAP_MIN = 10;        # segments between hazards (the trunk's are 14..34)
+var CFG_WET_HAZ_GAP_MAX = 24;
+var CFG_WET_HAZ_PAIR_PCT = 45;       # stacked jump-then-duck pairs (the trunk's is 30)
+# ⚠ THE SPUR IS "YIELD LOW, RISK I": dry, x1, and — until someone has played both — the trunk's own
+#   hazard spacing. These are its knobs, separate from the trunk's so they can move alone.
+var CFG_SPUR_HAZ_GAP_MIN = 14;
+var CFG_SPUR_HAZ_GAP_MAX = 34;
+var CFG_SPUR_HAZ_PAIR_PCT = 30;
 
 # ---- the apex bonus -----------------------------------------------------------------------------------
 # ⭐ THE OPTIMAL LINE MUST BE RHYTHMIC, NOT HELD-BRAKE. Braking into a bend and releasing at the apex

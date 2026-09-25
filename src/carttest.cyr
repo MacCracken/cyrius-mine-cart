@@ -690,6 +690,124 @@ fn ctt_apex(): i64 {
     return 0;
 }
 
+# ---- ⭐⭐ forks: the switch, and what the wet shaft does to the cart ----------------------------------------
+# the reference pilot with every switch left alone — it would otherwise throw the first one itself
+fn ctt_pilot_no_switch(): i64 { return cart_autopilot() & (0 - 1 - IN_SW_LEFT); }
+
+# ride the reference pilot, switch left alone, until the fork's points are `ahead` segments off
+fn ctt_to_points(ahead): i64 {
+    var t = 0;
+    while (t < 6000) {
+        if (trk_fork_pending() == 1) {
+            if (trk_fork_at - trk_abs_seg <= ahead) { return 1; }
+        }
+        if (cart_tick(ctt_pilot_no_switch()) == 0) { return 0; }
+        t = t + 1;
+    }
+    return 0;
+}
+
+# stamp a constant bend over the live window, every segment carrying `flags`
+fn ctt_track_flags(curve, flags): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        trk_put(i, curve, 0, KIND_PLAIN, flags, 0, 0);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# stamp a single centre-lane treasure at segment 20, every segment carrying `flags`
+fn ctt_pickup_flags(flags): i64 {
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var i = 0;
+    while (i < CFG_GEN_AHEAD) {
+        var k = KIND_PLAIN;
+        if (i == 20) { k = KIND_PICKUP; }
+        trk_put(i, 0, 0, k, flags, 0, 1);
+        i = i + 1;
+    }
+    return 0;
+}
+
+# the switch as the player throws it, and the two branches' character
+fn ctt_fork(): i64 {
+    # -- the SWITCH word throws it, before the points --------------------------------------------------
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    ctt_true("the pilot reaches the fork", ctt_to_points(8));
+    var p = trk_fork_at;
+    cart_tick(IN_SW_LEFT);
+    ctt_eq("a double-tap left throws the switch to the wet shaft", trk_fork_side, 0 - 1);
+    cart_tick(IN_SW_RIGHT);
+    ctt_eq("...and right throws it back to the spur", trk_fork_side, 1);
+    cart_tick(IN_SW_LEFT);
+    # ride through the points and the neck
+    var t = 0;
+    while (t < 2000) {
+        if (trk_abs_seg >= p + CFG_BRANCH_NECK + 2) { t = 2000; }
+        if (cart_tick(ctt_pilot_no_switch()) == 0) { t = 2000; }
+        t = t + 1;
+    }
+    ctt_eq("...and the cart survives the neck", cart_dead, 0);
+    ctt_eq("the choice is final past the points", trk_fork_lock, 1);
+    cart_tick(IN_SW_RIGHT);
+    ctt_eq("a switch thrown after the points changes nothing", trk_fork_side, 0 - 1);
+    ctt_eq("the cart is on the wet shaft", trk_wet_at(trk_abs_seg), 1);
+
+    # -- left alone, the spur -------------------------------------------------------------------------
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    ctt_to_points(8);
+    p = trk_fork_at;
+    t = 0;
+    while (t < 2000) {
+        if (trk_abs_seg >= p + CFG_BRANCH_NECK + 2) { t = 2000; }
+        if (cart_tick(ctt_pilot_no_switch()) == 0) { t = 2000; }
+        t = t + 1;
+    }
+    ctt_eq("with no switch the cart takes the spur", trk_fork_side, 1);
+    ctt_eq("...which is dry", trk_wet_at(trk_abs_seg), 0);
+
+    # -- ⭐ SLICK RAILS: a bend that holds dry at the redline lets go wet --------------------------------
+    # At the redline the dry flange lets go past ~536 brads/segment and the wet one past ~430.
+    ctt_track_flags(480, FLAG_NONE);
+    cart_speed = CFG_SPEED_BASE << 16;
+    cart_tick(0);
+    ctt_eq("a 480 bend at the redline holds on dry rails", cart_slip, 0);
+    ctt_track_flags(480, FLAG_WET);
+    cart_speed = CFG_SPEED_BASE << 16;
+    cart_tick(0);
+    ctt_eq("...and LETS GO on the wet shaft's", cart_slip, 1);
+    # ...but the wet shaft is slick, not impossible: braking still reaches it
+    ctt_track_flags(480, FLAG_WET);
+    cart_speed = (CFG_SPEED_BASE * 3 / 4) << 16;
+    cart_tick(IN_BRAKE);
+    ctt_eq("...and holds again at three-quarters speed", cart_slip, 0);
+
+    # -- ⭐ YIELD HIGH: the same treasure at the same speed scores double on the wet shaft ---------------
+    ctt_pickup_flags(FLAG_NONE);
+    t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 24) { t = 900; }
+        cart_speed = CFG_SPEED_BASE << 16;
+        if (cart_tick(0) == 0) { t = 900; }
+        t = t + 1;
+    }
+    var dry_score = cart_score;
+    ctt_pickup_flags(FLAG_WET);
+    t = 0;
+    while (t < 900) {
+        if (trk_abs_seg >= 24) { t = 900; }
+        cart_speed = CFG_SPEED_BASE << 16;
+        if (cart_tick(0) == 0) { t = 900; }
+        t = t + 1;
+    }
+    ctt_true("a dry treasure scores", dry_score > 0);
+    ctt_eq("the same treasure on the wet shaft scores CFG_WET_YIELD times as much", cart_score,
+      dry_score * CFG_WET_YIELD);
+    return 0;
+}
+
 # ---- determinism ------------------------------------------------------------------------------------------
 # ⭐ THIS IS THE SHAPE OF THE STEP-11 REPLAY TEST, ARRIVING EARLY BECAUSE IT COSTS NOTHING TO DO SO.
 # The sim is a pure function of (input word, world state) — no clock, no keyboard, no rng outside the
@@ -740,6 +858,7 @@ fn cart_selftest(): i64 {
     ctt_integrity();
     ctt_placement();
     ctt_apex();
+    ctt_fork();
     ctt_determinism();
 
     ps("  cart + input:     "); pn(ctt_ran); ps(" assertions, ");

@@ -142,6 +142,12 @@ fn mc_pal(c): i64 {
     if (c == 67)  { return mc_rgb(79,  200, 230); }   # C  speed, under the redline
     if (c == 77)  { return mc_rgb(236, 168, 44);  }   # M  speed, over it
     if (c == 90)  { return mc_rgb(244, 84,  56);  }   # Z  the redline
+    if (c == 79)  { return mc_rgb(40,  72,  84);  }   # O  a rail with its lamps out — the fork's other branch
+    if (c == 113) { return mc_rgb(10,  16,  22);  }   # q  the fork sign's board
+    if (c == 102) { return mc_rgb(58,  68,  76);  }   # f  ...its steel frame
+    if (c == 105) { return mc_rgb(92,  212, 255); }   # i  WET, lit — water-blue, a cousin of the rails
+    if (c == 106) { return mc_rgb(255, 188, 72);  }   # j  DRY, lit — the ore's amber
+    if (c == 110) { return mc_rgb(40,  54,  64);  }   # n  either word, unlit
     return mc_rgb(255, 0, 255);                       # an unmapped character shows up LOUD
 }
 
@@ -152,7 +158,58 @@ fn mc_row(x0, y, s): i64 {
     return 0;
 }
 
-# paint the sprite atlas at u 32..47: cart, crate, rider, beam, gem, spark, HUD
+# ---- the fork's sign ---------------------------------------------------------------------------------
+# ⭐ WRITTEN ONCE, INKED TWICE. Each panel's art uses '#' for its lettering, so the lit and the unlit copy
+# are the same strings in a different ink and cannot drift apart. The glyphs are the HUD's 3 x 5 cell.
+# paint one row of a sign panel: '#' in the string is painted in `ink`, everything else as itself
+fn mc_row_ink(x0, y, s, ink): i64 {
+    var i = 0;
+    while (load8(s + i) != 0) {
+        var c = load8(s + i);
+        if (c == 35) { c = ink; }
+        mc_texel(x0 + i, y, mc_pal(c));
+        i = i + 1;
+    }
+    return 0;
+}
+
+# the wet shaft's panel at atlas row y0, in `ink`: "WET" over "◄ x2" — it points the way the branch goes
+fn mc_sign_wet(y0, ink): i64 {
+    mc_row_ink(32, y0 +  0, "ffffffffffffffff", ink);
+    mc_row_ink(32, y0 +  1, "fqq#q#q###q###qf", ink);
+    mc_row_ink(32, y0 +  2, "fqq#q#q#qqqq#qqf", ink);
+    mc_row_ink(32, y0 +  3, "fqq###q##qqq#qqf", ink);
+    mc_row_ink(32, y0 +  4, "fqq###q#qqqq#qqf", ink);
+    mc_row_ink(32, y0 +  5, "fqq#q#q###qq#qqf", ink);
+    mc_row_ink(32, y0 +  6, "fqqqqqqqqqqqqqqf", ink);
+    mc_row_ink(32, y0 +  7, "fqqq#qqqqqq###qf", ink);
+    mc_row_ink(32, y0 +  8, "fqq##qq#q#qqq#qf", ink);
+    mc_row_ink(32, y0 +  9, "fq###qqq#qq###qf", ink);
+    mc_row_ink(32, y0 + 10, "fqq##qq#q#q#qqqf", ink);
+    mc_row_ink(32, y0 + 11, "fqqq#qqqqqq###qf", ink);
+    mc_row_ink(32, y0 + 12, "ffffffffffffffff", ink);
+    return 0;
+}
+
+# the service spur's panel at atlas row y0, in `ink`: "DRY" over "x1 ►"
+fn mc_sign_dry(y0, ink): i64 {
+    mc_row_ink(32, y0 +  0, "ffffffffffffffff", ink);
+    mc_row_ink(32, y0 +  1, "fqq##qq##qq#q#qf", ink);
+    mc_row_ink(32, y0 +  2, "fqq#q#q#q#q#q#qf", ink);
+    mc_row_ink(32, y0 +  3, "fqq#q#q##qqq#qqf", ink);
+    mc_row_ink(32, y0 +  4, "fqq#q#q#q#qq#qqf", ink);
+    mc_row_ink(32, y0 +  5, "fqq##qq#q#qq#qqf", ink);
+    mc_row_ink(32, y0 +  6, "fqqqqqqqqqqqqqqf", ink);
+    mc_row_ink(32, y0 +  7, "fqqqqqq#qqq#qqqf", ink);
+    mc_row_ink(32, y0 +  8, "fq#q#q##qqq##qqf", ink);
+    mc_row_ink(32, y0 +  9, "fqq#qqq#qqq###qf", ink);
+    mc_row_ink(32, y0 + 10, "fq#q#qq#qqq##qqf", ink);
+    mc_row_ink(32, y0 + 11, "fqqqqq###qq#qqqf", ink);
+    mc_row_ink(32, y0 + 12, "ffffffffffffffff", ink);
+    return 0;
+}
+
+# paint the sprite atlas at u 32..47: cart, crate, rider, beam, gem, spark, HUD, and the fork's sign
 fn mc_tex_atlas(): i64 {
     # -- the cart's rear plate, 16 x 10 at (32, 0): rim, hazard band, tail lamps, wheels over the rails
     mc_row(32, 0, "RRRRRRRRRRRRRRRR");
@@ -238,6 +295,17 @@ fn mc_tex_atlas(): i64 {
     mc_row(32, 45, "######.#.######");
     # swatches at row 46: the empty bar, the fill under the redline, the fill over it, the redline
     mc_row(32, 46, "PCMZ");
+
+    # -- a fork's other branch: the rail-pair strip's pattern with its lamps out, ONE row at (32, 47) ---
+    # Same layout as the strip at u 50..62 — rails at +-12.5 ru under the wheels — so the two tracks
+    # leaving the points are the same track, one lit and one not.
+    mc_row(32, 47, ".OO.......OO.");
+
+    # -- the fork's sign (design plate 1A): four 16 x 13 panels from row 48 ---------------------------
+    mc_sign_wet(ATL_SIGN_ROW, 105);                             # WET, lit ('i')
+    mc_sign_wet(ATL_SIGN_ROW + ATL_SIGN_H, 110);                # WET, unlit ('n')
+    mc_sign_dry(ATL_SIGN_ROW + 2 * ATL_SIGN_H, 106);            # DRY, lit ('j')
+    mc_sign_dry(ATL_SIGN_ROW + 3 * ATL_SIGN_H, 110);            # DRY, unlit
     return 0;
 }
 

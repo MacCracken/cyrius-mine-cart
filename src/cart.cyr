@@ -158,6 +158,13 @@ fn cart_damage(n): i64 {
 fn cart_tick(word): i64 {
     if (cart_dead == 1) { return 0; }
 
+    # ---- ⭐⭐ THE SWITCH: the double-tap throws the points of the fork ahead ----------------------------
+    # ⭐ Read before the cart moves, so a throw on the very tick the cart reaches the points still counts.
+    #   Left is the wet shaft and right the service spur; after the points it is refused (see
+    #   trk_fork_switch). A throw is a lever, not a body movement, so crouching or airborne is no bar.
+    if ((word & IN_SW_LEFT) != 0)  { trk_fork_switch(0 - 1); }
+    if ((word & IN_SW_RIGHT) != 0) { trk_fork_switch(1); }
+
     var braking = 0;
     if ((word & IN_BRAKE) != 0) { braking = 1; }
 
@@ -222,6 +229,11 @@ fn cart_tick(word): i64 {
     # first exceeds the second the rail lets go, and the ONLY way back is to shed speed — which is
     # what makes the brake a necessity rather than a bonus-chasing option.
     var grip = CFG_GRIP_MAX - fx_mul(sf, CFG_GRIP_FADE);
+    # ⭐ THE WET SHAFT'S RAILS ARE SLICK. Scaled AFTER the speed fade, so the penalty is proportional at
+    #   every speed — and before the floor, so a wet cart is still never doomed outright.
+    if (trk_live(trk_abs_seg) == 1) {
+        if (trk_wet_at(trk_abs_seg) == 1) { grip = fx_mul(grip, CFG_WET_GRIP); }
+    }
     if (grip < CFG_GRIP_MIN) { grip = CFG_GRIP_MIN; }
     cart_slip = 0;
     if (alat > grip) { cart_slip = 1; cart_slip_ticks = cart_slip_ticks + 1; }
@@ -341,7 +353,10 @@ fn cart_tick(word): i64 {
                     # ⭐ SPEED IS THE SCORE MULTIPLIER, so a treasure taken at the redline is worth
                     # far more than the same treasure crawled past. Collecting and going fast are the
                     # same skill, which is what stops the safe line from also being the rich one.
-                    cart_score = cart_score + ((CFG_TREASURE_SCORE * (65536 + cart_speed_frac())) >>> 16);
+                    var pts = (CFG_TREASURE_SCORE * (65536 + cart_speed_frac())) >>> 16;
+                    # ⭐ ...and the wet shaft is "YIELD HIGH": what it risks, it pays for
+                    if (trk_wet_at(cart_last_seg) == 1) { pts = pts * CFG_WET_YIELD; }
+                    cart_score = cart_score + pts;
                 }
             }
         }
@@ -389,6 +404,16 @@ fn cart_autopilot(): i64 {
     if (cv > cart_prev_curve) { if (cv > CFG_APEX_MIN_CURVE) { word = word | IN_BRAKE; } }
     # ⭐ AND BRAKE WHEN THE RAIL HAS ALREADY LET GO. Steering cannot reach a slip; only speed can.
     if (cart_slip == 1) { word = word | IN_BRAKE; }
+
+    # -- the fork: throw the switch to the WET SHAFT once its sign is in view ------------------------
+    # ⭐ The yardstick takes the risky line, so what --sim and the gate measure is what the wet shaft
+    #   DEMANDS — slick rails, closer hazards — and the switch, the mirrored neck and the branch are all
+    #   exercised on every run. (Hands off, the cart takes the spur: that is the default.)
+    if (trk_fork_pending() == 1) {
+        if (trk_fork_side > 0) {
+            if (trk_fork_at - trk_abs_seg <= CFG_FORK_CLEAR) { word = word | IN_SW_LEFT; }
+        }
+    }
 
     # -- the hands: scan ahead for the next gap or beam ---------------------------------------------
     # ⚠ Scans only as far as the ring is live. Reading past that returns a RECYCLED segment — a
@@ -445,5 +470,20 @@ fn mc_cart_to(frame): i64 {
     mc_cart_reset();
     var f = 0;
     while (f < frame) { cart_tick(0); f = f + 1; }
+    return 0;
+}
+
+# ⭐ FRAME N OF THE AUTOPILOT'S RIDE, as the film and shot tools define it: tick, then draw, from a fresh
+# chapter, a death restarting it — so frame N here is film's frame N, and a frame seen in the video can
+# be put through --verify on iron. The input-less definition above cannot reach a fork: hands off, the
+# cart falls into the first gap at 87 m, every time. pilot 0 is that definition, unchanged.
+fn mc_cart_to_pilot(frame, pilot): i64 {
+    if (pilot == 0) { return mc_cart_to(frame); }
+    mc_cart_reset();
+    var f = 0;
+    while (f <= frame) {
+        if (cart_tick(cart_autopilot()) == 0) { cart_reset(cart_seed, cart_chapter); }
+        f = f + 1;
+    }
     return 0;
 }

@@ -191,21 +191,89 @@ fn mc_check(): i64 {
         g = g + 1;
     }
 
+    # ---- ⭐⭐ pass 3: THE FORK, BOTH WAYS, AT THE EXTREMES ------------------------------------------
+    # ⛔ The ride path takes one fork one way at the autopilot's lean. The fork's geometry is the widest
+    # in the game — a chamber two bores across, a nose, a dark opening, a sign the camera passes under —
+    # and every piece of it is a new way for a frame to be refused. So ride to the first fork twice, once
+    # throwing the switch to the wet shaft and once leaving it on the spur, and through the approach, the
+    # chamber and the nose build every third tick three times: on the rail, and jammed to either wall.
+    # ⛔⛔ THIS PASS FOUND A 2x MARGIN THE FIRST TIME IT RAN: the dark mouth of the branch not taken, face-on
+    # and mostly off screen as the nose reached the near plane, at |D| 819,686,400. The ride path had
+    # never leaned that way. It is why face-on geometry is clipped (mc_fo_emit), and why this runs at all
+    # three consoles: a receding surface's |D| grows with the rect's offset.
+    var fk_frames = 0;
+    var fk_max = 0;
+    var fsd_dx = MC_DX;
+    var fsd_dy = MC_DY;
+    var fpass = 0;
+    while (fpass < 6) {
+        var fside = fpass % 2;
+        MC_DX = 0;  MC_DY = 0;
+        if (fpass / 2 == 1) { MC_DX = 80;  MC_DY = 96; }
+        if (fpass / 2 == 2) { MC_DX = 960; MC_DY = 520; }
+        mc_cart_reset();
+        var guard = 0;
+        while (guard < 3000) {
+            var wd = cart_autopilot();
+            if (fside == 1) { wd = wd & (0 - 1 - IN_SW_LEFT); }       # the spur: never throw the switch
+            if (cart_tick(wd) == 0) { cart_reset(cart_seed, cart_chapter); }
+            if (trk_fork_pending() == 1) {
+                if (trk_fork_at - trk_abs_seg <= CFG_FORK_CLEAR + 4) { guard = 3000; }
+            }
+            guard = guard + 1;
+        }
+        var fq = 0;
+        while (fq < 240) {
+            var wd2 = cart_autopilot();
+            if (fside == 1) { wd2 = wd2 & (0 - 1 - IN_SW_LEFT); }
+            if (cart_tick(wd2) == 0) { cart_reset(cart_seed, cart_chapter); }
+            if ((fq % 3) == 0) {
+                var li = 0;
+                while (li < 3) {
+                    var fcx = 0;
+                    if (li == 1) { fcx = MC_TW - 2; }
+                    if (li == 2) { fcx = 2 - MC_TW; }
+                    var n3 = mc_build(fcx);
+                    tris = tris + n3;
+                    if (n3 > fk_max) { fk_max = n3; }
+                    dr_flat  = dr_flat  + mc_drop_flat;
+                    dr_huge  = dr_huge  + mc_drop_huge;
+                    dr_coord = dr_coord + mc_drop_coord;
+                    dr_band  = dr_band  + mc_drop_band;
+                    dr_full  = dr_full  + mc_drop_full;
+                    dr_cull  = dr_cull  + mc_cull;
+                    dr_refused = dr_refused + mc_refused;
+                    frames = frames + 1;
+                    fk_frames = fk_frames + 1;
+                    mc_ck_list(&mc_vtx_a, mc_n_a);
+                    if (mc_n_b != 0) { maxlap = maxlap + 1; }
+                    li = li + 1;
+                }
+            }
+            fq = fq + 1;
+        }
+        fpass = fpass + 1;
+    }
+    MC_DX = fsd_dx;
+    MC_DY = fsd_dy;
+
     ps("  "); pn(frames); ps(" frames built ("); pn(900); ps(" on the ride path, 120 at real screen offsets, ");
-    pn(60); ps(" at extremes), "); pn(tris); ps(" triangles"); nl();
+    pn(60); ps(" at extremes, "); pn(fk_frames); ps(" through a fork both ways), "); pn(tris); ps(" triangles"); nl();
     ps("  per frame "); pn(mintri); ps(" to "); pn(maxtri); ps(" of "); pn(MC_TRI_MAX);
-    ps(" permitted, "); pn(CFG_TRI_RESERVE); ps(" of them held in reserve for the cart"); nl();
+    ps(" permitted, "); pn(CFG_TRI_RESERVE); ps(" of them held in reserve for the cart;"); nl();
+    ps("    through the fork at the extremes, at most "); pn(fk_max); nl();
 
     # ---- drops, and the distinction that decides whether one is a hole -----------------------
     # ⭐ dr_full IS THE NEWEST AND WAS THE MOST DANGEROUS OMISSION. mc_emit's over-budget path used
     # to `return 0` without touching any counter, so a frame that silently lost its last N triangles
     # reported a perfectly clean tally — "0 dropped" over a tunnel with the far end missing. It is
     # grouped with the pixel-losing drops because that is exactly what it is.
+    # ⚠ mc_fo_full is a face-on polygon corner refused for want of room (mc_fo_vert): a hole too.
     ps("  dropped: coord "); pn(dr_coord); ps("  w-band "); pn(dr_band);
-    ps("  oversize "); pn(dr_huge); ps("  over-budget "); pn(dr_full);
+    ps("  oversize "); pn(dr_huge); ps("  over-budget "); pn(dr_full); ps("  face-on corners "); pn(mc_fo_full);
     ps(" -- these LOSE PIXELS: ");
-    if (dr_coord + dr_band + dr_huge + dr_full == 0) { ps("none"); nl(); }
-    if (dr_coord + dr_band + dr_huge + dr_full != 0) { ps("FAIL"); nl(); bad = bad + 1; }
+    if (dr_coord + dr_band + dr_huge + dr_full + mc_fo_full == 0) { ps("none"); nl(); }
+    if (dr_coord + dr_band + dr_huge + dr_full + mc_fo_full != 0) { ps("FAIL"); nl(); bad = bad + 1; }
     ps("  dropped: degenerate "); pn(dr_flat);
     ps(" -- cross is EXACTLY 0 (see geom.cyr), so these cover no pixel and are not holes"); nl();
     ps("  culled: "); pn(dr_cull);

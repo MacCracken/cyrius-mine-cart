@@ -20,8 +20,18 @@ var mc_s_rz[24];
 var mc_s_cx[24];
 var mc_s_cy[24];
 var mc_s_v[24];            # texture v at this endpoint, 16.16 texels
+var mc_s_px[24];           # the fork's OTHER branch's centre line (== mc_s_cx wherever there is none)
 var mc_s_guard = 0;
 var mc_nslab = 0;          # number of ENDPOINTS written (slabs = mc_nslab - 1)
+
+# ---- ⭐⭐ THE FORK IN VIEW, as mc_walk finds it -----------------------------------------------------
+# Between a fork's points and its NOSE the two branches share one widening chamber; past the nose they
+# are two bores with rock between them, and only the ring's is drawn — the other is a dark opening.
+var mc_fork_on = 0;        # 1 while any of a fork's chamber is in view
+var mc_nose_rz = 0;        # camera-relative depth of the nose: slabs ending at or before it are chamber
+var mc_nose_k  = 0;        # the endpoint that lies ON the nose, -1 if the nose itself is not in view
+var mc_dpsi    = 0;        # the other branch minus the ring: heading, brads...
+var mc_dxq     = 0;        # ...and lateral offset, 16.16 render units
 
 # the vertex lists and slab arrays measured: 1 if every span is at least its declared size
 fn mc_bufs_ok(): i64 {
@@ -30,7 +40,8 @@ fn mc_bufs_ok(): i64 {
     # understates.
     if ((&mc_vtx_b     - &mc_vtx_a) < MC_TRI_MAX * 64) { return 0; }
     if ((&mc_vtx_guard - &mc_vtx_b) < MC_TRI_MAX * 64) { return 0; }
-    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 4)      { return 0; }
+    if ((&mc_s_guard   - &mc_s_rz)  < 24 * 8 * 5)      { return 0; }
+    if (mc_fo_ok() == 0) { return 0; }
     return 1;
 }
 
@@ -91,7 +102,9 @@ fn mc_cam_place(): i64 {
 # ⚠ `>>> 5` rather than `/ 32`: the field can be NEGATIVE, and those are different operations for
 # negative values (one floors, the other truncates toward zero). The engine uses the flooring
 # convention everywhere so that no call site has to know the sign of its input.
-fn mc_integ(ru_a, ru_b, want_grade): i64 {
+# field: 0 = curvature, 1 = grade, 2 = the fork's DIFFERENCE curvature — the other branch minus the
+# ring, which on a neck segment is -2x the ring's (the other branch is its mirror) and zero elsewhere.
+fn mc_integ(ru_a, ru_b, field): i64 {
     var acc = 0;
     var p = ru_a;
     while (p < ru_b) {
@@ -104,13 +117,31 @@ fn mc_integ(ru_a, ru_b, want_grade): i64 {
         # ⛔ A read outside the live window does not fail — it returns a RECYCLED slot, i.e. a
         # different part of the track. Treat it as straight rather than as whatever is in the slot.
         if (trk_live(abs) == 1) {
-            if (want_grade == 0) { c = trk_curve_at(abs); }
-            if (want_grade != 0) { c = trk_grade_at(abs); }
+            if (field == 0) { c = trk_curve_at(abs); }
+            if (field == 1) { c = trk_grade_at(abs); }
+            if (field == 2) { if (trk_neck_at(abs) == 1) { c = 0 - 2 * trk_curve_at(abs); } }
         }
         acc = acc + ((c * (e - p)) >>> 5);
         p = e;
     }
     return acc;
+}
+
+# ⭐ The fork's divergence over [q0, q1) (render units from the start of the camera's segment), one
+# segment at a time into mc_dpsi / mc_dxq. Per segment the curvature is constant, so the midpoint rule
+# is exact — this is how the branches' separation is carried up to the near plane once the camera has
+# passed the points and they have ALREADY parted by the time anything is drawn.
+fn mc_div_span(q0, q1): i64 {
+    var q = q0;
+    while (q < q1) {
+        var e = ((q >>> 5) + 1) << 5;
+        if (e > q1) { e = q1; }
+        var dd = mc_integ(q, e, 2);
+        mc_dxq = mc_dxq + (((e - q) * (2 * mc_dpsi + dd) * MC_TAU_Q16) >>> 17);
+        mc_dpsi = mc_dpsi + dd;
+        q = e;
+    }
+    return 0;
 }
 
 # ---- the walk: turn per-segment curvature into a centre line ----------------------------------------------
@@ -130,6 +161,29 @@ fn mc_walk(): i64 {
     var psi = 0; var xq = 0;
     var phi = 0; var yq = 0;
 
+    # ---- ⭐⭐ IS A FORK IN VIEW? ------------------------------------------------------------------
+    # Its chamber runs from the points to the nose. In view means the points are nearer than the far
+    # plane and the nose is beyond the near plane; mc_nose_rz is then where the chamber ends.
+    # ⚠ A fork entirely behind the camera, or not yet in range, leaves mc_fork_on at 0 and every slab
+    #   is drawn exactly as it was before forks existed — the neck past a nose is ordinary bore.
+    mc_fork_on = 0;
+    mc_nose_k  = 0 - 1;
+    mc_nose_rz = 0 - 1;
+    mc_dpsi    = 0;
+    mc_dxq     = 0;
+    if (trk_fork_at >= 0) {
+        var pz = (trk_fork_at - mc_cam_seg) * 32 - cam_ru;     # the points, camera-relative
+        var nz = pz + CFG_FORK_NOSE * 32;                      # the nose
+        if (pz < MC_ZF) {
+            if (nz > MC_ZN) {
+                mc_fork_on = 1;
+                mc_nose_rz = nz;
+                # ⭐ past the points already: the branches have parted before the near plane
+                if (pz < MC_ZN) { mc_div_span(cam_ru + pz, cam_ru + MC_ZN); }
+            }
+        }
+    }
+
     # texture v advances with depth so the tunnel scrolls past continuously. Anchored modulo one
     # segment at the near plane so v never grows without bound (|N| is a shader register pair and
     # the ABI bounds it at 2^62).
@@ -141,16 +195,31 @@ fn mc_walk(): i64 {
     store64(&mc_s_cx + 0, 0);
     store64(&mc_s_cy + 0, 0);
     store64(&mc_s_v  + 0, v);
+    store64(&mc_s_px + 0, mc_dxq >>> 16);
     n = 1;
 
     while (rz < MC_ZF) {
         var step = mc_step_at(rz);
+        # ⭐ AN ENDPOINT LANDS EXACTLY ON THE NOSE. The walls jump there — the chamber's outer walls give
+        #   way to the ring's own bore — and a slab that straddled it would draw one wall across the
+        #   jump. The ladder resumes from the nose, and the last step is trimmed to the far plane (a
+        #   step past it would put w over 4096 and have the whole batch refused).
+        if (mc_fork_on == 1) {
+            if (rz < mc_nose_rz) { if (rz + step > mc_nose_rz) { step = mc_nose_rz - rz; } }
+        }
+        if (rz + step > MC_ZF) { step = MC_ZF - rz; }
         var dpsi = mc_integ(cam_ru + rz, cam_ru + rz + step, 0);
         var dphi = mc_integ(cam_ru + rz, cam_ru + rz + step, 1);
         xq = xq + ((step * (2 * psi + dpsi) * MC_TAU_Q16) >>> 17);
         yq = yq + ((step * (2 * phi + dphi) * MC_TAU_Q16) >>> 17);
         psi = psi + dpsi;
         phi = phi + dphi;
+        # the other branch rides the same step, so the two centre lines are integrated alike
+        if (mc_fork_on == 1) {
+            var dd = mc_integ(cam_ru + rz, cam_ru + rz + step, 2);
+            mc_dxq = mc_dxq + ((step * (2 * mc_dpsi + dd) * MC_TAU_Q16) >>> 17);
+            mc_dpsi = mc_dpsi + dd;
+        }
         rz = rz + step;
         v  = v + step * (MC_TEXFULL / 32);
         if (n < MC_SLAB_MAX) {
@@ -158,6 +227,8 @@ fn mc_walk(): i64 {
             store64(&mc_s_cx + n * 8, xq >>> 16);
             store64(&mc_s_cy + n * 8, yq >>> 16);
             store64(&mc_s_v  + n * 8, v);
+            store64(&mc_s_px + n * 8, (xq + mc_dxq) >>> 16);
+            if (mc_fork_on == 1) { if (rz == mc_nose_rz) { mc_nose_k = n; } }
             n = n + 1;
         }
     }
@@ -183,6 +254,18 @@ fn mc_cl_at(k, rz): i64 {
     var den = rzf - rzn;
     mc_clx = xn + ((xf - xn) * (rz - rzn)) / den;
     mc_cly = yn + ((yf - yn) * (rz - rzn)) / den;
+    return 0;
+}
+
+var mc_plx = 0;
+
+# the fork's other branch at depth rz inside slab k, interpolated exactly as mc_cl_at: sets mc_plx
+fn mc_pl_at(k, rz): i64 {
+    var rzn = load64(&mc_s_rz + k * 8);
+    var rzf = load64(&mc_s_rz + (k + 1) * 8);
+    var xn  = load64(&mc_s_px + k * 8);
+    var xf  = load64(&mc_s_px + (k + 1) * 8);
+    mc_plx = xn + ((xf - xn) * (rz - rzn)) / (rzf - rzn);
     return 0;
 }
 
@@ -254,6 +337,136 @@ fn mc_gem(k, rz, a, cam_x): i64 {
     return 0;
 }
 
+# ---- ⭐⭐ THE FORK'S SIGN — design plate 1A: the choice, in the tunnel, lit on the side it will take ----
+# ⭐ "EYES NEVER LEAVE THE RAILS." The plate puts the fork in world space rather than in a HUD corner, and
+#   so does this: two panels hung across the bore CFG_FORK_SIGN_LEAD segments before the points —
+#   ◄ WET x2 on the left, DRY x1 ► on the right — with the side the switch is set to LIT and the other
+#   dim. A double-tap moves the light, which is the player's confirmation that the switch took.
+# ⚠ Hung ABOVE the eye so it can never be mistaken for a beam, which hangs at rider height below it.
+#
+# one panel: the whole 16 x 13 tile starting at atlas row `row`, on the screen rectangle l..r x t..b
+# ⛔ FACE-ON, SO CLIPPED TO THE DRAW RECT (see mc_fo_emit). Passed under at w 280 it measured |D|
+#   193,130,496 unclipped, with most of it above the top of the screen.
+fn mc_sign_panel(l, r, t, b, w, row): i64 {
+    var v0 = row << 16;
+    var v1 = ((row + ATL_SIGN_H) << 16) - 1;
+    mc_fo_begin();
+    mc_fo_vert(l, t, ATL_SIGN_U0, v0);
+    mc_fo_vert(r, t, ATL_SIGN_U1, v0);
+    mc_fo_vert(r, b, ATL_SIGN_U1, v1);
+    mc_fo_vert(l, b, ATL_SIGN_U0, v1);
+    mc_fo_emit(w);
+    return 0;
+}
+
+# the sign at depth rz in slab k: two panels, the switched-to side lit
+fn mc_sign(k, rz, cam_x): i64 {
+    if (mc_room(4) == 0) { return 0; }
+    mc_cl_at(k, rz);
+    var cx = mc_clx - cam_x;
+    var w  = mc_wof(rz);
+    var t  = mc_py(mc_cly - CFG_SIGN_TOP, rz);
+    var b  = mc_py(mc_cly - CFG_SIGN_BOT, rz);
+    # the atlas holds WET lit, WET unlit, DRY lit, DRY unlit, in that order
+    var wet_row = ATL_SIGN_ROW + ATL_SIGN_H;
+    var dry_row = ATL_SIGN_ROW + 2 * ATL_SIGN_H;
+    if (trk_fork_side < 0) {
+        wet_row = ATL_SIGN_ROW;
+        dry_row = ATL_SIGN_ROW + 3 * ATL_SIGN_H;
+    }
+    mc_sign_panel(mc_px(cx - CFG_SIGN_X1, rz), mc_px(cx - CFG_SIGN_X0, rz), t, b, w, wet_row);
+    mc_sign_panel(mc_px(cx + CFG_SIGN_X0, rz), mc_px(cx + CFG_SIGN_X1, rz), t, b, w, dry_row);
+    return 0;
+}
+
+# ---- ⭐⭐ THE NOSE: where the chamber becomes two bores -----------------------------------------------
+# Drawn once, at the nose's own depth, after everything beyond it and before anything nearer, so painter's
+# order puts it in front of the ring's bore beyond and behind the chamber this side of it. Three pieces:
+#     the branch NOT taken   its whole cross-section in the far cap's darkness — a tunnel with its lamps
+#                            out, which is what "unlit" means on the plate. Nothing of it is simulated,
+#                            so nothing of it is drawn past this point.
+#     the rock between       from the ceiling down to the springing line, where the two arches part...
+#                            ...and below it, the sliver by which the bores are more than 2 x MC_TW
+#                            apart here (170 ru against 168: a nose, not a knife edge)
+# ⚠ Structural, not optional: without the dark opening the ring's own bore would show through the side
+#   the cart is not going, so none of this asks mc_room for permission.
+# ⛔ FACE-ON, SO CLIPPED TO THE DRAW RECT (see mc_fo_emit). With the camera leaning hard toward the dark
+#   mouth as the nose reached the near plane, it measured |D| 819,686,400 unclipped — a 2x margin.
+fn mc_nose_draw(cam_x): i64 {
+    var nk = mc_nose_k;
+    var z  = load64(&mc_s_rz + nk * 8);
+    var cx = load64(&mc_s_cx + nk * 8) - cam_x;
+    var px = load64(&mc_s_px + nk * 8) - cam_x;
+    var cy = load64(&mc_s_cy + nk * 8);
+    var w  = mc_wof(z);
+    var fl = mc_py(cy + MC_FLOOR_Y, z);
+    var ar = mc_py(cy - MC_ARCH_Y, z);
+    var ce = mc_py(cy - MC_CEIL_Y, z);
+    var D  = MC_TEX_CAPDARK;
+
+    # -- the branch not taken: its whole cross-section, dark from floor to crown ---------------------------
+    var ol = mc_px(px - MC_TW, z);
+    var orr = mc_px(px + MC_TW, z);
+    var il = mc_px(px - MC_CEIL_HW, z);
+    var ir = mc_px(px + MC_CEIL_HW, z);
+    mc_fo_begin();
+    mc_fo_vert(ol, fl, D, 0);
+    mc_fo_vert(ol, ar, D, 0);
+    mc_fo_vert(il, ce, D, 0);
+    mc_fo_vert(ir, ce, D, 0);
+    mc_fo_vert(orr, ar, D, 0);
+    mc_fo_vert(orr, fl, D, 0);
+    mc_fo_emit(w);
+
+    # -- the rock between the two bores, facing the camera --------------------------------------------
+    # From the ceiling it narrows between the two crowns down to the springing line, then drops to the
+    # floor as wide as the bores are more than 2 x MC_TW apart (a sliver: 170 ru against 168). Textured on
+    # ONE affine plane across its width and down its height, so its two pieces meet without a seam.
+    # ⛔ TWO POLYGONS, NOT ONE. The outline is a wine glass — the valley narrowing into the sliver's stem —
+    #   and where they meet it has a REFLEX corner. It was drawn as one six-sided polygon, fanned from a
+    #   corner, and the fan's last triangle lay outside it: rock painted across the dark mouth beside it.
+    #   A fan is only a triangulation of a CONVEX polygon; the trapezoid and the sliver each are one.
+    # dir is the way from the branch not taken toward the ring.
+    var dir = 1;
+    if (cx < px) { dir = 0 - 1; }
+    var pe  = mc_px(px + dir * MC_TW, z);          # the dark bore's inner wall
+    var re  = mc_px(cx - dir * MC_TW, z);          # the ring's inner wall
+    var pce = mc_px(px + dir * MC_CEIL_HW, z);     # ...and the inner edges of their two crowns
+    var rce = mc_px(cx - dir * MC_CEIL_HW, z);
+    # ⚠ if the bores overlap by a pixel the sliver would turn inside out: close it to nothing instead
+    if ((re - pe) * dir < 0) { re = pe; }
+    # u runs left to right across the whole polygon, whichever side the ring is on; v runs down it
+    var xmin = pce;
+    if (rce < xmin) { xmin = rce; }
+    var span = rce - pce;
+    if (span < 0) { span = 0 - span; }
+    if (span == 0) { span = 1; }
+    var tall = fl - ce;
+    if (tall == 0) { tall = 1; }
+    var H  = MC_TEX_HALF;
+    var ur = MC_TEXFULL - 1 - H;                   # the rock band, ending one ulp short of the wrap
+    var v0 = 8 << 16;                              # below the timber set at v 0..7...
+    var vr = 112 << 16;                            # ...to v 120
+    var var_ar = v0 + ((ar - ce) * vr) / tall;     # v at the springing line, where the two pieces meet
+    # the valley between the crowns: a trapezoid
+    mc_fo_begin();
+    mc_fo_vert(pce, ce, H + ((pce - xmin) * ur) / span, v0);
+    mc_fo_vert(rce, ce, H + ((rce - xmin) * ur) / span, v0);
+    mc_fo_vert(re,  ar, H + ((re  - xmin) * ur) / span, var_ar);
+    mc_fo_vert(pe,  ar, H + ((pe  - xmin) * ur) / span, var_ar);
+    mc_fo_emit(w);
+    # the sliver below it, down to the floor — nothing at all if the bores meet exactly
+    if (re != pe) {
+        mc_fo_begin();
+        mc_fo_vert(pe,  ar, H + ((pe  - xmin) * ur) / span, var_ar);
+        mc_fo_vert(re,  ar, H + ((re  - xmin) * ur) / span, var_ar);
+        mc_fo_vert(re,  fl, H + ((re  - xmin) * ur) / span, v0 + vr);
+        mc_fo_vert(pe,  fl, H + ((pe  - xmin) * ur) / span, v0 + vr);
+        mc_fo_emit(w);
+    }
+    return 0;
+}
+
 # ---- what stands on the track inside slab k, drawn FAR TO NEAR ------------------------------------------
 # ⭐ OBJECTS ARE PLACED BY SEGMENT, NOT BY SLAB. A far slab spans two segments, and the old code read
 # only the segment at a slab's NEAR endpoint — so an object on the far half of a 64 ru slab was never
@@ -280,6 +493,7 @@ fn mc_objects(k, lo, hi, cam_x): i64 {
             if (kind == KIND_PICKUP) {
                 if ((trk_flags_at(a) & FLAG_TAKEN) == 0) { mc_gem(k, rza, a, cam_x); }
             }
+            if (kind == KIND_SIGN) { mc_sign(k, rza, cam_x); }
         }
         rza = rza - 32;
         a = a - 1;
@@ -291,7 +505,9 @@ fn mc_objects(k, lo, hi, cam_x): i64 {
 # ⭐ Interpolated from the slab's own endpoints (mc_cl_at), so a run that covers the whole slab is the
 # old quad to the pixel, and a cut lands exactly on the plane the uncut quad would have drawn.
 # v is linear in depth by construction (4 texels per ru), so it is interpolated exactly too.
-fn mc_floor_run(k, a, b, multi, cam_x): i64 {
+# st: 1 one track, 2 three tracks, 3 a fork's neck. chamber: 1 if the slab is this side of the nose,
+# where the floor spans both branches and the neck carries the other branch's track as well.
+fn mc_floor_run(k, a, b, st, cam_x, chamber): i64 {
     var rzs = load64(&mc_s_rz + k * 8);
     var vs  = load64(&mc_s_v + k * 8);
     var vn  = vs + (a - rzs) * (MC_TEXFULL / 32);
@@ -307,19 +523,56 @@ fn mc_floor_run(k, a, b, multi, cam_x): i64 {
     var fln = mc_py(gn + MC_FLOOR_Y, a);
     var flf = mc_py(gf + MC_FLOOR_Y, b);
 
+    # ⭐ IN A FORK'S CHAMBER THE FLOOR SPANS BOTH BRANCHES: from the leftmost centre line's wall to the
+    #   rightmost's. Everywhere else the other branch IS the ring (mc_s_px == mc_s_cx) and this is the
+    #   old floor exactly.
+    var opn = cn;
+    var opf = cf;
+    if (chamber == 1) {
+        mc_pl_at(k, a);
+        opn = mc_plx - cam_x;
+        mc_pl_at(k, b);
+        opf = mc_plx - cam_x;
+    }
+    var lon = cn;  if (opn < lon) { lon = opn; }
+    var hin = cn;  if (opn > hin) { hin = opn; }
+    var lof = cf;  if (opf < lof) { lof = opf; }
+    var hif = cf;  if (opf > hif) { hif = opf; }
+
     # floor — far-left, far-right, near-right, near-left. u spans the floor band.
-    var ln = mc_px(cn - MC_TW, a);  var lf = mc_px(cf - MC_TW, b);
-    var rn = mc_px(cn + MC_TW, a);  var rf = mc_px(cf + MC_TW, b);
+    var ln = mc_px(lon - MC_TW, a);  var lf = mc_px(lof - MC_TW, b);
+    var rn = mc_px(hin + MC_TW, a);  var rf = mc_px(hif + MC_TW, b);
     mc_quad(&mc_vtx_a, &mc_n_a,
       lf, flf, wf, 0, vf,              rf, flf, wf, MC_TEX_FLOOR, vf,
       rn, fln, wn, MC_TEX_FLOOR, vn,   ln, fln, wn, 0, vn);
+
+    var GW = CFG_TRACK_HW;
+
+    # ---- ⭐⭐ THE FORK: the branch the switch is NOT set to, in dim steel -------------------------
+    # ⚠ DRAWN BEFORE THE LIT TRACK: the two leave the points together, and on one plane the last one
+    #   written wins, so the route the cart will take must be the one written last.
+    # ⭐ THE RAILS ARE THE ONLY BRIGHT THING IN THE MINE, so the lit route is the one the cart will take
+    #   and the other is drawn unlit — from a one-row tile at a constant v, so no sleepers scroll past on
+    #   it. Throwing the switch mirrors the neck, and this is where a player SEES it: the bright rails
+    #   and the dim ones change sides, as a real turnout's blades would.
+    if (st == 3) {
+        if (chamber == 1) {
+            if (mc_room(2) == 1) {
+                var qlf = mc_px(opf - GW, b);  var qrf = mc_px(opf + GW, b);
+                var qln = mc_px(opn - GW, a);  var qrn = mc_px(opn + GW, a);
+                var dv = ATL_RAILDIM_V;
+                mc_quad(&mc_vtx_a, &mc_n_a,
+                  qlf, flf, wf, ATL_RAILDIM_U0, dv,   qrf, flf, wf, ATL_RAILDIM_U1, dv,
+                  qrn, fln, wn, ATL_RAILDIM_U1, dv,   qln, fln, wn, ATL_RAILDIM_U0, dv);
+            }
+        }
+    }
 
     # ---- ⭐⭐ EVERY TRACK IS A STRIP, INCLUDING THE MAIN ONE ---------------------------------------
     # ⛔ The rails used to be painted into the floor texture, which spans the whole bore — so the track
     # was as wide as the tunnel and nothing could sit beside it. Drawing each track as its own quad
     # makes a track an OBJECT with a position and a gauge, which is what lets three of them exist at
     # once and what makes a hop between them meaningful.
-    var GW = CFG_TRACK_HW;
     var m0lf = mc_px(cf - GW, b);  var m0rf = mc_px(cf + GW, b);
     var m0ln = mc_px(cn - GW, a);  var m0rn = mc_px(cn + GW, a);
     mc_quad(&mc_vtx_a, &mc_n_a,
@@ -333,7 +586,7 @@ fn mc_floor_run(k, a, b, multi, cam_x): i64 {
     # ⇒ Drawn at every depth now, room permitting; culling pays for it by no longer spending the
     #   budget on the off-screen slabs that were crowding it out.
     # ⚠ ONE QUAD PER SIDE TRACK, carrying BOTH its rails from the strip at u 50..62.
-    if (multi == 1) {
+    if (st == 2) {
         if (mc_room(4) == 1) {
             var R = CFG_RAIL_SEP;
             var slf = mc_px(cf - R - GW, b);  var srf = mc_px(cf - R + GW, b);
@@ -348,6 +601,7 @@ fn mc_floor_run(k, a, b, multi, cam_x): i64 {
               trn, fln, wn, MC_TEX_RAILEND, vn,    tln, fln, wn, MC_TEX_RAILPAIR, vn);
         }
     }
+
     return 0;
 }
 
@@ -531,13 +785,23 @@ fn mc_build(cam_x): i64 {
     # WORLD, which is worse than a visual flaw because the player's eye goes straight to it.
     # ⇒ One quad at the far plane, sampling the near-black cap swatch with a CONSTANT attribute at
     #   every corner. Drawn FIRST so every slab overwrites it — painter's order does the rest.
-    # ⚠ It spans the full bore rather than the arch, so no sliver of bg survives at the corners.
+    # ⚠ It spans the full bore rather than the arch, so no sliver of bg survives at the corners — and in a
+    #   fork's chamber, both branches' bores.
     var capz = load64(&mc_s_rz + (mc_nslab - 1) * 8);
     var capx = load64(&mc_s_cx + (mc_nslab - 1) * 8) - cam_x;
     var capy = load64(&mc_s_cy + (mc_nslab - 1) * 8);
     var capw = mc_wof(capz);
-    var cl = mc_px(capx - MC_TW, capz);
-    var cr = mc_px(capx + MC_TW, capz);
+    var caplo = capx;
+    var caphi = capx;
+    if (mc_fork_on == 1) {
+        if (capz <= mc_nose_rz) {
+            var cappx = load64(&mc_s_px + (mc_nslab - 1) * 8) - cam_x;
+            if (cappx < caplo) { caplo = cappx; }
+            if (cappx > caphi) { caphi = cappx; }
+        }
+    }
+    var cl = mc_px(caplo - MC_TW, capz);
+    var cr = mc_px(caphi + MC_TW, capz);
     var ct = mc_py(capy - MC_CEIL_Y, capz);
     var cb = mc_py(capy + MC_FLOOR_Y, capz);
     mc_quad(&mc_vtx_a, &mc_n_a,
@@ -558,11 +822,32 @@ fn mc_build(cam_x): i64 {
         var wn = mc_wof(rzn);
         var wf = mc_wof(rzf);
 
+        # ---- ⭐⭐ A FORK'S NOSE: everything beyond it is drawn, so its face goes on next ------------------
+        if (k + 1 == mc_nose_k) { mc_nose_draw(cam_x); }
+
+        # ---- ⭐⭐ A FORK'S CHAMBER: this side of the nose the two branches share one bore --------------
+        # Its walls follow the OUTER side of each branch — the leftmost centre line's left wall and the
+        # rightmost's right wall — so it widens as they part, and each track keeps a full MC_TW of room on
+        # its outer side: the camera, which leans at most CFG_LEAN_MAX off its track, stays inside.
+        # ⚠ Wherever there is no fork, the other branch IS the ring and every station below is the old one.
+        var chamber = 0;
+        if (mc_fork_on == 1) { if (rzf <= mc_nose_rz) { chamber = 1; } }
+        var lon = cn;  var hin = cn;
+        var lof = cf;  var hif = cf;
+        if (chamber == 1) {
+            var opn = load64(&mc_s_px + k * 8) - cam_x;
+            var opf = load64(&mc_s_px + (k + 1) * 8) - cam_x;
+            if (opn < lon) { lon = opn; }
+            if (opn > hin) { hin = opn; }
+            if (opf < lof) { lof = opf; }
+            if (opf > hif) { hif = opf; }
+        }
+
         # the bore's six horizontal stations, near and far
-        var ln  = mc_px(cn - MC_TW,      rzn);  var lf  = mc_px(cf - MC_TW,      rzf);
-        var rn  = mc_px(cn + MC_TW,      rzn);  var rf  = mc_px(cf + MC_TW,      rzf);
-        var cln = mc_px(cn - MC_CEIL_HW, rzn);  var clf = mc_px(cf - MC_CEIL_HW, rzf);
-        var crn = mc_px(cn + MC_CEIL_HW, rzn);  var crf = mc_px(cf + MC_CEIL_HW, rzf);
+        var ln  = mc_px(lon - MC_TW,      rzn);  var lf  = mc_px(lof - MC_TW,      rzf);
+        var rn  = mc_px(hin + MC_TW,      rzn);  var rf  = mc_px(hif + MC_TW,      rzf);
+        var cln = mc_px(lon - MC_CEIL_HW, rzn);  var clf = mc_px(lof - MC_CEIL_HW, rzf);
+        var crn = mc_px(hin + MC_CEIL_HW, rzn);  var crf = mc_px(hif + MC_CEIL_HW, rzf);
 
         # ...and its four vertical ones. Grade shifts the whole section up or down.
         var fln = mc_py(gn + MC_FLOOR_Y,      rzn); var flf = mc_py(gf + MC_FLOOR_Y,      rzf);
@@ -577,14 +862,14 @@ fn mc_build(cam_x): i64 {
         # from where cart_tick puts it. With the cart now drawn exactly where the rules apply, the
         # hole it falls into has to be exactly where the rules say it is.
         # ⇒ Each slab's floor is cut at the segment boundaries inside it and drawn as RUNS of equal
-        #   state — gap (nothing), one track, or three. A slab with one state is still one quad; the
-        #   extra quads appear only where a gap or a 3-track section begins or ends.
+        #   state — gap (nothing), one track, three, or a fork's neck. A slab with one state is still
+        #   one quad; the extra quads appear only where a gap, a 3-track section or a neck begins or ends.
         # ⭐ A GAP IS DRAWN BY NOT DRAWING. Omitting the floor leaves op 0x0F's background showing
         # through — an actual hole in the world, at zero triangle cost, and unmistakable.
         var sfirst = (mc_cam_ru + rzn) >>> 5;
         var slast  = (mc_cam_ru + rzf - 1) >>> 5;
         var run_a  = rzn;
-        var run_st = 0 - 1;                  # 0 gap, 1 one track, 2 three tracks
+        var run_st = 0 - 1;                  # 0 gap, 1 one track, 2 three tracks, 3 a fork's neck
         var sj = sfirst;
         while (sj <= slast) {
             var pa = sj * 32 - mc_cam_ru;
@@ -594,15 +879,16 @@ fn mc_build(cam_x): i64 {
             if (trk_live(fseg) == 1) {
                 if (trk_kind_at(fseg) == KIND_GAP) { st = 0; }
                 if (st == 1) { if (trk_multi_at(fseg) == 1) { st = 2; } }
+                if (st == 1) { if (trk_neck_at(fseg) == 1) { st = 3; } }
             }
             if (st != run_st) {
-                if (run_st > 0) { mc_floor_run(k, run_a, pa, run_st - 1, cam_x); }
+                if (run_st > 0) { mc_floor_run(k, run_a, pa, run_st, cam_x, chamber); }
                 run_a = pa;
                 run_st = st;
             }
             sj = sj + 1;
         }
-        if (run_st > 0) { mc_floor_run(k, run_a, rzf, run_st - 1, cam_x); }
+        if (run_st > 0) { mc_floor_run(k, run_a, rzf, run_st, cam_x, chamber); }
 
         # left wall — u runs floor-to-springing so the rock does not smear
         mc_quad(&mc_vtx_a, &mc_n_a,

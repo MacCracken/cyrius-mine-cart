@@ -212,6 +212,142 @@ fn mc_quad(list, np, xa, ya, wa, ua, va, xb, yb, wb, ub, vb, xc, yc, wc, uc, vc,
     return got;
 }
 
+# ---- ⭐⭐ FACE-ON GEOMETRY IS CLIPPED TO THE DRAW RECT BEFORE IT IS EMITTED --------------------------
+# ⛔⛔ AT ONE w, |D| IS AREA, AND THE AREA THAT COUNTS INCLUDES EVERYTHING OFF SCREEN. For a triangle whose
+# three vertices share a w — a surface squarely facing the camera — the kernel's D is the same at all four
+# corners of the rect: the triangle's doubled-domain area, times two, times 65536/w. So a face-on surface
+# the camera is about to pass pays for all of itself, seen or not. A fork put three of them in the game
+# (its sign, the dark mouth of the branch not taken, the rock of its nose), and the gate measured:
+#     the sign, passed under at w 280            512 x 403 px     |D|  193,130,496
+#     the dark mouth, jammed wall-side at w 336  1280 x 821 px    |D|  819,686,400   <- a 2x margin
+# against the walls' 80,688,960, on an ABI whose failure is a refused batch and a black screen.
+# ⇒ Such a surface is built as a convex polygon, clipped to the draw rect one edge at a time
+#   (Sutherland-Hodgman), and emitted as a fan. That bounds its |D| by what is on screen.
+# ⭐ AND IT IS EXACT. At one w the perspective-correct mapping is affine, so u and v at a clipped corner
+#   are interpolated exactly as the rasteriser would have found them there. The clipped corners lie ON
+#   the rect's edges, which are whole pixels; the sub-pixel ban rounds a corner only ALONG the edge it
+#   sits on, less than half a pixel, at the border of the frame.
+# ⚠ Only for geometry at ONE w. A receding surface (a wall, the floor) has a tilted 1/w plane and a
+#   clipped corner would need its own w — that is a near-plane clipper, which this renderer avoids.
+# ⛔ AND ONLY FOR CONVEX POLYGONS. Clipping a concave one to the rect is sound; FANNING it is not — a fan
+#   is a triangulation of a convex polygon and of nothing else. The fork's nose rock was first drawn as
+#   one wine-glass outline, and its fan laid a triangle of rock across the dark mouth beside it. Split a
+#   concave outline into convex pieces that share their cut edge.
+var mc_fo_x[24];           # two buffers of 12 vertices: the polygon, and the clip being built
+var mc_fo_y[24];
+var mc_fo_u[24];
+var mc_fo_v[24];
+var mc_fo_guard = 0;
+var mc_fo_n = 0;           # vertices in the polygon (buffer 0)
+var mc_fo_full = 0;        # vertices refused for want of room — counted, and held at zero by the gate
+
+# the face-on buffers measured: 1 if each spans its 24 slots
+fn mc_fo_ok(): i64 {
+    if ((&mc_fo_y     - &mc_fo_x) < 24 * 8) { return 0; }
+    if ((&mc_fo_u     - &mc_fo_y) < 24 * 8) { return 0; }
+    if ((&mc_fo_v     - &mc_fo_u) < 24 * 8) { return 0; }
+    if ((&mc_fo_guard - &mc_fo_v) < 24 * 8) { return 0; }
+    return 1;
+}
+
+# n / d rounded to the nearest integer, halves away from zero, for either sign of either
+fn mc_div_round(n, d): i64 {
+    if (d < 0) { n = 0 - n; d = 0 - d; }
+    if (n >= 0) { return (n + d / 2) / d; }
+    return 0 - ((0 - n + d / 2) / d);
+}
+
+# start a face-on polygon
+fn mc_fo_begin(): i64 { mc_fo_n = 0; return 0; }
+
+# add a corner (pixels, and 16.16 texels) to the face-on polygon, in order around it
+fn mc_fo_vert(x, y, u, v): i64 {
+    if (mc_fo_n >= 12) { mc_fo_full = mc_fo_full + 1; return 0; }
+    store64(&mc_fo_x + mc_fo_n * 8, x);
+    store64(&mc_fo_y + mc_fo_n * 8, y);
+    store64(&mc_fo_u + mc_fo_n * 8, u);
+    store64(&mc_fo_v + mc_fo_n * 8, v);
+    mc_fo_n = mc_fo_n + 1;
+    return 1;
+}
+
+# keep the part of the polygon with coordinate `axis` (0 x, 1 y) >= bound (ge 1) or <= bound (ge 0)
+fn mc_fo_clip(axis, bound, ge): i64 {
+    var m = 0;
+    var i = 0;
+    while (i < mc_fo_n) {
+        var j = i + 1;
+        if (j == mc_fo_n) { j = 0; }
+        var ax = load64(&mc_fo_x + i * 8);  var ay = load64(&mc_fo_y + i * 8);
+        var bx = load64(&mc_fo_x + j * 8);  var by = load64(&mc_fo_y + j * 8);
+        var ac = ax;  var bc = bx;
+        if (axis == 1) { ac = ay; bc = by; }
+        var ain = 0;  var bin = 0;
+        if (ge == 1) { if (ac >= bound) { ain = 1; } if (bc >= bound) { bin = 1; } }
+        if (ge == 0) { if (ac <= bound) { ain = 1; } if (bc <= bound) { bin = 1; } }
+        if (ain == 1) {
+            if (m < 12) {
+                store64(&mc_fo_x + (12 + m) * 8, ax);
+                store64(&mc_fo_y + (12 + m) * 8, ay);
+                store64(&mc_fo_u + (12 + m) * 8, load64(&mc_fo_u + i * 8));
+                store64(&mc_fo_v + (12 + m) * 8, load64(&mc_fo_v + i * 8));
+                m = m + 1;
+            }
+        }
+        if (ain != bin) {
+            # the edge crosses the bound: the corner lands ON it, and u, v follow the same fraction
+            var num = bound - ac;
+            var den = bc - ac;
+            var ix = bound;
+            var iy = bound;
+            if (axis == 0) { iy = ay + mc_div_round((by - ay) * num, den); }
+            if (axis == 1) { ix = ax + mc_div_round((bx - ax) * num, den); }
+            var au = load64(&mc_fo_u + i * 8);  var bu = load64(&mc_fo_u + j * 8);
+            var av = load64(&mc_fo_v + i * 8);  var bv = load64(&mc_fo_v + j * 8);
+            if (m < 12) {
+                store64(&mc_fo_x + (12 + m) * 8, ix);
+                store64(&mc_fo_y + (12 + m) * 8, iy);
+                store64(&mc_fo_u + (12 + m) * 8, au + mc_div_round((bu - au) * num, den));
+                store64(&mc_fo_v + (12 + m) * 8, av + mc_div_round((bv - av) * num, den));
+                m = m + 1;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < m) {
+        store64(&mc_fo_x + i * 8, load64(&mc_fo_x + (12 + i) * 8));
+        store64(&mc_fo_y + i * 8, load64(&mc_fo_y + (12 + i) * 8));
+        store64(&mc_fo_u + i * 8, load64(&mc_fo_u + (12 + i) * 8));
+        store64(&mc_fo_v + i * 8, load64(&mc_fo_v + (12 + i) * 8));
+        i = i + 1;
+    }
+    mc_fo_n = m;
+    return m;
+}
+
+# clip the face-on polygon to the draw rect and emit it at depth w as a fan; returns triangles written
+fn mc_fo_emit(w): i64 {
+    mc_fo_clip(0, MC_DX, 1);
+    mc_fo_clip(0, MC_DX + MC_W, 0);
+    mc_fo_clip(1, MC_DY, 1);
+    mc_fo_clip(1, MC_DY + MC_H, 0);
+    if (mc_fo_n < 3) { return 0; }
+    var x0 = load64(&mc_fo_x);  var y0 = load64(&mc_fo_y);
+    var u0 = load64(&mc_fo_u);  var v0 = load64(&mc_fo_v);
+    var got = 0;
+    var i = 1;
+    while (i < mc_fo_n - 1) {
+        var j = i + 1;
+        got = got + mc_emit(&mc_vtx_a, &mc_n_a,
+          x0, y0, w, u0, v0,
+          load64(&mc_fo_x + i * 8), load64(&mc_fo_y + i * 8), w, load64(&mc_fo_u + i * 8), load64(&mc_fo_v + i * 8),
+          load64(&mc_fo_x + j * 8), load64(&mc_fo_y + j * 8), w, load64(&mc_fo_u + j * 8), load64(&mc_fo_v + j * 8));
+        i = i + 1;
+    }
+    return got;
+}
+
 # ---- the budget reserve --------------------------------------------------------------------------
 # ⛔ OPTIONAL DETAIL ASKS PERMISSION. The per-record cap is 256 and mc_emit's over-budget path drops
 # silently — so whatever is emitted LAST is whatever gets lost, and the cart is drawn last because

@@ -216,8 +216,13 @@ fn trt_generator(): i64 {
     # would desynchronise every segment after it. gen_count counts PRODUCTIONS and gen_to counts
     # POSITIONS — they can only stay equal if the stream is strictly one-for-one and in order.
     trt_eq("each segment generated exactly once", trk_gen_count, trk_gen_to);
-    # and streaming really did keep the required distance ahead of the cart
-    trt_eq("horizon stays CFG_GEN_AHEAD in front", trk_gen_to, trk_abs_seg + CFG_GEN_AHEAD + 1);
+    # and streaming really did keep the required distance ahead of the cart — except in front of a fork
+    # the cart has not reached, where the generator waits at the end of the neck for the choice
+    var horizon = trk_abs_seg + CFG_GEN_AHEAD + 1;
+    if (trk_fork_pending() == 1) {
+        if (trk_fork_at + CFG_BRANCH_NECK < horizon) { horizon = trk_fork_at + CFG_BRANCH_NECK; }
+    }
+    trt_eq("horizon stays CFG_GEN_AHEAD in front (or at a waiting fork's neck)", trk_gen_to, horizon);
     # 4000 ticks at 8533 sub/tick is ~521 segments, not 4000 — the cart crosses a boundary every
     # 7.7 ticks, so this bounds the actual streaming volume rather than the tick count
     trt_true("generator streamed a real distance", trk_gen_count > 500);
@@ -255,6 +260,181 @@ fn trt_liveness(): i64 {
     return 0;
 }
 
+# ---- ⭐⭐ forks ------------------------------------------------------------------------------------------
+# ⭐ WHAT A FORK MUST NEVER DO, IN THE ORDER IT WOULD HURT: strand the generator (a track that stops is a
+# cart that drives off the end of the world), let the choice leak backwards (a switch that moved anything
+# the camera has already seen), or break the promise a seed makes (the same choice must lay the same
+# branch). Each is silent, and each is pinned here without a cart, by driving the position carry directly.
+# ride the bare track until the current fork's points are at most `ahead` segments in front
+fn trt_to_points(ahead): i64 {
+    var t = 0;
+    while (t < 20000) {
+        if (trk_fork_pending() == 1) {
+            if (trk_fork_at - trk_abs_seg <= ahead) { return 1; }
+        }
+        trk_advance(8533);
+        t = t + 1;
+    }
+    return 0;
+}
+
+# a checksum of the track laid after the first fork, with the switch thrown left or left alone
+fn trt_fork_sum(throw): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    trt_to_points(4);
+    if (throw == 1) { trk_fork_switch(0 - 1); }
+    var t = 0;
+    while (t < 300) { trk_advance(8533); t = t + 1; }
+    var h = 0;
+    var a = trk_abs_seg;
+    while (a < trk_gen_to) {
+        h = (h * 1000003 + trk_curve_at(a) * 31 + trk_kind_at(a) * 7 + trk_flags_at(a)) & 0xFFFFFFFF;
+        a = a + 1;
+    }
+    return h;
+}
+
+# the fork as the generator lays it, the switch, the pause at the neck, and the branch after it
+fn trt_fork(): i64 {
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    trt_true("a fork is laid", trt_to_points(20));
+    var p = trk_fork_at;
+    trt_eq("the first fork's points are where config puts them", p, CFG_FORK_FIRST);
+    trt_eq("the switch starts on the spur", trk_fork_side, 1);
+
+    # -- its furniture ------------------------------------------------------------------------------
+    trt_eq("the sign hangs CFG_FORK_SIGN_LEAD before the points", trk_kind_at(p - CFG_FORK_SIGN_LEAD), KIND_SIGN);
+    trt_eq("the points are a KIND_FORK segment", trk_kind_at(p), KIND_FORK);
+    trt_eq("the neck starts at the points, not before", trk_neck_at(p - 1), 0);
+
+    # -- the approach: dead straight, and nothing on it ------------------------------------------------
+    var bent = 0;
+    var busy = 0;
+    var a = p - CFG_FORK_CLEAR;
+    while (a < p) {
+        if (trk_curve_at(a) != 0) { bent = bent + 1; }
+        var k = trk_kind_at(a);
+        if (k != KIND_PLAIN) { if (k != KIND_SIGN) { busy = busy + 1; } }
+        if (trk_multi_at(a) == 1) { busy = busy + 1; }
+        a = a + 1;
+    }
+    trt_eq("the approach is dead straight", bent, 0);
+    trt_eq("...and nothing stands on it", busy, 0);
+
+    # -- the neck: flagged, sterile, exactly the profile, on the spur side ----------------------------
+    var off = 0;
+    var wrong = 0;
+    a = p;
+    while (a < p + CFG_BRANCH_NECK) {
+        if (trk_neck_at(a) == 0) { off = off + 1; }
+        if (trk_curve_at(a) != trk_fork_dc(a - p)) { wrong = wrong + 1; }
+        if (a > p) { if (trk_kind_at(a) != KIND_PLAIN) { busy = busy + 1; } }
+        if (trk_multi_at(a) == 1) { busy = busy + 1; }
+        a = a + 1;
+    }
+    trt_eq("every neck segment is flagged", off, 0);
+    trt_eq("the neck is the profile, turned toward the spur", wrong, 0);
+    trt_eq("...and nothing stands in it", busy, 0);
+    # ⛔ no kink from the lead-in through the neck: curvature steps at most CFG_CURVE_RAMP
+    var kink = 0;
+    a = p - CFG_FORK_CLEAR - CFG_FORK_STRAIGHT;
+    while (a < p + CFG_BRANCH_NECK - 1) {
+        var d = trk_curve_at(a + 1) - trk_curve_at(a);
+        if (d < 0) { d = 0 - d; }
+        if (d > CFG_CURVE_RAMP) { kink = kink + 1; }
+        a = a + 1;
+    }
+    trt_eq("no kink from the lead-in through the neck", kink, 0);
+
+    # -- ⛔ the pause: the generator waits at the end of the neck ------------------------------------
+    trt_eq("the generator waits at the end of the neck", trk_gen_to, p + CFG_BRANCH_NECK);
+
+    # -- ⭐ the switch mirrors the neck in place, and only before the points --------------------------
+    var probe = p + 6;
+    var before = trk_curve_at(probe);
+    trt_true("the neck bends", before != 0);
+    trt_eq("throwing the switch left moves it", trk_fork_switch(0 - 1), 1);
+    trt_eq("...to the wet shaft", trk_fork_side, 0 - 1);
+    trt_eq("...and mirrors the neck in place", trk_curve_at(probe), 0 - before);
+    trt_eq("...leaving the approach untouched", trk_curve_at(p - 1), 0);
+    trt_eq("throwing it the same way again does nothing", trk_fork_switch(0 - 1), 0);
+    trk_fork_switch(1);
+    trt_eq("throwing it back restores the neck exactly", trk_curve_at(probe), before);
+    trk_fork_switch(0 - 1);
+
+    trt_to_points(1);
+    trt_eq("the choice is still open a segment short of the points", trk_fork_lock, 0);
+    trt_eq("...and the generator is still waiting", trk_gen_to, p + CFG_BRANCH_NECK);
+    while (trk_abs_seg < p) { trk_advance(8533); }
+    trt_eq("crossing the points makes the choice final", trk_fork_lock, 1);
+    trt_eq("...and the generator catches up at once", trk_gen_to, trk_abs_seg + CFG_GEN_AHEAD + 1);
+    trt_eq("a switch after the points is refused", trk_fork_switch(1), 0);
+    trt_eq("...and the branch is still the wet shaft", trk_fork_side, 0 - 1);
+
+    # -- the wet shaft is wet from the end of the neck; the neck itself is not -----------------------
+    var wet = 0;
+    var dry = 0;
+    a = p + CFG_BRANCH_NECK;
+    while (a < trk_gen_to) {
+        if (trk_wet_at(a) == 1) { wet = wet + 1; }
+        if (trk_wet_at(a) == 0) { dry = dry + 1; }
+        a = a + 1;
+    }
+    trt_true("the wet shaft is laid wet", wet > 0);
+    trt_eq("...every segment of it this far", dry, 0);
+    trt_eq("the neck is not", trk_wet_at(p + CFG_BRANCH_NECK - 1), 0);
+
+    # -- left alone, the cart takes the spur, and the spur is dry --------------------------------------
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    trt_to_points(1);
+    var ps0 = trk_fork_at;
+    while (trk_abs_seg < ps0) { trk_advance(8533); }
+    trt_eq("left alone, the switch stays on the spur", trk_fork_side, 1);
+    wet = 0;
+    a = ps0 + CFG_BRANCH_NECK;
+    while (a < trk_gen_to) { if (trk_wet_at(a) == 1) { wet = wet + 1; } a = a + 1; }
+    trt_eq("...and the spur is dry", wet, 0);
+
+    # -- ⭐ the seed's promise survives the fork: the same choice lays the same branch -------------------
+    var s1 = trt_fork_sum(1);
+    var s2 = trt_fork_sum(1);
+    trt_eq("the same choice lays the same branch", s1, s2);
+    trt_true("the other choice lays a different one", trt_fork_sum(0) != s1);
+    return 0;
+}
+
+# ---- the fork's constants, re-derived rather than trusted ------------------------------------------------
+fn trt_fork_constants(): i64 {
+    # ⭐ THE NOSE: the two bores are a full 2 x MC_TW apart at CFG_FORK_NOSE, and not one segment sooner.
+    #   The same midpoint integral the renderer uses, of the DIFFERENCE curvature (twice the profile).
+    var psi = 0;
+    var xq = 0;
+    var early = 0;
+    var i = 0;
+    while (i < CFG_FORK_NOSE) {
+        var d = 2 * trk_fork_dc(i);
+        xq = xq + ((32 * (2 * psi + d) * MC_TAU_Q16) >>> 17);
+        psi = psi + d;
+        if (i == CFG_FORK_NOSE - 2) { early = xq; }
+        i = i + 1;
+    }
+    trt_true("the bores have parted by CFG_FORK_NOSE", xq >= (2 * MC_TW) << 16);
+    trt_true("...and not a segment sooner", early < (2 * MC_TW) << 16);
+    trt_true("the nose is inside the neck", CFG_FORK_NOSE < CFG_BRANCH_NECK);
+    # ⭐⭐ THE BRIEF'S 1.2 s TELEGRAPH: the sign enters at the far plane and must be in view that long
+    #   before the points, at the absolute top speed
+    var reach = (MC_ZF - CFG_CART_RZ) + CFG_FORK_SIGN_LEAD * MC_SEG;
+    trt_true("the sign is in view 1.2 s before the points at top speed",
+      reach * MC_SUB_PER_RU / CFG_SPEED_MAX >= (CFG_TICK_HZ * 6) / 5);
+    # ⛔ the pause is never on screen: the neck outlasts what the view reaches past the cart
+    trt_true("the neck outlasts the view", CFG_BRANCH_NECK * MC_SEG > MC_ZF - CFG_CART_RZ + MC_SEG);
+    trt_true("the approach outlasts it too", (CFG_FORK_CLEAR + 1) * MC_SEG > MC_ZF - CFG_CART_RZ);
+    # the profile starts and ends inside the ramp, so neither end of the neck is a kink
+    trt_true("the neck starts gently", trk_fork_dc(0) <= CFG_CURVE_RAMP);
+    trt_eq("...and ends straight", trk_fork_dc(CFG_BRANCH_NECK - 1), 0);
+    return 0;
+}
+
 # ---- the suite ---------------------------------------------------------------------------------------
 fn trk_selftest(): i64 {
     trt_fail = 0;
@@ -267,6 +447,8 @@ fn trk_selftest(): i64 {
     trt_determinism();
     trt_generator();
     trt_liveness();
+    trt_fork();
+    trt_fork_constants();
 
     ps("  segment ring:     "); pn(trt_ran); ps(" assertions, ");
     if (trt_fail == 0) { ps("all pass"); nl(); }
