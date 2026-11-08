@@ -8,7 +8,7 @@ language = "cyrius"
 # Pinned on purpose — do not chase the cyrius tip here. Through 0.2.2 this matched the toolchain
 # agnos builds with (agnos 1.57.7, cyrius 6.6.6). agnos has since moved to 6.7.x (1.57.17 builds
 # with 6.7.18), so the game and the kernel whose ABI it consumes are now built by different compilers.
-cyrius = "6.6.20"
+cyrius = "6.7.9"
 
 [build]
 src = "src/main.cyr"

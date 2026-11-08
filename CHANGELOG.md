@@ -7,6 +7,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and this pro
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-11-08
+
+**The toolchain moves to 6.7.9, and the repository gets CI and releases.** No game source changes, and
+nothing the game computes or draws changes with it.
+
+### Added
+
+- **CI** (`.github/workflows/ci.yml`), on every push and pull request to `main`. Installs the toolchain
+  named by the `cyrius.cyml` pin and verifies `lib/` against `cyrius.lock`; builds all six targets,
+  failing on an `undefined function` warning (it compiles to a `ud2` stub and the build still exits 0);
+  fails if `build/`, `lib/` or `cyrius.lock` differ from what the source builds, because agnos's stage
+  script copies `build/mine-cart_agnos` as committed; then runs `--check`, `cyrius audit` and
+  `cyrius vet`, and requires a changelog entry for `VERSION`.
+- **Releases** (`.github/workflows/release.yml`), on pushing a tag equal to `VERSION`. Runs CI as a
+  gate, rebuilds, runs `--check` on the binary being shipped, and publishes `mine-cart`,
+  `mine-cart_agnos`, a source tarball and `SHA256SUMS`, with this file's section as the notes.
+
+### Changed
+
+- **Toolchain `6.6.20` → `6.7.9`**, and the vendored stdlib re-synced from it: every file in `lib/` is
+  byte-identical to 6.7.9's, with no module added or dropped. No source change was needed. Verified
+  across the two toolchains, byte-identical: the gate's output, three `--sim` runs, a 6.6.6 recording
+  replayed on the 6.7.9 build, all 1800 frames of a 30 s film, and the `--wav` mix. The 110 `SYS_`
+  numbers in `syscalls_x86_64_agnos.cyr` are unchanged. agnos 1.57.17 builds with 6.7.18, so the game
+  and the kernel are still built by different compilers.
+
+### Notes
+
+- Binary 464,728 → 464,744 bytes (agnos: 485,512 → 485,528).
+
 ## [0.2.3] — 2026-11-08
 
 **Forks — the build order's step 6.** Every few hundred metres the shaft splits: a sign in the tunnel
@@ -397,7 +427,8 @@ to use the 3D ops at all.
   loaded + run in ring 3 on the real kernel under QEMU. The GPU path itself is iron-only — `#86`
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
-[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.3...HEAD
+[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.3...0.3.0
 [0.2.3]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...0.2.3
 [0.2.2]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.0...0.2.1

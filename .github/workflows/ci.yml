@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:   # reusable: release.yml gates on this workflow
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (pinned)
+
+      - name: Install Cyrius toolchain
+        # The cyrius.cyml pin is the single source of truth for the toolchain
+        # version — never hardcode it here.
+        run: |
+          set -eo pipefail
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Verify vendored stdlib against cyrius.lock
+        # Before the build, which re-vendors lib/ and rewrites the lock.
+        run: cyrius deps --verify
+
+      - name: Build all targets
+        # An undefined function is only a warning: it compiles to a ud2 stub and
+        # the build still exits 0, even with --strict. So fail on the text.
+        run: |
+          set -eo pipefail
+          log="$RUNNER_TEMP/build.log"
+          cyrius build src/main.cyr build/mine-cart 2>&1 | tee "$log"
+          cyrius build --agnos src/main.cyr build/mine-cart_agnos 2>&1 | tee -a "$log"
+          for tool in film shot refrender dumptex; do
+            cyrius build "tools/$tool.cyr" "build/$tool" 2>&1 | tee -a "$log"
+          done
+          if grep -q 'undefined function' "$log"; then
+            echo "::error::undefined function in the build (a ud2 stub at runtime)"
+            exit 1
+          fi
+
+      - name: Committed binaries and lib/ match the source
+        # build/ and lib/ are tracked, and agnos's stage script copies
+        # build/mine-cart_agnos from this repo as committed, so a stale binary is
+        # a real defect. Builds are byte-reproducible: rebuilding must change nothing.
+        run: |
+          drift="$(git status --porcelain -- build lib cyrius.lock)"
+          if [ -n "$drift" ]; then
+            echo "$drift"
+            echo "::error::build/, lib/ or cyrius.lock differ from what this source builds; rebuild and commit them"
+            exit 1
+          fi
+
+      - name: Host gate (--check, exit 95 = pass)
+        run: |
+          rc=0
+          ./build/mine-cart --check || rc=$?
+          if [ "$rc" -ne 95 ]; then
+            echo "::error::mine-cart --check exited $rc (95 = pass)"
+            exit 1
+          fi
+
+      - name: Audit (fmt, lint, docs, tests)
+        run: cyrius audit
+
+      - name: Vet include dependencies
+        run: cyrius vet src/main.cyr
+
+      - name: VERSION has a changelog entry
+        run: |
+          VERSION="$(tr -d '[:space:]' < VERSION)"
+          grep -qF "## [$VERSION]" CHANGELOG.md || { echo "::error::no CHANGELOG entry for $VERSION"; exit 1; }

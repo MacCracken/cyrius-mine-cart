@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ['[0-9]+.[0-9]+.[0-9]+*']   # bare SemVer tags (e.g. 0.3.0), matched to VERSION
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: CI Gate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build & Release
+    needs: [ci]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4 (pinned)
+
+      - name: Tag matches VERSION
+        # VERSION is the single source of truth; cyrius.cyml derives from it.
+        run: |
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "$FILE_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::VERSION ($FILE_VERSION) != tag ($GITHUB_REF_NAME)"
+            exit 1
+          fi
+
+      - name: Install Cyrius toolchain
+        # The cyrius.cyml pin is the single source of truth — see ci.yml.
+        run: |
+          set -eo pipefail
+          CYRIUS_VERSION="$(grep '^cyrius = ' cyrius.cyml | head -1 | sed 's/cyrius = "\(.*\)"/\1/')"
+          echo "Installing Cyrius $CYRIUS_VERSION"
+          curl -sSf https://raw.githubusercontent.com/MacCracken/cyrius/main/scripts/install.sh | \
+            CYRIUS_VERSION="$CYRIUS_VERSION" sh
+          echo "$HOME/.cyrius/bin" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: |
+          cyrius build src/main.cyr build/mine-cart
+          cyrius build --agnos src/main.cyr build/mine-cart_agnos
+
+      - name: Host gate on the binary being shipped
+        run: |
+          rc=0
+          ./build/mine-cart --check || rc=$?
+          if [ "$rc" -ne 95 ]; then
+            echo "::error::mine-cart --check exited $rc (95 = pass)"
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '
+            index($0, "## [" tag "]") == 1 { found = 1; next }
+            /^## \[/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/release-body.md"
+          if [ ! -s "$RUNNER_TEMP/release-body.md" ]; then
+            echo "::error::no CHANGELOG entry for $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: Package binaries, source and checksums
+        # Flat names, so `sha256sum -c SHA256SUMS` works on the downloaded assets.
+        run: |
+          TAG="$GITHUB_REF_NAME"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="cyrius-mine-cart-$TAG/" -o "dist/cyrius-mine-cart-$TAG-src.tar.gz" HEAD
+          cp build/mine-cart build/mine-cart_agnos dist/
+          (cd dist && sha256sum -- * > SHA256SUMS)
+
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2 (pinned)
+        with:
+          name: "cyrius-mine-cart ${{ github.ref_name }}"
+          body_path: ${{ runner.temp }}/release-body.md
+          prerelease: ${{ startsWith(github.ref_name, '0.') }}
+          files: dist/*
