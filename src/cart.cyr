@@ -153,6 +153,12 @@ fn cart_damage(n): i64 {
     return 0;
 }
 
+# the lateral force this bend exerts at the current speed — it rises as speed SQUARED
+fn cart_lat(curve): i64 {
+    var sf = cart_speed_frac();
+    return fx_mul((curve * CFG_LEAN_FORCE) >>> 10, fx_mul(sf, sf));
+}
+
 # ---- one simulation tick --------------------------------------------------------------------------------
 # word is the input bitfield. Returns 1 while the cart is alive, 0 on the tick it derails.
 fn cart_tick(word): i64 {
@@ -219,8 +225,7 @@ fn cart_tick(word): i64 {
     # ⭐ CENTRIFUGAL FORCE IS OUTWARD: a right-hand bend (positive curve) throws the cart LEFT, so the
     # player counter-leans RIGHT to hold the rail. That matches the hands — you steer into the turn.
     var sf  = cart_speed_frac();
-    var sf2 = fx_mul(sf, sf);
-    var lat = fx_mul((curve * CFG_LEAN_FORCE) >>> 10, sf2);
+    var lat = cart_lat(curve);
     var alat = fx_abs(lat);
     cart_lean_vel = cart_lean_vel - lat;
 
@@ -465,18 +470,23 @@ fn mc_cart_reset(): i64 { return cart_reset(CFG_SEED_DEFAULT, 0); }
 # one tick of "frame N": the cart with no input at all
 fn mc_cart_step(): i64 { return cart_tick(0); }
 
-# the shared definition of frame N — reset, then N input-less ticks
+# ⛔ the shared definition of frame N, as the ride, film and shot live it: tick, then draw, from a fresh
+# chapter, a death restarting it. It used to stop one tick short of that and to freeze at the first death,
+# so `refrender 233` and `refrender 900` were the same picture.
 fn mc_cart_to(frame): i64 {
     mc_cart_reset();
     var f = 0;
-    while (f < frame) { cart_tick(0); f = f + 1; }
+    while (f <= frame) {
+        if (cart_tick(0) == 0) { cart_reset(cart_seed, cart_chapter); }
+        f = f + 1;
+    }
     return 0;
 }
 
 # ⭐ FRAME N OF THE AUTOPILOT'S RIDE, as the film and shot tools define it: tick, then draw, from a fresh
 # chapter, a death restarting it — so frame N here is film's frame N, and a frame seen in the video can
 # be put through --verify on iron. The input-less definition above cannot reach a fork: hands off, the
-# cart falls into the first gap at 87 m, every time. pilot 0 is that definition, unchanged.
+# cart falls into the first gap at 89 m, every time. pilot 0 is that definition, unchanged.
 fn mc_cart_to_pilot(frame, pilot): i64 {
     if (pilot == 0) { return mc_cart_to(frame); }
     mc_cart_reset();

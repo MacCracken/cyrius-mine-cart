@@ -16,7 +16,7 @@
 #   --wav       20 s of the mix to /tmp/deepvein.wav, so a person can listen to it
 #   --record F  ride (or --sim) and write every input word to F
 #   --replay F  re-run a recorded ride headless; exit 95 only if it reproduced exactly
-#   --frames N  bound the ride or the --sim run (0 = ride until ESC)
+#   --frames N  bound the ride (0 = ride until ESC) or the --sim run (must be > 0)
 #   --pilot N   0 = hands off, 1 = the reference autopilot (--sim, --wav)
 #   --trace     report every dropped triangle, for diagnosis
 #
@@ -115,11 +115,10 @@ fn mc_pace(): i64 {
     # deadline instead. A catch-up loop turns one slow frame into a spiral.
     if (rem <= 0) { mc_deadline_us = now; return 0; }
     if (rem > 100000) { rem = 100000; }
-    # ⚠ sleep_ms rounds UP to whole 10 ms ticks, so a sub-10 ms remainder would sleep a whole tick and
-    # overshoot the frame. Below that, spend the remainder rather than oversleep it — the deadline is
-    # absolute, so the next frame simply has less to wait for.
-    var rem_ms = rem / 1000;
-    if (rem_ms > 0) { syscall(41, rem_ms); }
+    # ⚠ A SLEEP ENDS ON A 10 ms TIMER TICK (agnos wq_tick), so a sub-10 ms remainder would sleep a whole
+    # tick and overshoot the frame. Below that, spend the remainder rather than oversleep it — the
+    # deadline is absolute, so the next frame simply has less to wait for.
+    if (rem >= 10000) { syscall(41, rem / 1000); }
     return rem;
 }
 #else
@@ -182,7 +181,7 @@ fn mc_sim(ticks, pilot, record): i64 {
 
     ps("mine-cart: SIM pilot "); pn(pilot); ps(", "); pn(ticks); ps(" ticks at ");
     pn(CFG_TICK_HZ); ps(" Hz ("); pn(ticks / CFG_TICK_HZ); ps(" s)"); nl();
-    ps("    tick   depth  km/h    lean  warn  int  score  jump  duck  slip"); nl();
+    ps("  tick\tdepth\tkm/h\tlean\twarn\tderail\tapex\tint\tscore\tjump\tduck\tslip"); nl();
 
     var deepest = 0;
     var top     = 0;
@@ -263,6 +262,7 @@ fn mc_sim(ticks, pilot, record): i64 {
     }
 
     mc_sim_bank();                                 # the life still riding when the run stopped
+    if (cur_slip_run > max_slip_run) { max_slip_run = cur_slip_run; }    # a slip still going at the end
 
     nl();
     ps("  "); pn(mcs_lives); ps(" li"); if (mcs_lives == 1) { ps("fe"); } if (mcs_lives != 1) { ps("ves"); }
@@ -285,14 +285,13 @@ fn mc_sim(ticks, pilot, record): i64 {
     ps("  the generator produced "); pn(trk_gen_count); ps(" segments, ABI curve clamp fired ");
     pn(trk_clamp_hits); ps(" times"); nl();
     if (rp_on == 1) {
-        mc_build(cart_cam_x());                    # the final frame, which the log fingerprints
         var len = rp_end();
         if (file_write_all(record, rp_buf, len) != len) {
             ps("mine-cart: could NOT write the input log to "); ps(record); nl();
             return 1;
         }
         ps("  input log: "); pn(rp_ticks); ps(" ticks to "); ps(record); ps(", state hash ");
-        pn(rp_hash); ps(", frame hash "); pn(rp_frame_hash()); nl();
+        pn(rp_hash); ps(", frame hash "); pn(rp_sealed_frame); nl();
     }
     return 0;
 }
@@ -339,6 +338,8 @@ fn mc_ride(limit, record): i64 {
 
     var drawn = 0;
     var presented = 0;
+    var unpresented = 0;                           # frames drawn that #84 did not flip
+    var logbad = 0;                                # 1 if the recording could not be written
     var rc = 95;
     var f = 0;
     while (1 == 1) {
@@ -359,6 +360,7 @@ fn mc_ride(limit, record): i64 {
             # this specific stretch of mine, so they get the SAME track back, not a new sample.
             ps("mine-cart: "); ps(mc_death_name()); ps(" at "); pn(trk_depth_m());
             ps(" m -- restarting the chapter"); nl();
+            aud_reset();                               # or the death's screech plays over the new run
             cart_reset(cart_seed, cart_chapter);
         }
         # ⚠ AFTER the tick and any restart — exactly where rp_run folds the state in on replay
@@ -386,15 +388,16 @@ fn mc_ride(limit, record): i64 {
         # ⛔ CHECK THE PRESENT. #84 returns 0 when the double-buffer is not armed, and an ignored 0
         # means 900 frames of "success" over a screen that never changed — the silent-nothing class
         # this whole cut keeps running into. Reported ONCE, not per frame.
-        if (mc_gpu_present() != 1) {
-            if (presented == 0) {
+        if (mc_gpu_present() == 1) {
+            presented = presented + 1;
+        } else {
+            if (unpresented == 0) {
                 ps("mine-cart: #84 present returned 0 -- the double buffer is NOT armed, so nothing");
                 nl();
                 ps("           reaches the panel. The draw may still be fine; the FLIP is not."); nl();
             }
-            presented = 0 - 1;
+            unpresented = unpresented + 1;
         }
-        if (presented >= 0) { presented = presented + 1; }
         drawn = drawn + 1;
         f = f + 1;
         mc_pace();
@@ -410,19 +413,23 @@ fn mc_ride(limit, record): i64 {
     ps(" triangles, peak |D| "); pn(mc_peak_d); nl();
 
     if (rp_on == 1) {
-        # the vertex list still holds the last frame built — the one the log's frame hash describes
         var len = rp_end();
         ps("mine-cart: input log "); pn(rp_ticks); ps(" ticks, state hash "); pn(rp_hash);
-        ps(", frame hash "); pn(rp_frame_hash()); nl();
+        ps(", frame hash "); pn(rp_sealed_frame); nl();
         if (file_write_all(record, rp_buf, len) == len) {
             ps("           written to "); ps(record); ps(" -- replay it anywhere with --replay"); nl();
         } else {
             ps("           could NOT be written to "); ps(record);
             ps(" -- the two hashes above are the ride's fingerprint"); nl();
+            logbad = 1;
         }
     }
     if (rc != 95) { return rc; }
     if (drawn == 0) { return 6; }
+    # ⛔ 95 IS A CLAIM THAT THE RIDE REACHED THE PANEL AND THE LOG REACHED THE DISK. It used to be
+    # returned with every frame unpresented, or with the recording lost.
+    if (unpresented != 0) { return 8; }
+    if (logbad != 0) { return 1; }
     return 95;
 }
 
@@ -443,7 +450,7 @@ fn mc_replay(path): i64 {
         if (rp_err == 5) {
             ps("mine-cart: "); ps(path); ps(" was recorded by simulation revision "); pn(rp_get16(buf + 6));
             ps(", and this build is revision "); pn(RP_SIM_REV); nl();
-            ps("           -- replay it with the build that recorded it (0.2.2 is revision 0)"); nl();
+            ps("           -- replay it with the build that recorded it (0.2.2 is revision 0, 0.2.3-0.3.1 is 1)"); nl();
             return 2;
         }
         ps("mine-cart: "); ps(path); ps(" is not a DEEPVEIN input log (reason "); pn(rp_err); ps(")"); nl();
@@ -490,10 +497,11 @@ fn mc_verify(frame, pilot): i64 {
     if (mc_fb_ok() == 0) { ps("mine-cart: cannot allocate the readback buffer"); nl(); return 7; }
     if (rr_fb_ok() == 0) { ps("mine-cart: cannot allocate the reference buffer"); nl(); return 7; }
 
-    # ⛔ POISON FIRST. A #86 slot is a fixed window per index and hands back the previous run's
-    # pixels, so an untouched buffer can read as a pass.
-    var i = 0;
-    while (i < MC_W * MC_H) { store32(mc_fb + i * 4, 0xA5A5A5A5); i = i + 1; }
+    # ⛔ POISON THE BACK BUFFER, NOT OUR COPY OF IT. This pattern used to be written into mc_fb, which
+    # #73 then overwrites in full, so it never survived to be counted and exit 88 could not happen.
+    # The frame's #85 clear carries it instead: op 0x0F replaces its whole rect, so any poison still
+    # there after the draw is a pixel the GPU never wrote.
+    mc_clear = 0xA5A5A5A5;
 
     if (mc_gpu_frame() != 1) {
         ps("mine-cart: frame refused -- #92 returned "); pn(mc_gpu_err);
@@ -510,7 +518,7 @@ fn mc_verify(frame, pilot): i64 {
     mc_gpu_free();
 
     var untouched = 0;
-    i = 0;
+    var i = 0;
     while (i < MC_W * MC_H) {
         if ((load32(mc_fb + i * 4) & 0xFFFFFFFF) == 0xA5A5A5A5) { untouched = untouched + 1; }
         i = i + 1;
@@ -632,7 +640,7 @@ fn main(): i64 {
             ps("  --sim        run the simulation headless and print telemetry (tuning)"); nl();
             ps("  --wav        render 20 s of the mix to /tmp/deepvein.wav and LISTEN to it"); nl();
             ps("  --pilot N    0 = hands off the controls, 1 = crude autopilot (--sim, --wav)"); nl();
-            ps("  --frames N   bound the ride, or the --sim run (0 = ride until ESC)"); nl();
+            ps("  --frames N   bound the ride (0 = ride until ESC), or the --sim run (must be > 0)"); nl();
             ps("  --record F   write every input word of the ride (or --sim run) to F, to replay"); nl();
             ps("  --replay F   re-run a recorded ride headless; exit 95 if it reproduces exactly"); nl();
             ps("  --trace      report every dropped triangle, for diagnosis"); nl();
@@ -654,6 +662,17 @@ fn main(): i64 {
     # and takes a different path on agnos, and if it ever returns nothing then argc() is 0 and every
     # flag silently vanishes — `--check` would quietly become a ride, which on a burn log is
     # indistinguishable from the gate having been skipped. One line removes that ambiguity.
+    # ⛔ TWO MODES IS A MISTAKE, NOT A PRECEDENCE RULE. `--check --record F` used to pass the gate and
+    # write no file, and `--sim --replay F` ran the sim and never looked at F; both looked like success.
+    var modes = check + verify + sim + wav;
+    if (replay != 0) { modes = modes + 1; }
+    if (modes > 1) {
+        ps("mine-cart: --check, --verify, --sim, --wav and --replay are separate modes -- pick one"); nl();
+        return 2;
+    }
+    if (record != 0) {
+        if (modes != sim) { ps("mine-cart: --record works with the ride or --sim"); nl(); return 2; }
+    }
     ps("mine-cart: argc "); pn(argc()); ps(" -- mode ");
     if (check == 1) { ps("CHECK (host gate, no GPU needed)"); nl(); return mc_check(); }
     if (verify == 1) {
@@ -669,7 +688,7 @@ fn main(): i64 {
     if (wav == 1) {
         ps("WAV (render the mix to /tmp/deepvein.wav so a person can hear it)"); nl();
         fx_sin_init();
-        wav_write("/tmp/deepvein.wav", 20, pilot);
+        if (wav_write("/tmp/deepvein.wav", 20, pilot) == 0) { return 1; }
         return 0;
     }
     ps("RIDE ("); pn(frames); ps(" frames");

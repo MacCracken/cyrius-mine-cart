@@ -17,7 +17,8 @@
 # masking the same way, at the same four draw-rect corners — and never looks at the values that
 # were passed in.
 #
-# ⚠ The mirror is agnos kernel/core/syscall.cyr gpo_validate_triperspec (:4857 at agnos 1.57.7).
+# ⚠ The mirror is agnos kernel/core/syscall.cyr gpo_validate_triperspec (:5526 at agnos 1.57.17, and
+#   re-compared against that source in the 0.3.2 audit).
 # Codes below are that file's GPO_E_* values; if the kernel renumbers, this is where it drifts.
 
 # load a 32-bit field SIGN-extended, as the kernel reads coordinates

@@ -430,7 +430,9 @@ fn trk_gen_one(): i64 {
                         if (pick == 0) { kind = KIND_GAP;  trk_gap_left = CFG_GAP_SEGS - 1; }
                         if (pick != 0) { kind = KIND_BEAM; }
                         if (fx_rand_n(100) < trk_haz_pair_pct()) {
-                            trk_haz_pair = CFG_HAZ_PAIR_SEGS;
+                            # ⚠ + 1 BECAUSE THE COUNTDOWN BELOW TICKS IN THIS SAME CALL. Without it the partner
+                            # lands one segment short, inside a crouch at the top speed (config.cyr).
+                            trk_haz_pair = CFG_HAZ_PAIR_SEGS + 1;
                             # the partner is always the OTHER verb — a gap-gap pair is just a wider gap
                             trk_haz_pair_kind = KIND_BEAM;
                             if (kind == KIND_BEAM) {
@@ -559,10 +561,10 @@ fn trk_reset(seed, chapter): i64 {
 # what crossing a segment boundary IS. Clamping it (the instinct, because the field is "a u16")
 # would pin the cart at the end of a segment forever. The carry is a WHILE, not an IF, so that a
 # speed high enough to cross two segments in one tick still lands correctly; at the design top speed
-# of 28.6 m/s that is 12203 sub-units a tick and a boundary every 5.4 ticks, so the second iteration
+# of 28.6 m/s that is 12208 sub-units a tick and a boundary every 5.4 ticks, so the second iteration
 # never runs today — but a speed tunable is exactly the kind of number that changes.
 #
-# ⚠ speed_sub is sub-units per tick. At 60 Hz: 8533 = 20.0 m/s, 12203 = 28.6 m/s (the design top).
+# ⚠ speed_sub is sub-units per tick. At 60 Hz: 8533 = 20.0 m/s, 12208 = 28.6 m/s (the design top).
 fn trk_advance(speed_sub): i64 {
     if (speed_sub < 0) { speed_sub = 0; }
     trk_pos_sub = trk_pos_sub + speed_sub;

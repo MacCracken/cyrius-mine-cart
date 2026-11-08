@@ -19,6 +19,45 @@ fn mc_mutation_verdict(want, name): i64 {
     return 1;
 }
 
+# ---- is any floor missing on purpose? ------------------------------------------------------------
+# 1 if a gap lies anywhere the camera can see — the one thing that may legitimately show background.
+# ⚠ The camera trails the cart by 124 ru (about 4 segments) and the far plane is 512 ru (16 segments).
+fn mc_gap_in_view(): i64 {
+    var s = 0 - 6;
+    while (s < 14) {
+        var a = trk_abs_seg + s;
+        if (trk_live(a) == 1) { if (trk_kind_at(a) == KIND_GAP) { return 1; } }
+        s = s + 1;
+    }
+    return 0;
+}
+
+# how many vertices sit on the u = 128 wrap, where an edge sample masks to column 0 (the ballast band)
+fn mc_ck_uwrap(list, n): i64 {
+    var c = 0;
+    var i = 0;
+    while (i < n) {
+        var j = 0;
+        while (j < 3) {
+            if (mc_i32(list + i * 64 + 12 + j * 20) >= MC_TEXFULL) { c = c + 1; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    return c;
+}
+
+# how many pixels of the frame rr_record just drew still hold op 0x0F's background
+fn mc_ck_holes(): i64 {
+    var n = 0;
+    var i = 0;
+    while (i < MC_W * MC_H) {
+        if ((load32(rr_fb + i * 4) & 0xFFFFFFFF) == MC_BG) { n = n + 1; }
+        i = i + 1;
+    }
+    return n;
+}
+
 # ---- the host gate ---------------------------------------------------------------------------
 # ⛔ THE ORDER HERE IS DELIBERATE AND IS THE LESSON OF THE RUNGS THIS GAME CONSUMES. The first
 # thing asserted is not "the records are correct" — it is that the gate CAN FAIL (the mutation at
@@ -77,7 +116,10 @@ fn mc_check(): i64 {
     var tris   = 0;
     var mincov = 999999;
     var mintop = 999999;
-    var maxlap = 0;
+    var holes = 0;
+    var holef = 0 - 1;
+    var holescan = 0;
+    var uwrap = 0;
     var mintri = 999999;
     var maxtri = 0;
     # ⛔ ACCUMULATE. mc_build RESETS the drop counters every frame, so reading them after the loop
@@ -96,9 +138,9 @@ fn mc_check(): i64 {
     # which is exactly the state where the accumulated centre line, the degenerate-sliver drops and
     # the coordinate window all actually get tested. Straight track is the one case that cannot fail.
     # ⛔⛔ THE GATE MUST PLAY THE GAME, NOT COAST THROUGH IT. This drove with cart_tick(0) — no
-    # input — which falls into the first gap at 87 m and restarts, forever. It therefore never
+    # input — which falls into the first gap at 89 m and restarts, forever. It therefore never
     # reached a 3-track section, and reported "over-budget 0" while real play was dropping 30
-    # triangles a frame and losing the cart entirely. A gate that only probes the opening 87 m of a
+    # triangles a frame and losing the cart entirely. A gate that only probes the opening 89 m of a
     # 500 m run is not measuring the game.
     # ⚠ cart_autopilot() is the same reference pilot --sim and the film tool use, so the gate, the
     # telemetry and the recorded video all traverse identical ground.
@@ -119,7 +161,7 @@ fn mc_check(): i64 {
         dr_refused = dr_refused + mc_refused;
         frames = frames + 1;
         mc_ck_list(&mc_vtx_a, mc_n_a);
-        if (mc_n_b != 0) { maxlap = maxlap + 1; }
+        uwrap = uwrap + mc_ck_uwrap(&mc_vtx_a, mc_n_a);
         if ((f % MC_COV_EVERY) == 0) {
             # background EXCLUDED — see mc_ck_cover's note
             var cov = mc_ck_cover(&mc_vtx_a, MC_BG_TRIS, mc_n_a);
@@ -127,15 +169,25 @@ fn mc_check(): i64 {
             var tcov = mc_ck_cover_rows(&mc_vtx_a, MC_BG_TRIS, mc_n_a, 0, MC_H / 2);
             if (tcov < mintop) { mintop = tcov; }
         }
+        # ⭐ EVERY PIXEL, NOT EVERY FOURTH. The coverage sweep samples, and a seam between two surfaces is
+        # one to three pixels wide: 0.3.1 had black slivers along the floor/wall join in 128 of 921 frames
+        # and the sweep never landed on one. With no gap in view there is no reason for any background.
+        if ((f % 2) == 1) {
+            if (mc_gap_in_view() == 0) {
+                rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
+                var hn = mc_ck_holes();
+                holescan = holescan + 1;
+                if (hn > holes) { holes = hn; holef = f; }
+            }
+        }
         f = f + 1;
     }
 
     # ---- ⭐ pass 1b: THE SAME RIDE PATH, AT THE REAL ON-SCREEN OFFSET -------------------------
-    # ⛔ |D| IS EVALUATED AT THE DRAW RECT'S CORNERS, AND THE RECT NO LONGER STARTS AT (0,0). The
-    # frame is now drawn straight to its place in the back buffer, so qx1/qy1 move outward with
-    # dstxy and |D| grows with them. Measuring only at the origin would understate the one bound
-    # this gate exists to enforce. 80/96 is an 800x600 console; 960/520 is 2560x1440, the largest
-    # this game can meet — and D grows with the offset, so passing there bounds every console between.
+    # The frame is drawn straight to its place in the back buffer, so run the same re-parse at the two
+    # offsets that matter: 80/96 is an 800x600 console and 960/520 is 2560x1440, the largest this game
+    # can meet. |D| itself turns out not to move (vertices and sample points shift together), which the
+    # emitter and the re-parse agreeing at every offset below is what shows.
     var saved_dx = MC_DX;
     var saved_dy = MC_DY;
     var oi = 0;
@@ -168,10 +220,16 @@ fn mc_check(): i64 {
     # more — curvature lives in the ring, so the only way to reach a hard-curving stretch is to ride
     # to one. Each probe advances the sim and then jams the cart to a wall, which exercises the
     # coordinate window against REAL accumulated centre-line offsets rather than invented ones.
+    # ⛔ THE AUTOPILOT DRIVES, AND A DEATH RESTARTS. This coasted on cart_tick(0), which is a no-op once
+    # the cart is dead — hands off it falls in the first gap, so 50 of these 60 frames sat at the first gap.
+    mc_cart_reset();
     var g = 0;
     while (g < 60) {
         var q = 0;
-        while (q < 17) { mc_cart_step(); q = q + 1; }
+        while (q < 17) {
+            if (cart_tick(cart_autopilot()) == 0) { cart_reset(cart_seed, cart_chapter); }
+            q = q + 1;
+        }
         var cx = 0;
         if ((g % 4) == 1) { cx = MC_TW - 2; }
         if ((g % 4) == 2) { cx = 2 - MC_TW; }
@@ -187,7 +245,6 @@ fn mc_check(): i64 {
         dr_refused = dr_refused + mc_refused;
         frames = frames + 1;
         mc_ck_list(&mc_vtx_a, mc_n_a);
-        if (mc_n_b != 0) { maxlap = maxlap + 1; }
         g = g + 1;
     }
 
@@ -199,8 +256,8 @@ fn mc_check(): i64 {
     # chamber and the nose build every third tick three times: on the rail, and jammed to either wall.
     # ⛔⛔ THIS PASS FOUND A 2x MARGIN THE FIRST TIME IT RAN: the dark mouth of the branch not taken, face-on
     # and mostly off screen as the nose reached the near plane, at |D| 819,686,400. The ride path had
-    # never leaned that way. It is why face-on geometry is clipped (mc_fo_emit), and why this runs at all
-    # three consoles: a receding surface's |D| grows with the rect's offset.
+    # never leaned that way. It is why face-on geometry is clipped (mc_fo_emit), and it runs at all three
+    # consoles because the clip and the cull are both against the rect, wherever the rect is.
     var fk_frames = 0;
     var fk_max = 0;
     var fsd_dx = MC_DX;
@@ -246,7 +303,6 @@ fn mc_check(): i64 {
                     frames = frames + 1;
                     fk_frames = fk_frames + 1;
                     mc_ck_list(&mc_vtx_a, mc_n_a);
-                    if (mc_n_b != 0) { maxlap = maxlap + 1; }
                     li = li + 1;
                 }
             }
@@ -284,14 +340,22 @@ fn mc_check(): i64 {
     ps("  optional detail refused for room: "); pn(dr_refused); ps(" times"); nl();
 
     # ---- the rule the geometry was designed around ------------------------------------------
-    ps("  peak |D| "); pn(mc_peak_d); ps(" of "); pn(MC_D_MAX);
-    ps(" permitted -- margin "); pn(MC_D_MAX / mc_peak_d); ps("x: ");
-    if (mc_peak_d <= MC_D_MAX) { ps("PASS"); nl(); }
-    if (mc_peak_d > MC_D_MAX) { ps("FAIL -- the batch would be refused GPO_E_DRANGE"); nl(); bad = bad + 1; }
+    # ⚠ ZERO MEANS NO TRIANGLE WAS EVER MEASURED, which is a failure and not a division to attempt.
+    if (mc_peak_d == 0) {
+        ps("  peak |D| is ZERO: FAIL -- no triangle was measured at all"); nl();
+        bad = bad + 1;
+    } else {
+        ps("  peak |D| "); pn(mc_peak_d); ps(" of "); pn(MC_D_MAX);
+        ps(" permitted -- margin "); pn(MC_D_MAX / mc_peak_d); ps("x: ");
+        if (mc_peak_d <= MC_D_MAX) { ps("PASS"); nl(); }
+        if (mc_peak_d > MC_D_MAX) { ps("FAIL -- the batch would be refused GPO_E_DRANGE"); nl(); bad = bad + 1; }
+    }
 
-    ps("  peak |N| "); pn(mc_peak_n); ps(" (a register PAIR in the shader; the bound is 2^62): ");
-    if (mc_peak_n <= 4611686018427387904) { ps("PASS"); nl(); }
-    if (mc_peak_n > 4611686018427387904) { ps("FAIL"); nl(); bad = bad + 1; }
+    # ⚠ THE VALIDATOR PERMITS 2^62 BUT tri_persp.s's RESTORING DIVIDE RUNS 56 ITERATIONS, so 2^56 is what
+    # this game can actually rely on — a numerator above it would be accepted and then divide wrong.
+    ps("  peak |N| "); pn(mc_peak_n); ps(" (the shader divides 56 bits, the validator allows 2^62): ");
+    if (mc_peak_n < 72057594037927936) { ps("PASS"); nl(); }
+    if (mc_peak_n >= 72057594037927936) { ps("FAIL"); nl(); bad = bad + 1; }
 
     # ---- the re-parse verdict ---------------------------------------------------------------
     ps("  re-parsed every packed record by the kernel's rules: ");
@@ -354,9 +418,11 @@ fn mc_check(): i64 {
     # ⇒ Two measurements now, because the two halves of the frame have different honest answers:
     #    the TOP half is roof, arch and far wall on every frame this game can produce (a gap is a hole
     #    in the FLOOR, and the floor never climbs above the horizon), so anything short of total is a
-    #    rendering hole. Measured over all 900 ride frames: 100% on every one. Held at 99%.
-    #    the WHOLE frame may legitimately show background through a gap under the cart. Measured
-    #    worst over all 900: 87.6%. Held at 75%.
+    #    rendering hole. Sampled over all 900 ride frames at 0.3.2: 100% on every one. Held at 99%.
+    #    the WHOLE frame may legitimately show background through a gap under the cart. Sampled worst
+    #    over all 900 at 0.3.2: 88.8%. Held at 75%.
+    # ⚠ THE GATE ITSELF SWEEPS EVERY 24th FRAME (MC_COV_EVERY): all 900 takes 89 s against the gate's 7. The
+    #    every-pixel hole check below is what looks at the frames between.
     var total = (MC_W / MC_CK_STEP) * (MC_H / MC_CK_STEP);
     ps("  coverage: worst top half "); pn(mintop); ps(" of "); pn(total / 2);
     ps(" samples (roof and walls: must be ~all of it): ");
@@ -367,6 +433,16 @@ fn mc_check(): i64 {
     ps("    -- LEGAL AND EMPTY is the failure a burn cannot tell from a refused batch: ");
     if (mincov * 4 >= total * 3) { ps("PASS"); nl(); }
     if (mincov * 4 < total * 3) { ps("FAIL -- the tunnel does not fill the screen"); nl(); bad = bad + 1; }
+    ps("  holes: "); pn(holescan); ps(" ride frames with no gap in view, every pixel checked, worst shows ");
+    pn(holes); ps(" of background: ");
+    if (holescan == 0) { ps("FAIL -- nothing was checked"); nl(); bad = bad + 1; }
+    if (holescan != 0) {
+        if (holes == 0) { ps("PASS"); nl(); }
+        if (holes != 0) { ps("FAIL at frame "); pn(holef); ps(" -- a seam in the geometry"); nl(); bad = bad + 1; }
+    }
+    ps("  texture: "); pn(uwrap); ps(" vertices on the u = 128 wrap: ");
+    if (uwrap == 0) { ps("PASS"); nl(); }
+    if (uwrap != 0) { ps("FAIL -- their edge samples read the ballast band"); nl(); bad = bad + 1; }
 
     # ---- ⭐⭐ THE FRAME MUST BE EXACTLY ONE RECORD ------------------------------------------
     # ⛔ THIS GATE EXISTS BECAUSE 0.1.0 SHIPPED TWO AND IT COST AN IRON FRAME. op 0x0F REPLACES its
@@ -374,10 +450,11 @@ fn mc_check(): i64 {
     # unconditionally — so a second record over the same rect paints opaque black over everything
     # the first drew. The first burn showed the walls and nothing else. Records do not layer, and
     # nothing in the ABI says so; the only defence is to assert it here.
-    ps("  the frame is ONE op 0x0F record ("); pn(maxlap);
-    ps(" frames emitted a second list): ");
-    if (maxlap == 0) { ps("PASS -- op 0x0F REPLACES its rect, so records cannot be layered"); nl(); }
-    if (maxlap != 0) {
+    # ⚠ THIS MEASURES THE COUNT THE DISPATCH PASSES. It used to count frames with a non-empty second list,
+    #   a variable nothing ever set, so it could not fail.
+    ps("  the frame is ONE op 0x0F record ("); pn(MC_OPS_PER_FRAME); ps(" dispatched to #92): ");
+    if (MC_OPS_PER_FRAME == 1) { ps("PASS -- op 0x0F REPLACES its rect, so records cannot be layered"); nl(); }
+    if (MC_OPS_PER_FRAME != 1) {
         ps("FAIL -- a second record would black out the first"); nl();
         bad = bad + 1;
     }
@@ -397,18 +474,25 @@ fn mc_check(): i64 {
     mc_cart_to(60);
     mc_build(cart_cam_x());
     var n0 = mc_n_a;
-    var probe0x = mc_i32(&mc_vtx_a + 0) >>> 16;
-    var probe0y = mc_i32(&mc_vtx_a + 4) >>> 16;
-    var lastx = mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16;
+    # ⚠ a copy of the whole list: this used to compare three values and claim every vertex
+    var vc = 0;
+    while (vc < n0 * 16) { store32(&mc_vtx_b + vc * 4, load32(&mc_vtx_a + vc * 4)); vc = vc + 1; }
     MC_DX = 80; MC_DY = 96;
     mc_cart_to(60);
     mc_build(cart_cam_x());
     var shifted = 0;
     if (mc_n_a == n0) {
-        if ((mc_i32(&mc_vtx_a + 0) >>> 16) - probe0x == 80) {
-            if ((mc_i32(&mc_vtx_a + 4) >>> 16) - probe0y == 96) {
-                if ((mc_i32(&mc_vtx_a + (n0 - 1) * 64 + 40) >>> 16) - lastx == 80) { shifted = 1; }
+        if (n0 > 0) { shifted = 1; }
+        var vi = 0;
+        while (vi < n0) {
+            var vj = 0;
+            while (vj < 3) {
+                var vo = vi * 64 + vj * 20;
+                if ((mc_i32(&mc_vtx_a + vo) >>> 16) - (mc_i32(&mc_vtx_b + vo) >>> 16) != 80) { shifted = 0; }
+                if ((mc_i32(&mc_vtx_a + vo + 4) >>> 16) - (mc_i32(&mc_vtx_b + vo + 4) >>> 16) != 96) { shifted = 0; }
+                vj = vj + 1;
             }
+            vi = vi + 1;
         }
     }
     MC_DX = fdx; MC_DY = fdy;

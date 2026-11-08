@@ -63,16 +63,15 @@ fn main(): i64 {
             log = file_read_whole(argv(2), &lenb);
             loglen = load64(&lenb);
             if (log == 0) { ps("film: cannot read "); ps(argv(2)); nl(); return 2; }
-            if (loglen < RP_HDR + RP_TRAILER) { ps("film: not an input log"); nl(); return 2; }
-            if (load8(log) != 68) { ps("film: not an input log"); nl(); return 2; }
-            if (loglen != RP_HDR + rp_get32(log + 16) * 2 + RP_TRAILER) {
-                ps("film: damaged input log"); nl(); return 2;
-            }
-            # ⭐ another simulation's log would film a different ride — say so (see RP_SIM_REV)
-            if (rp_get16(log + 6) != RP_SIM_REV) {
-                ps("film: that ride was recorded by simulation revision "); pn(rp_get16(log + 6));
-                ps(" and this build is revision "); pn(RP_SIM_REV);
-                ps(" -- film it with the build that recorded it"); nl();
+            # ⭐ the same checks --replay makes, and another simulation's log is named (see RP_SIM_REV)
+            if (rp_check(log, loglen) < 0) {
+                if (rp_err == 5) {
+                    ps("film: that ride was recorded by simulation revision "); pn(rp_get16(log + 6));
+                    ps(" and this build is revision "); pn(RP_SIM_REV);
+                    ps(" -- film it with the build that recorded it"); nl();
+                    return 2;
+                }
+                ps("film: not a usable input log (reason "); pn(rp_err); ps(")"); nl();
                 return 2;
             }
         }
@@ -81,6 +80,7 @@ fn main(): i64 {
     var pilot   = film_arg(2, 1);
     if (log != 0) { seconds = 1; pilot = 0; }
     if (seconds < 1) { ps("film: seconds must be a whole number >= 1"); nl(); return 2; }
+    if (seconds > 86400) { ps("film: at most a day of video (86400 s)"); nl(); return 2; }
     if (pilot < 0) { ps("film: pilot must be 0 or 1"); nl(); return 2; }
     if (pilot > 1) { ps("film: pilot must be 0 or 1"); nl(); return 2; }
     if (rr_fb_ok() == 0) { ps("film: cannot allocate the frame buffer"); nl(); return 1; }
@@ -127,7 +127,11 @@ fn main(): i64 {
         # ⛔ rr_record, NOT rr_list — an op 0x0F record REPLACES its whole rect with background first,
         # and a reference that writes only covered pixels is MORE FORGIVING THAN THE HARDWARE.
         rr_record(&mc_vtx_a, mc_n_a, &mc_tex_a);
-        sys_write(fd, rr_fb, MC_W * MC_H * 4);
+        if (sys_write(fd, rr_fb, MC_W * MC_H * 4) != MC_W * MC_H * 4) {
+            ps("film: could NOT write frame "); pn(f); ps(" to /tmp/mc_film.raw"); nl();
+            file_close(fd);
+            return 1;
+        }
 
         # ⚠ Report the SLIP, not just the position. A frame log that shows only depth and speed
         # cannot distinguish "riding well" from "about to lose it", which is the whole thing the
@@ -157,18 +161,23 @@ fn main(): i64 {
         f = f + 1;
     }
     file_close(fd);
+    var diverged = 0;
     if (log != 0) {
-        # ⭐ PROVE THE VIDEO IS OF THAT RIDE: the same two hashes --replay checks
+        # ⭐ PROVE THE VIDEO IS OF THAT RIDE: the same two hashes --replay checks, the same verdict
         var want_s = rp_get32(log + RP_HDR + frames * 2);
         var want_f = rp_get32(log + RP_HDR + frames * 2 + 4);
+        var got_f = rp_canon_hash();
+        if (rp_hash != want_s) { diverged = 1; }
+        if (got_f != want_f) { diverged = 1; }
         ps("film: state hash "); pn(rp_hash); ps(" (recorded "); pn(want_s); ps("), frame hash ");
-        pn(rp_frame_hash()); ps(" (recorded "); pn(want_f); ps(") -- ");
-        if (rp_hash == want_s) { if (rp_frame_hash() == want_f) { ps("the film IS the recorded ride"); nl(); } }
-        if (rp_hash != want_s) { ps("DIVERGED"); nl(); }
+        pn(got_f); ps(" (recorded "); pn(want_f); ps(") -- ");
+        if (diverged == 0) { ps("the film IS the recorded ride"); nl(); }
+        if (diverged != 0) { ps("DIVERGED"); nl(); }
     }
 
     ps("film: done -- "); pn(trk_depth_m()); ps(" m, "); pn(cart_apex_hits);
     ps(" apexes, "); pn(derails); ps(" deaths"); nl();
+    if (diverged != 0) { return 90; }
     return 0;
 }
 

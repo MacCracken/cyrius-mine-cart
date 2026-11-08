@@ -58,7 +58,7 @@ fn trt_carry(): i64 {
     trt_eq("65537 -> +1 seg", trk_abs_seg - seg0, 1);
     trt_eq("65537 -> sub 1", trk_pos_sub, 1);
 
-    # ⚠ MULTI-CARRY. Unreachable at the design top speed (12203 sub/tick) but the loop must be a
+    # ⚠ MULTI-CARRY. Unreachable at the design top speed (12208 sub/tick) but the loop must be a
     # WHILE, because a speed tunable is exactly the sort of number that gets raised later.
     trk_reset(CFG_SEED_DEFAULT, 0);
     seg0 = trk_abs_seg;
@@ -94,8 +94,8 @@ fn trt_distance(): i64 {
 # ---- ⛔ THE u16 WRAP — THE TEST THAT JUSTIFIES THE 128-SLOT RING -----------------------------------
 # Drive the absolute segment counter through 65535 -> 65536 and require the ring slot to stay
 # CONTINUOUS. Under `% 96` this is where the world jumps 64 segments sideways.
-# ⚠ This walks 65540 segments, which is why it steps the counter directly rather than at 60 Hz —
-# reaching this point in real play takes 2 h 20 min, which is exactly why it has to be tested here.
+# ⚠ Reaching this point in real play takes hours, which is exactly why it has to be tested here: the slot
+# function is checked directly, and then the generator is really driven across the wrap, one segment a call.
 fn trt_wrap(): i64 {
     # the slot function must be continuous everywhere, including across the u16 boundary
     var discontinuities = 0;
@@ -124,18 +124,22 @@ fn trt_wrap(): i64 {
     # ...while the authoritative counter does not
     trt_eq("abs counter does not wrap", trk_abs_seg, 65536);
 
-    # ⛔⛔ THE DEMONSTRATION THAT JUSTIFIES THE WHOLE DESIGN. This asserts that indexing the ring off
-    # the u16 VIEW is discontinuous exactly where indexing off the absolute counter is not. It is
-    # written as an assertion rather than a comment because the comment is what somebody deletes
-    # when they "simplify" trk_slot to take pos_seg — this fails the moment they do.
-    #   65535 -> 0 is one segment forward, so a correct index must step by exactly one slot.
-    var u16_before = 65535 % 96;          # what a modulo ring indexed by pos_seg would give at 65535
-    var u16_after  = 0 % 96;              # ...and one segment later, after the u16 wraps
-    trt_true("indexing off the u16 view TELEPORTS the ring",
-      ((u16_before + 1) % 96) != u16_after);
-    # the absolute counter, over the same one-segment step, does not
-    trt_true("indexing off the absolute counter does not",
-      ((trk_slot(65535) + 1) & CFG_RING_MASK) == trk_slot(65536));
+    # ⛔⛔ THE DEMONSTRATION THAT JUSTIFIES THE WHOLE DESIGN: a segment laid BEFORE the wrap must still read
+    # back the same AFTER it, with the cart really having ridden across. This used to compare two
+    # literals, which could not fail whatever trk_slot did.
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    while (trk_abs_seg < 65530) { trk_advance(CFG_SUB_PER_SEG); }
+    var kept_curve = trk_curve_at(65540);
+    var kept_kind = trk_kind_at(65540);
+    trt_true("the segment past the wrap is laid before the cart gets there", trk_live(65540));
+    var dark = 0;
+    while (trk_abs_seg < 65540) {
+        trk_advance(CFG_SUB_PER_SEG);
+        if (trk_live(trk_abs_seg) != 1) { dark = dark + 1; }
+    }
+    trt_eq("the ring under the cart stays live across the wrap", dark, 0);
+    trt_eq("a curve laid before the wrap reads the same after it", trk_curve_at(65540), kept_curve);
+    trt_eq("a hazard laid before the wrap reads the same after it", trk_kind_at(65540), kept_kind);
     return 0;
 }
 
@@ -164,8 +168,9 @@ fn trt_determinism(): i64 {
     trt_eq("same seed replays the same track", a, b);
 
     # ⚠ and it must still hold after an UNRELATED chapter has been generated in between — this is
-    # the death-and-retry path, and it is where leftover generator state would show up.
-    trt_stream_sum(CFG_SEED_DEFAULT, 7, 250);
+    # the death-and-retry path, and it is where leftover generator state would show up. Long enough
+    # (about 156 segments) to take the intervening chapter past its first fork at segment 110.
+    trt_stream_sum(CFG_SEED_DEFAULT, 7, 1200);
     var c = trt_stream_sum(CFG_SEED_DEFAULT, 0, 400);
     trt_eq("replay survives an intervening chapter", a, c);
 
@@ -248,7 +253,7 @@ fn trt_liveness(): i64 {
     var missing = 0;
     t = 0;
     while (t < 1200) {
-        trk_advance(12203);                    # design TOP speed, the worst case for streaming
+        trk_advance(CFG_SPEED_MAX);                  # design TOP speed, the worst case for streaming
         var k = 0;
         while (k <= 16) {
             if (trk_live(trk_abs_seg + k) == 0) { missing = missing + 1; }

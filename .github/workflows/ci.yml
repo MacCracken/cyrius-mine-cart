@@ -37,8 +37,9 @@ jobs:
         run: cyrius deps --verify
 
       - name: Build all targets
-        # An undefined function is only a warning: it compiles to a ud2 stub and
-        # the build still exits 0, even with --strict. So fail on the text.
+        # A reachable undefined function is already a build error, but an
+        # unreachable one is only a warning and the build exits 0. Fail on the
+        # text too, so a call left dangling in dead code cannot accumulate.
         run: |
           set -eo pipefail
           log="$RUNNER_TEMP/build.log"

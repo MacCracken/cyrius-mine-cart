@@ -33,6 +33,10 @@ var mc_slot_ta = 0;
 var mc_slot_fb = 0;
 var mc_gpu_up  = 0;
 var mc_gpu_err = 0;        # last -((idx<<8)|reason) from #92, unpacked below
+var mc_clear   = 0;        # the colour #85 clears the back buffer to; --verify sets a poison pattern
+# ⛔ HOW MANY RECORDS ONE FRAME HANDS #92, AND THE LENGTH THE DISPATCH PASSES. The gate asserts this is
+# 1 — op 0x0F replaces its rect, so a second record would black out the first.
+var MC_OPS_PER_FRAME = 1;
 
 # the draw rect in bytes: 640 x 400 x 4
 fn mc_fb_bytes(): i64 { return MC_W * MC_H * 4; }
@@ -73,6 +77,17 @@ var mc_fbw = 0;
 var mc_fbh = 0;
 
 #ifdef CYRIUS_TARGET_AGNOS
+# the back buffer's real stride from #89, or 0 if the double buffer is not armed
+fn mc_bb_pitch(): i64 {
+    var caps[32];                                      # ⚠ LOCAL: 32 bytes, its own function on purpose
+    var i = 0;
+    while (i < 32) { store8(&caps + i, 0); i = i + 1; }
+    if (syscall(89, &caps, 32) != 0) { return 0; }
+    if ((load32(&caps + 0) & 2) == 0) { return 0; }    # flags bit1: double buffer armed
+    return load32(&caps + 4) & 0xFFFFFFFF;
+}
+
+# ask the kernel for the console geometry and centre the draw rect in it
 fn mc_fbinfo(): i64 {
     var info[24];
     var i = 0;
@@ -87,6 +102,18 @@ fn mc_fbinfo(): i64 {
     # 100 is NOT a multiple of 8. Masking gives (80,96): four pixels above centre, and legal.
     MC_DX = ((mc_fbw - MC_W) / 2) & 0xFFFFFFF8;
     MC_DY = ((mc_fbh - MC_H) / 2) & 0xFFFFFFF8;
+    # ⛔ #38 DESCRIBES THE CONSOLE; #92 DRAWS INTO THE BACK BUFFER, WHOSE STRIDE COMES FROM boot_info. On a
+    # boot where the two differ the rows land at one pitch and scan out at another: a garbled panel that
+    # #92, #84 and even --verify all report as success, because the readback uses the same wrong stride.
+    # The cause is the kernel's; all a program can do is say so where a person will see it.
+    var bbp = mc_bb_pitch();
+    var fbp = load32(&info + 8) & 0xFFFFFFFF;
+    if (bbp != 0) {
+        if (bbp != fbp) {
+            ps("mine-cart: WARNING -- back-buffer stride "); pn(bbp); ps(" != console stride "); pn(fbp); nl();
+            ps("           the panel will be garbled on this boot (a kernel geometry mismatch, #89 vs #38)"); nl();
+        }
+    }
     return 1;
 }
 #else
@@ -128,11 +155,11 @@ fn mc_gpu_frame(): i64 {
     # ⛔ CLEAR THE WHOLE BACK BUFFER FIRST. The draw rect is 640x400 inside an 800x600 buffer, and
     # the surround is never written by op 0x0F. Without this it holds whatever the PREVIOUS use of
     # this buffer left — and since #84 flips between two buffers, that is frame N-2, which flickers.
-    syscall(85, 0, 0, 0);
+    syscall(85, mc_clear, 0, 0);
 
     var d[64];                                         # ⚠ LOCAL: 64 BYTES, exactly one record
     mc_pack_op(&d, mc_slot_ta, mc_slot_va, mc_n_a);
-    var rc = syscall(92, &d, 64);
+    var rc = syscall(92, &d, MC_OPS_PER_FRAME * 64);
     if (rc != 0) { mc_gpu_err = rc; return 0; }
     return 1;
 }

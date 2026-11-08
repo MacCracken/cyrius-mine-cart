@@ -42,6 +42,7 @@ fn main(): i64 {
     # rebases to rect-local, so the rendered IMAGE must be byte-identical for every dstxy. If it is
     # not, the game and the kernel disagree about the coordinate frame — which is exactly the defect
     # that nearly went to iron.
+    if (argc() == 3) { ps("refrender: an offset needs both dx and dy"); nl(); return 2; }
     if (argc() > 3) {
         var vx = mc_atoi(argv(2));
         var vy = mc_atoi(argv(3));
@@ -75,7 +76,10 @@ fn main(): i64 {
     ps("  "); pn(rr_drawn); ps(" pixel writes (overdraw included) over a "); pn(MC_W * MC_H);
     ps("-pixel rect"); nl();
 
-    file_write_all("/tmp/mc_ref.raw", rr_fb, MC_W * MC_H * 4);
+    if (file_write_all("/tmp/mc_ref.raw", rr_fb, MC_W * MC_H * 4) != MC_W * MC_H * 4) {
+        ps("refrender: could NOT write /tmp/mc_ref.raw"); nl();
+        return 1;
+    }
     ps("  wrote /tmp/mc_ref.raw ("); pn(MC_W); ps("x"); pn(MC_H); ps(" BGRA)"); nl();
     return 0;
 }

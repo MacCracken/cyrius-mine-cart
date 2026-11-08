@@ -239,22 +239,26 @@ fn ctt_lean(): i64 {
     while (t < 40) { cart_tick(0); t = t + 1; }
     ctt_true("left bend pushes the cart RIGHT", cart_lean > 0);
 
-    # ⭐ SPEED SQUARED: the same bend at half speed must push MUCH less than half as hard.
-    # This is the property the whole risk/reward of the brake rests on.
-    ctt_track(CFG_CURVE_MAX);
-    t = 0;
-    while (t < 240) { cart_tick(0); t = t + 1; }        # get to full speed first
+    # ⭐ SPEED SQUARED: the same bend at half speed must push a QUARTER as hard. This is the property the
+    # whole risk/reward of the brake rests on.
+    # ⛔ MEASURED ON THE FORCE ITSELF. This compared two rides' lean, one slipping and one braking down
+    # to a quarter speed, so it passed with the exponent changed to 1 or to 3.
     ctt_track(CFG_CURVE_MAX);
     cart_speed = CFG_SPEED_MAX << 16;
-    t = 0;
-    while (t < 30) { cart_tick(0); t = t + 1; }
-    var lean_fast = fx_abs(cart_lean);
-    ctt_track(CFG_CURVE_MAX);
+    var lat_fast = fx_abs(cart_lat(CFG_CURVE_MAX));
     cart_speed = (CFG_SPEED_MAX / 2) << 16;
-    t = 0;
-    while (t < 30) { cart_tick(IN_BRAKE); t = t + 1; }  # hold it near half speed
-    var lean_slow = fx_abs(cart_lean);
-    ctt_true("half speed pushes far less than half as hard", lean_slow * 2 < lean_fast);
+    var lat_half = fx_abs(cart_lat(CFG_CURVE_MAX));
+    ctt_true("a bend pushes at all", lat_half > 0);
+    ctt_true("half speed pushes a quarter as hard (upper)", lat_half * 400 <= lat_fast * 101);
+    ctt_true("half speed pushes a quarter as hard (lower)", lat_half * 400 >= lat_fast * 99);
+
+    # ⛔ "FRAME N" IS THE RIDE'S FRAME N: tick, then draw, so N + 1 ticks from the gate, a death restarting
+    #   it. Hands off the cart dies at about tick 238, so frame 900 is well into a later life.
+    mc_cart_to(10);
+    ctt_eq("frame 10 is 11 ticks from the gate", cart_ticks, 11);
+    mc_cart_to(900);
+    ctt_eq("a frame past a death is a restarted ride, not a frozen one", cart_dead, 0);
+    ctt_true("...in a later life", cart_ticks < 900);
 
     # ⛔ AN UNATTENDED HARD BEND MUST KILL. If it does not, the derail rule is decoration.
     ctt_track(CFG_CURVE_MAX);
@@ -301,7 +305,7 @@ fn ctt_lean(): i64 {
     # of the grip model and an earlier version of this test was asserting the opposite. What is still
     # true, and worth pinning, is that the clock is CONSECUTIVE: come back inside and it zeroes, so a
     # long clean run is never more fragile than a short one.
-    # ⚠ Curve 500 at the throttle cap gives ~1699 of lateral force against ~1754 of grip: enough to
+    # ⚠ Curve 500 at the throttle cap gives ~3454 of lateral force against ~3707 of grip: enough to
     # push the cart wide, not enough to let go.
     ctt_track(500);
     t = 0;
@@ -635,6 +639,37 @@ fn ctt_placement(): i64 {
       CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_CROUCH_TICKS);
     ctt_true("pair spacing exceeds the jump",
       CFG_HAZ_PAIR_SEGS * CFG_SUB_PER_SEG / CFG_SPEED_MAX > CFG_JUMP_TICKS);
+
+    # ⛔ AND THE GENERATOR HAS TO LAY THEM THAT FAR APART. The two above do arithmetic on the constant, and
+    #   passed for as long as the countdown placed the partner one segment short. Two hazards closer
+    #   together than the ordinary minimum are a stacked pair; measure every one in a long walk.
+    trk_reset(CFG_SEED_DEFAULT, 0);
+    var last = 0 - 1;
+    var pairs = 0;
+    var wrong = 0;
+    var was_gap = 0;
+    a = 0;
+    while (a < 6000) {
+        var hk = trk_kind_at(trk_abs_seg);
+        var starts = 0;
+        if (hk == KIND_BEAM) { starts = 1; }
+        if (hk == KIND_GAP) { if (was_gap == 0) { starts = 1; } }
+        was_gap = 0;
+        if (hk == KIND_GAP) { was_gap = 1; }
+        if (starts == 1) {
+            if (last >= 0) {
+                if (trk_abs_seg - last < CFG_HAZ_GAP_MIN / 2) {
+                    pairs = pairs + 1;
+                    if (trk_abs_seg - last != CFG_HAZ_PAIR_SEGS) { wrong = wrong + 1; }
+                }
+            }
+            last = trk_abs_seg;
+        }
+        trk_advance(CFG_SUB_PER_SEG);
+        a = a + 1;
+    }
+    ctt_true("a long walk has stacked pairs to measure", pairs > 0);
+    ctt_eq("every stacked pair is laid CFG_HAZ_PAIR_SEGS apart", wrong, 0);
     return 0;
 }
 

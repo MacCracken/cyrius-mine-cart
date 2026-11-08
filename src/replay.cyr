@@ -24,7 +24,7 @@
 #    16  u32 ticks              the number of words that follow
 #    20  u16 word[ticks]        exactly the words cart_tick() was handed, in order
 #     .  u32 state hash         over every tick (see rp_state)
-#     .  u32 frame hash         the final frame's packed op 0x0F triangle list
+#     .  u32 frame hash         the final frame's packed op 0x0F triangle list, built at draw offset (0,0)
 # The words are the SIMULATION's input: IN_QUIT never reaches cart_tick, so it is never recorded.
 
 var RP_HDR     = 20;
@@ -36,11 +36,14 @@ var RP_MAX_TICKS = 216000;          # one hour at 60 Hz — 432 KB of words
 # — which reads exactly like a determinism bug in the build that recorded it. Forks (step 6) changed the
 # track from 230 m on, so every 0.2.2 log would "diverge" here. Refusing it by name instead points the
 # person at the right build rather than at a bug that is not there.
-# ⚠ Bump this whenever the simulation changes what a given (seed, words) produces. It sits in what 0.2.2
-#   wrote as a reserved zero, so revision 0 is exactly the 0.2.2 simulation.
-var RP_SIM_REV = 1;                 # 1 = forks
+# ⚠ Bump this whenever the simulation changes what a given (seed, words) produces — or the renderer
+#   changes the final frame, because its hash is in the log too. It sits in what 0.2.2 wrote as a
+#   reserved zero, so revision 0 is exactly the 0.2.2 simulation.
+var RP_SIM_REV = 2;                 # 1 = forks, 2 = 0.3.2 (hazard-pair spacing, floor and wall edges)
 
 var rp_buf   = 0;                   # the log being recorded (heap)
+var rp_cap_frame = 0;               # the canonical frame hash, taken the tick the log filled
+var rp_sealed_frame = 0;            # the frame hash rp_end wrote into the log
 var rp_ticks = 0;
 var rp_on    = 0;                   # 1 while recording
 var rp_hash  = 0;                   # the running state hash of the ride being recorded or replayed
@@ -101,6 +104,23 @@ fn rp_frame_hash(): i64 {
     return h;
 }
 
+# ⛔⛔ THE FRAME HASH IS TAKEN AT DRAW OFFSET (0,0), WHATEVER CONSOLE THE RIDE WAS ON. Vertices are
+# framebuffer-absolute, so the same frame on an 800x600 console (offset 80,96) packs different bytes than
+# on a 640x400 host. This hashed whatever the ride had built, so every ride recorded on a console larger
+# than the frame reported DIVERGED on a host, with the state hash matching — and "record on the hardware,
+# replay on a host" is the reason this file exists.
+fn rp_canon_hash(): i64 {
+    var dx = MC_DX;
+    var dy = MC_DY;
+    MC_DX = 0;
+    MC_DY = 0;
+    mc_build(cart_cam_x());
+    var h = rp_frame_hash();
+    MC_DX = dx;
+    MC_DY = dy;
+    return h;
+}
+
 # ---- little-endian field access -------------------------------------------------------------------
 fn rp_put16(p, v): i64 { store8(p, v & 255); store8(p + 1, (v >>> 8) & 255); return 0; }
 # store a little-endian u32
@@ -134,6 +154,9 @@ fn rp_note(word): i64 {
     rp_put16(rp_buf + RP_HDR + rp_ticks * 2, word & 65535);
     rp_ticks = rp_ticks + 1;
     rp_hash = rp_state(rp_hash);
+    # ⛔ THE LOG STOPS HERE EVEN IF THE RIDE DOES NOT, so its frame must be this tick's. Hashing the ride's
+    # real last frame made any ride over an hour fail its own replay with the state hash matching.
+    if (rp_ticks == RP_MAX_TICKS) { rp_cap_frame = rp_canon_hash(); }
     return 1;
 }
 
@@ -143,7 +166,9 @@ fn rp_end(): i64 {
     rp_put32(rp_buf + 16, rp_ticks);
     var t = rp_buf + RP_HDR + rp_ticks * 2;
     rp_put32(t, rp_hash);
-    rp_put32(t + 4, rp_frame_hash());
+    rp_sealed_frame = rp_cap_frame;
+    if (rp_ticks < RP_MAX_TICKS) { rp_sealed_frame = rp_canon_hash(); }
+    rp_put32(t + 4, rp_sealed_frame);
     rp_on = 0;
     return RP_HDR + rp_ticks * 2 + RP_TRAILER;
 }
@@ -155,8 +180,8 @@ var rp_want_state = 0;
 var rp_want_frame = 0;
 var rp_got_frame  = 0;
 
-# replay a log: 1 = both recorded hashes reproduced, 0 = diverged, -1 = not a log
-fn rp_run(buf, len): i64 {
+# is this a log this build can replay? its tick count, or -1 with rp_err saying why not
+fn rp_check(buf, len): i64 {
     rp_err = 0;
     if (len < RP_HDR + RP_TRAILER) { rp_err = 1; return 0 - 1; }                 # too short
     if (load8(buf + 0) != 68) { rp_err = 2; return 0 - 1; }                    # "DVRP"
@@ -165,11 +190,18 @@ fn rp_run(buf, len): i64 {
     if (load8(buf + 3) != 80) { rp_err = 2; return 0 - 1; }
     if (rp_get16(buf + 4) != 1) { rp_err = 3; return 0 - 1; }                  # version
     if (rp_get16(buf + 6) != RP_SIM_REV) { rp_err = 5; return 0 - 1; }         # another simulation
+    var n = rp_get32(buf + 16);
+    if (n > RP_MAX_TICKS) { rp_err = 4; return 0 - 1; }
+    if (len != RP_HDR + n * 2 + RP_TRAILER) { rp_err = 4; return 0 - 1; }       # count vs size
+    return n;
+}
+
+# replay a log: 1 = both recorded hashes reproduced, 0 = diverged, -1 = not a log
+fn rp_run(buf, len): i64 {
+    var ticks = rp_check(buf, len);
+    if (ticks < 0) { return 0 - 1; }
     var seed    = rp_get32(buf + 8);
     var chapter = rp_get32(buf + 12);
-    var ticks   = rp_get32(buf + 16);
-    if (ticks > RP_MAX_TICKS) { rp_err = 4; return 0 - 1; }
-    if (len != RP_HDR + ticks * 2 + RP_TRAILER) { rp_err = 4; return 0 - 1; }   # count vs size
     rp_want_state = rp_get32(buf + RP_HDR + ticks * 2);
     rp_want_frame = rp_get32(buf + RP_HDR + ticks * 2 + 4);
 
@@ -185,8 +217,7 @@ fn rp_run(buf, len): i64 {
         rp_hash = rp_state(rp_hash);
         t = t + 1;
     }
-    mc_build(cart_cam_x());
-    rp_got_frame = rp_frame_hash();
+    rp_got_frame = rp_canon_hash();
     if (rp_hash != rp_want_state) { return 0; }
     if (rp_got_frame != rp_want_frame) { return 0; }
     return 1;
@@ -223,6 +254,16 @@ fn rpt_record(ticks): i64 {
     return rp_end();
 }
 
+# leave every piece of state a chapter restart has to clear in a value it would not have after one
+fn rpt_dirty(): i64 {
+    cart_speed = 1;  cart_lean = 77 << 16;  cart_lean_vel = 5;  cart_derail = 3;  cart_dead = 1;
+    cart_bonus = 777 << 16;  cart_ticks = 9;  cart_prev_curve = 99;  cart_apex_armed = 1;
+    cart_slip = 1;  cart_crouch = 5;  cart_air = 4;  cart_integrity = 1;  cart_score = 9;  cart_treasure = 9;
+    trk_fork_at = 999;  trk_fork_side = 0 - 1;  trk_fork_lock = 1;  trk_branch = 1;  trk_branch_left = 40;
+    trk_haz_next = 3;  trk_haz_pair = 2;
+    return 0;
+}
+
 # the replay suite, run by --check; returns the number of failed assertions
 fn rp_selftest(): i64 {
     rpt_fail = 0;
@@ -248,11 +289,77 @@ fn rp_selftest(): i64 {
     while (i < MC_W * MC_H) { rep_px = rp_mix(rep_px, load32(rr_fb + i * 4) & 0xFFFFFFFF); i = i + 1; }
     rpt_true("...byte for byte, as pixels", rep_px == rec_px);
 
-    # an unrelated ride in between — the death-and-retry path — must leave nothing behind
+    # ⛔ the frame hash has to be able to fail on its own, with every tick of the state still agreeing
+    var fhat = rp_buf + RP_HDR + 2400 * 2 + 4;
+    var fhkeep = rp_get32(fhat);
+    rp_put32(fhat, fhkeep ^ 1);
+    rpt_true("MUTATION: a wrong final frame alone is caught", rp_run(rp_buf, len) == 0);
+    rp_put32(fhat, fhkeep);
+
+    # ⛔ an unrelated ride in between — the death-and-retry path — must leave nothing behind. It has to get
+    #   as far as a fork and a branch: everything a reset has to clear is only dirty once it has.
     cart_reset(CFG_SEED_DEFAULT + 9, 2);
     i = 0;
-    while (i < 500) { cart_tick(IN_LEFT); i = i + 1; }
-    rpt_true("a replay survives an intervening ride", rp_run(rp_buf, len) == 1);
+    while (i < 1500) {
+        if (cart_tick(cart_autopilot()) == 0) { cart_reset(cart_seed, cart_chapter); }
+        i = i + 1;
+    }
+    rpt_true("a replay survives an intervening ride past a fork", rp_run(rp_buf, len) == 1);
+    rpt_dirty();
+    rpt_true("...and a state dirtied everywhere a reset must reach", rp_run(rp_buf, len) == 1);
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    var clean = rp_state(2166136261);
+    rpt_dirty();
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    rpt_true("a reset leaves no state behind", rp_state(2166136261) == clean);
+
+    # ⛔ A RIDE RECORDED ON A LARGER CONSOLE MUST REPLAY AT (0,0). Vertices are framebuffer-absolute.
+    MC_DX = 80;
+    MC_DY = 96;
+    var olen = rpt_record(1800);
+    MC_DX = 0;
+    MC_DY = 0;
+    rpt_true("a ride recorded at a console offset replays at the origin", rp_run(rp_buf, olen) == 1);
+
+    # ⛔ A LOG WITH A DEATH IN IT: the death restart is part of what gets replayed. Hands off, the cart
+    #   falls into the first gap at 89 m.
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    rp_begin(CFG_SEED_DEFAULT, 0);
+    var dead_seen = 0;
+    i = 0;
+    while (i < 900) {
+        if (cart_tick(0) == 0) { dead_seen = dead_seen + 1; cart_reset(cart_seed, cart_chapter); }
+        rp_note(0);
+        i = i + 1;
+    }
+    var dlen = rp_end();
+    rpt_true("the hands-off ride dies", dead_seen > 0);
+    rpt_true("a log with a death in it replays", rp_run(rp_buf, dlen) == 1);
+
+    # ⛔ THE CAP: a log that filled before the ride stopped must still replay. Lowered for the test.
+    var cap_keep = RP_MAX_TICKS;
+    RP_MAX_TICKS = 300;
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    rp_begin(CFG_SEED_DEFAULT, 0);
+    i = 0;
+    while (i < 400) {
+        var cw = cart_autopilot();
+        if (cart_tick(cw) == 0) { cart_reset(cart_seed, cart_chapter); }
+        rp_note(cw);
+        i = i + 1;
+    }
+    var clen = rp_end();
+    rpt_true("a log that hit its cap replays", rp_run(rp_buf, clen) == 1);
+    RP_MAX_TICKS = cap_keep;
+
+    # ...and the other end: a ride quit before its first tick
+    cart_reset(CFG_SEED_DEFAULT, 0);
+    rp_begin(CFG_SEED_DEFAULT, 0);
+    var zlen = rp_end();
+    rpt_true("a log with no ticks replays", rp_run(rp_buf, zlen) == 1);
+
+    # everything below needs the 40 s ride back in the buffer
+    len = rpt_record(2400);
 
     # ⛔ THE MUTATION: one bit of one word, halfway through. It MUST diverge.
     var at = rp_buf + RP_HDR + 1200 * 2;

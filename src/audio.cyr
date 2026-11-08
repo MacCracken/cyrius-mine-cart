@@ -216,6 +216,12 @@ fn aud_trigger_crack(): i64 { aud_crack_env = 65536; return 0; }
 # set the flood band's level, 0..65536 (the finale is a later step)
 fn aud_set_flood(amt): i64  { aud_flood_amt = amt; return 0; }
 
+# ⭐ ONE CLICK PER SEGMENT OF TRAVEL, so the phase increment is proportional to speed with no base term:
+# q = 0 is a stopped cart, not the brake floor.
+fn aud_joint_step(q): i64 { return (q * CFG_JOINT_SPAN) >>> 16; }
+
+var aud_clipped = 0;         # samples the mix pushed past S16, counted before the clamp for att_range
+
 # ---- one chunk of PCM ----------------------------------------------------------------------------------------
 # Fills aud_pcm with `frames` interleaved S16 stereo frames. Returns frames written.
 # ⛔ ACCUMULATE IN i64 AND CLAMP EXACTLY ONCE, AT THE END. Clamping each voice as it is added makes
@@ -232,8 +238,8 @@ fn aud_mix(frames): i64 {
         acc = acc + ((r * (10500 + ((aud_speed_q * 22500) >>> 16))) >>> 16);
 
         # -- JOINTS: a click whose RATE derives from speed. This is what makes speed audible. --------
-        # ⚠ The accumulator is in Q16.16 of "clicks per sample"; at the cap that is about 10 a second.
-        aud_joint_acc = aud_joint_acc + CFG_JOINT_BASE + ((aud_speed_q * CFG_JOINT_SPAN) >>> 16);
+        # ⚠ The accumulator is in Q16.16 of "clicks per sample"; at the cap that is about 11 a second.
+        aud_joint_acc = aud_joint_acc + aud_joint_step(aud_speed_q);
         if (aud_joint_acc >= 65536 * 8) {
             aud_joint_acc = aud_joint_acc - 65536 * 8;
             aud_joint_env = 65536;
@@ -264,8 +270,8 @@ fn aud_mix(frames): i64 {
         }
 
         # -- ONE clamp, at the end -------------------------------------------------------------------
-        if (acc > AUD_S16_MAX) { acc = AUD_S16_MAX; }
-        if (acc < AUD_S16_MIN) { acc = AUD_S16_MIN; }
+        if (acc > AUD_S16_MAX) { aud_clipped = aud_clipped + 1; acc = AUD_S16_MAX; }
+        if (acc < AUD_S16_MIN) { aud_clipped = aud_clipped + 1; acc = AUD_S16_MIN; }
 
         # interleaved L then R — hda.cyr reads bytes 0-1 as LEFT, 2-3 as RIGHT
         store16(&aud_pcm + i * 4 + 0, acc & 0xFFFF);

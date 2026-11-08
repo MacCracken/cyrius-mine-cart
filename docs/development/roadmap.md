@@ -29,10 +29,10 @@ numbers (triangle counts, `|D|` margins, sim telemetry) live in the README and t
   reaches one), then a ride with `--record /tmp/ride.dvrp`, and `--replay` of that log on a host.
   `--verify` is the only instrument that can see a picture that is ABI-legal and wrong.
   - agnos's `scripts/burn/stage-tools.sh` copies `build/mine-cart_agnos` from this repo as committed.
-  - A log records which simulation made it (0.2.2 is revision 0, forks revision 1), and a build
+  - A log records which simulation made it (0.2.2 is revision 0, 0.2.3–0.3.1 revision 1, 0.3.2 revision 2), and a build
     refuses another revision's log by name — replay a log with the build that recorded it.
 - **Tuning — step 4's question, and now step 6's.** `--sim` says: hands off, the cart falls into the
-  first gap at 87 m every time and never reaches a fork; the reference autopilot takes every fork's wet
+  first gap at 89 m every time and never reaches a fork; the reference autopilot takes every fork's wet
   shaft and still never dies in two minutes, though it slips measurably more there (the CHANGELOG has
   the numbers). Whether the wet shaft's slick rails (0.80 of dry grip) and closer hazards are worth ×2
   is a question for a person on iron — the autopilot reads the ring and has no reaction time, so it is

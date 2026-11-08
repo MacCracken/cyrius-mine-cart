@@ -90,7 +90,7 @@ fn wav_capture(seconds, pilot): i64 {
     while (t < ticks) {
         var word = 0;
         if (pilot == 1) { word = cart_autopilot(); }
-        if (cart_tick(word) == 0) { cart_reset(cart_seed, cart_chapter); }
+        if (cart_tick(word) == 0) { aud_reset(); cart_reset(cart_seed, cart_chapter); }
 
         # hand the mixer this tick's state, then render exactly one tick of audio
         var braking = 0;
@@ -138,7 +138,10 @@ fn wav_write(path, seconds, pilot): i64 {
     ps("  peak "); pn(peak); ps(" of 32767, "); pn((nonzero * 100) / frames);
     ps("% of frames non-silent"); nl();
 
-    file_write_all(path, wav_buf, WAV_HDR + frames * AUD_BPF);
+    if (file_write_all(path, wav_buf, WAV_HDR + frames * AUD_BPF) != WAV_HDR + frames * AUD_BPF) {
+        ps("wav: could NOT write "); ps(path); nl();
+        return 0;
+    }
     ps("  wrote "); ps(path); nl();
     return frames;
 }

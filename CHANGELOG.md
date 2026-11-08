@@ -7,6 +7,70 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and this pro
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-11-08
+
+**Audit and repair.** A sweep of all 8,900 lines found 29 defects: 1 high, 11 medium, 17 low. The
+simulation and every record the game emits came through clean: the op `0x0F` mirror still matches the
+kernel, and the kernel's own validator refused none of 140,000 frames at seven console sizes. What the
+sweep found was false results: a replay that could not pass for a ride on real hardware, exit codes
+that claimed success after a failure, and tests that could not fail. The full report, with every
+finding and how each repair was proven, is [`docs/audit/2026-11-08-audit.md`](docs/audit/2026-11-08-audit.md).
+
+### Fixed
+
+- **A ride recorded on any console larger than 640×400 reported DIVERGED on every replay**, with the
+  state hash matching. The frame hash covered framebuffer-absolute vertices; it is now taken at draw
+  offset (0,0). A ride longer than the log's hour, or quit before its first tick, failed the same way.
+- **`film --log` exited 0 after printing DIVERGED**, printed no verdict at all for a bad frame hash, and
+  accepted a log `--replay` refuses. It now makes `--replay`'s checks and exits 90 on a failed proof.
+- **Exit codes that claimed success.** The ride exited 95 with nothing presented or its recording lost
+  (now 8 and 1); `--wav`, `refrender`, `dumptex`, `film` and `shot` could report a failed write as done.
+- **Black slivers along the floor/wall seam and the fork's nose** in about one frame in seven. The cut
+  floor vertices now tuck under the wall, and a clipped polygon's corner rounds outward.
+- **A stacked hazard's partner landed one segment short of `CFG_HAZ_PAIR_SEGS`**, inside a 27-tick crouch
+  at the top speed, breaking the one thing the spacing exists for. This changes the track, so **the
+  first gap moves from 87 m to 89 m** and the autopilot's 30 s run from 732 m to 766 m.
+- **The rock's edge sampled the ballast band**: a texture coordinate exactly on the wrap reads column 0.
+- **The rail-joint click rate had a base term** that put 4.2 clicks a second under a floor running 2.6
+  segments a second; it is now once per segment at every speed. **A person should listen to it.**
+- **A death's screech played over the new run**, and `--verify`'s "the GPU wrote NOTHING" could not fire:
+  its poison went into a buffer the readback overwrites. It now goes through the back-buffer clear.
+- **`--verify` and `refrender`'s "frame N"** froze at the first death and ran one tick short of the
+  ride's frame N, despite the comment claiming one definition.
+- **Conflicting flags were silently ignored**: `--check --record F` wrote no file and passed. Modes are
+  now exclusive and `--record` is refused where it would do nothing. `refrender` with half an offset,
+  `film` with an overflowing length and `shot`'s frame numbers past 99999 are refused too.
+- **`--sim`'s table** had 10 headers over 12 columns, and a slip still running at the end was not counted.
+- **Frame pacing** slept under 10 ms, which its own comment rules out; a sleep ends on a timer tick.
+
+### Added
+
+- **The gate renders every other ride frame with no gap in view and checks every pixel for background**,
+  because the coverage sweep samples every fourth pixel and could not see a seam.
+- **A warning when the back buffer's stride differs from the console's** (`#89` vs `#38`): a garbled
+  panel that every other check reports as success. The cause is in the kernel.
+- **22 assertions** (301 → 323), replacing tests that could not fail: the S16 range test (it read back a
+  16-bit slot), "speed squared" (it passed with the exponent changed), the u16-wrap demonstration (it
+  compared literals), the gate's "one record" and "every vertex" checks. Pair spacing, a log with a
+  death in it, a frame-only divergence and a dirtied restart are measured for the first time.
+
+### Changed
+
+- **Replay logs are now revision 2.** The pair spacing changes the track and the seam repairs change the
+  final frame, so logs from 0.2.3–0.3.1 (revision 1) are refused by name.
+- The gate's peak `|N|` bound is 2^56, what the shader's divide can use, not the validator's 2^62.
+
+### Corrected
+
+- `ci.yml`'s comment, and the 0.3.0 entry below, said an undefined function always builds with exit 0.
+  A reachable one is a hard error; only one in dead code is a warning. CI's check is still worth having.
+
+### Notes
+
+- Binary 464,760 → 470,296 bytes (agnos: 481,576 → 491,360). `--check` takes 7 s, up from 4.
+- Every repair has a test that fails with the defect put back: 26 defects reintroduced, 26 caught.
+- The AGNOS-only repairs have run against a mock kernel, not on hardware.
+
 ## [0.3.1] — 2026-11-08
 
 **The toolchain moves to 6.7.18, the pin agnos itself builds with,** so the game and the kernel share a
@@ -445,7 +509,8 @@ to use the 3D ops at all.
   loaded + run in ring 3 on the real kernel under QEMU. The GPU path itself is iron-only — `#86`
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
-[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.1...HEAD
+[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.2...HEAD
+[0.3.2]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.1...0.3.2
 [0.3.1]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.3...0.3.0
 [0.2.3]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...0.2.3

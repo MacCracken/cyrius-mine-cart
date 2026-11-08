@@ -59,8 +59,14 @@ fn main(): i64 {
     dt_stats("tex_a (THE texture: floor band u 0-63, rock u 64-127)", &mc_tex_a);
     nl();
     dt_stats("tex_b (scratch: the rock pass before it is merged)", &mc_tex_b);
-    file_write_all("/tmp/mc_tex_a.raw", &mc_tex_a, bytes);
-    file_write_all("/tmp/mc_tex_b.raw", &mc_tex_b, bytes);
+    if (file_write_all("/tmp/mc_tex_a.raw", &mc_tex_a, bytes) != bytes) {
+        ps("dumptex: could NOT write /tmp/mc_tex_a.raw"); nl();
+        return 1;
+    }
+    if (file_write_all("/tmp/mc_tex_b.raw", &mc_tex_b, bytes) != bytes) {
+        ps("dumptex: could NOT write /tmp/mc_tex_b.raw"); nl();
+        return 1;
+    }
     nl();
     ps("wrote /tmp/mc_tex_a.raw and /tmp/mc_tex_b.raw"); nl();
     return 0;

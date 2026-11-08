@@ -503,10 +503,13 @@ fn mc_objects(k, lo, hi, cam_x): i64 {
 
 # ---- one run of floor, [a, b) inside slab k, and the tracks on it ------------------------------------
 # ⭐ Interpolated from the slab's own endpoints (mc_cl_at), so a run that covers the whole slab is the
-# old quad to the pixel, and a cut lands exactly on the plane the uncut quad would have drawn.
+# old quad to the pixel. A cut lands on the uncut quad's plane in depth, but not in x: mc_cl_at truncates
+# to whole render units, so a cut vertex is up to ~2 px off the wall's edge (see MC_SEAM_PX below).
 # v is linear in depth by construction (4 texels per ru), so it is interpolated exactly too.
 # st: 1 one track, 2 three tracks, 3 a fork's neck. chamber: 1 if the slab is this side of the nose,
 # where the floor spans both branches and the neck carries the other branch's track as well.
+var MC_SEAM_PX = 3;        # how far a cut floor vertex is pushed under the wall
+# draw the floor of [a, b) inside slab k, and the tracks on it
 fn mc_floor_run(k, a, b, st, cam_x, chamber): i64 {
     var rzs = load64(&mc_s_rz + k * 8);
     var vs  = load64(&mc_s_v + k * 8);
@@ -542,6 +545,11 @@ fn mc_floor_run(k, a, b, st, cam_x, chamber): i64 {
     # floor — far-left, far-right, near-right, near-left. u spans the floor band.
     var ln = mc_px(lon - MC_TW, a);  var lf = mc_px(lof - MC_TW, b);
     var rn = mc_px(hin + MC_TW, a);  var rf = mc_px(hif + MC_TW, b);
+    # ⛔ A T-JUNCTION: a cut vertex sits on the wall's long edge but rounds to a different pixel than that
+    # edge passes through, and op 0x0F's opaque background shows through the sliver. Push ONLY the cut
+    # vertices out; the wall is painted after the floor and hides the overshoot.
+    if (a > rzs) { ln = ln - MC_SEAM_PX;  rn = rn + MC_SEAM_PX; }
+    if (b < load64(&mc_s_rz + (k + 1) * 8)) { lf = lf - MC_SEAM_PX;  rf = rf + MC_SEAM_PX; }
     mc_quad(&mc_vtx_a, &mc_n_a,
       lf, flf, wf, 0, vf,              rf, flf, wf, MC_TEX_FLOOR, vf,
       rn, fln, wn, MC_TEX_FLOOR, vn,   ln, fln, wn, 0, vn);
@@ -745,7 +753,6 @@ fn mc_cart_draw(cam_x): i64 {
 # cam_x is the cart's lateral offset from the centre line, in RENDER UNITS.
 fn mc_build(cam_x): i64 {
     mc_n_a = 0;
-    mc_n_b = 0;
     mc_drop_flat = 0;
     mc_drop_huge = 0;
     mc_drop_coord = 0;
@@ -775,7 +782,9 @@ fn mc_build(cam_x): i64 {
     # quad spanning to 64 would drag them into the ballast, which is how treasure once came to be drawn
     # as bits of rail. The rock is the other half:
     var H = MC_TEX_HALF;      # rock starts here
-    var T = MC_TEXFULL;       # rock material:   u in [H, T)
+    # ⚠ ONE ULP SHORT OF THE WRAP, as mc_nose_draw is: a sample exactly on u = 128 masks to texel column 0,
+    #   which is the ballast band, and showed as stray floor-coloured pixels along the rock's edge.
+    var T = MC_TEXFULL - 1;   # rock material:   u in [H, T]
 
     # ---- ⭐ THE FAR CAP, AND WHY THE FRAME IS WRONG WITHOUT IT ---------------------------------
     # ⛔ op 0x0F writes GPU_TRID_BG — opaque BLACK — into every lane no triangle covered, and the
