@@ -7,6 +7,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and this pro
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-11-08
+
+**The toolchain moves to 6.7.18, the pin agnos itself builds with,** so the game and the kernel share a
+compiler again. No game source changes, and nothing the game computes or draws changes with it.
+
+### Changed
+
+- **Toolchain `6.7.9` → `6.7.18`**, the pin agnos 1.57.17 builds with and the newest cyrius tag, and the
+  vendored stdlib re-synced from it: every file in `lib/` is byte-identical to 6.7.18's, with no module
+  added or dropped. No source change was needed. Verified across the two toolchains, byte-identical:
+  the gate's output, three `--sim` runs, a 6.6.6 recording replayed on the 6.7.18 build, all 1800
+  frames of a 30 s film, and the `--wav` mix. In `syscalls_x86_64_agnos.cyr` three `SYS_` numbers are
+  new (109–111) and none moved or went away.
+
+### Notes
+
+- Binary 464,744 → 464,760 bytes (agnos: 485,528 → 481,576).
+
 ## [0.3.0] — 2026-11-08
 
 **The toolchain moves to 6.7.9, and the repository gets CI and releases.** No game source changes, and
@@ -427,7 +445,8 @@ to use the 3D ops at all.
   loaded + run in ring 3 on the real kernel under QEMU. The GPU path itself is iron-only — `#86`
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
-[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.1...HEAD
+[0.3.1]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.3.0...0.3.1
 [0.3.0]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.3...0.3.0
 [0.2.3]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...0.2.3
 [0.2.2]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.1...0.2.2
