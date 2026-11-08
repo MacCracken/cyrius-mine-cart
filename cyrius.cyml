@@ -5,10 +5,10 @@ description = "A ride through a curving mine tunnel, rasterised by the AGNOS GPU
 license = "GPL-3.0-only"
 repository = "https://github.com/MacCracken/cyrius-mine-cart"
 language = "cyrius"
-# Pinned to the toolchain agnos itself builds with, so the game and the kernel whose ABI it
-# consumes are compiled by the same compiler. Do not chase the cyrius tip here — the pin that
-# matters is the one the ABI was proven under. (agnos 1.57.7 builds with 6.6.6.)
-cyrius = "6.6.6"
+# Pinned on purpose — do not chase the cyrius tip here. Through 0.2.2 this matched the toolchain
+# agnos builds with (agnos 1.57.7, cyrius 6.6.6). agnos has since moved to 6.7.x (1.57.17 builds
+# with 6.7.18), so the game and the kernel whose ABI it consumes are now built by different compilers.
+cyrius = "6.6.20"
 
 [build]
 src = "src/main.cyr"

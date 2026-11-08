@@ -277,10 +277,9 @@ to the back buffer, in the same dispatch. Colour never got the field depth has.
 
 ## Status
 
-`0.2.2` — the loop, the hazards and the treasure, drawn where the rules apply them; a HUD; and the
-input-log replay that turns every ride into a regression test. Built with Cyrius 6.6.6, the toolchain
-agnos itself builds with. **Unreleased on top of it: forks** (the build order's step 6) — see the
-[CHANGELOG](CHANGELOG.md).
+`0.2.3` — the loop, the hazards and the treasure, drawn where the rules apply them; forks (the build
+order's step 6); a HUD; and the input-log replay that turns every ride into a regression test. Built
+with Cyrius 6.6.20 — see the [CHANGELOG](CHANGELOG.md).
 
 ![0.2.1 and 0.2.2, the same moment of the same ride](docs/screenshots/before-after.png)
 

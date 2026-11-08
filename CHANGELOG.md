@@ -7,6 +7,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/), and this pro
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-11-08
+
 **Forks — the build order's step 6.** Every few hundred metres the shaft splits: a sign in the tunnel
 (design plate 1A) says **◄ WET ×2** and **DRY ×1 ►**, a double-tap throws the switch, the lit rails
 change sides with it, and the cart commits at the points. The wet shaft pays double and runs on slick
@@ -14,7 +16,8 @@ rails between closer hazards; the spur is dry and pays the ordinary rate. The ri
 path — the other branch is only ever drawn, as a mirror — and the generator waits at the end of the
 fork's neck until the cart has chosen. The new gate pass that rides the fork both ways at the extremes
 found, the first time it ran, a 2× `|D|` margin that the ride path had never leaned far enough to see;
-face-on geometry is now clipped to the draw rect, and the margin is 21×.
+face-on geometry is now clipped to the draw rect, and the margin is 21×. The toolchain moves to 6.6.20,
+and nothing the game computes or draws changes with it.
 
 ### Added
 
@@ -76,6 +79,14 @@ face-on geometry is now clipped to the draw rect, and the margin is 21×.
 
 ### Changed
 
+- **Toolchain `6.6.6` → `6.6.20`**, and the vendored stdlib re-synced from it: every file in `lib/` is
+  byte-identical to 6.6.20's, plus the one module its `alloc.cyr` now names (`poison`, compiled only
+  under `CYRIUS_POISON`, so not in this build). The build now writes a `cyrius.lock` pinning the hash
+  of all 24 (`cyrius deps --verify`). No source change was needed. Verified across the two toolchains,
+  byte-identical: the gate's output, three `--sim` runs, a 6.6.6 recording replayed on the 6.6.20
+  build, all 1800 frames of a 30 s film, and the `--wav` mix. In `syscalls_x86_64_agnos.cyr` three
+  `SYS_` numbers are new and none moved or went away. 6.6.20 is **not** the toolchain agnos builds with
+  any more — agnos 1.57.17 is on 6.7.18.
 - **The track differs from 0.2.2 from the first fork's lead-in on (segment 90, 230 m).** Everything
   before it is identical — the fork logic draws nothing from the rng until it is laid — so hands off,
   the cart still falls into the first gap at 87 m every time.
@@ -103,7 +114,8 @@ face-on geometry is now clipped to the draw rect, and the margin is 21×.
 - `--sim`, 30 s: the autopilot throws the first fork's switch at 281 m and reaches 732 m with no
   deaths; over two minutes it takes three wet shafts, reaches 3,031 m on one life, and slips for 13.6%
   of its 4,039 ticks on the wet shaft against 8.3% off it. Hands off: 87 m, every time, no fork.
-- Binary 409,728 → 443,072 bytes (agnos: 413,656 → 451,088).
+- Binary 409,728 → 443,072 bytes with the forks → 464,728 on 6.6.20's larger stdlib (agnos: 413,656 →
+  451,088 → 485,512).
 - **None of this has been on iron** — nor has 0.2.2. The roadmap lists what to run on the hardware.
 
 ## [0.2.2] — 2026-09-24
@@ -385,7 +397,8 @@ to use the 3D ops at all.
   loaded + run in ring 3 on the real kernel under QEMU. The GPU path itself is iron-only — `#86`
   slots come from the GPU carveout, which QEMU has no GPU to provide.
 
-[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...HEAD
+[Unreleased]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.3...HEAD
+[0.2.3]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.2...0.2.3
 [0.2.2]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.1...0.2.2
 [0.2.1]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.2.0...0.2.1
 [0.2.0]: https://github.com/MacCracken/cyrius-mine-cart/compare/0.1.0...0.2.0

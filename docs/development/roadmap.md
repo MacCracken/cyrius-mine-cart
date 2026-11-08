@@ -11,7 +11,7 @@ numbers (triangle counts, `|D|` margins, sim telemetry) live in the README and t
 | 1–3 | Fixed-point core, the segment ring and its streaming generator, the ring-driven renderer | done — 0.2.0 |
 | 4 | **The loop**: speed, brake, lean, derail — "fun with nothing else in it" | done — 0.2.0; grip/slip model 0.2.1 |
 | 5 | Duck and jump obstacles: beams, gaps, integrity | done — 0.2.1; drawn where they resolve, 0.2.2 |
-| 6 | Forks, and their 1.2 s telegraph | done — unreleased: the switch, the sign (plate 1A), the wet shaft and the spur; follow-ups below |
+| 6 | Forks, and their 1.2 s telegraph | done — 0.2.3: the switch, the sign (plate 1A), the wet shaft and the spur; follow-ups below |
 | 7 | Pickups and score | done — 0.2.1; visible for the first time, 0.2.2 |
 | 8 | Pursuers and combat (the whip) | **not started** — scaffolding only |
 | 9 | The flood finale | **not started** — scaffolding only |
